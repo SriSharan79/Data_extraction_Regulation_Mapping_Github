@@ -21,11 +21,13 @@ keep working.
 ## Requirements
 
 - Python 3.10+ with Tkinter (ships with the standard python.org installer)
-- Python packages (install what you need for the tabs you use):
+- Python packages — install everything from the pinned list:
 
   ```bash
-  pip install docling docling-core markitdown pymupdf openpyxl xmltodict colorama pandas tqdm
+  pip install -r requirements.txt
   ```
+
+  Or install only what a given tab needs:
 
   | Tool / tab | Needs |
   |---|---|
@@ -44,6 +46,9 @@ keep working.
   (**HybridChunker**), each tagged with headings, page numbers and doc-item types.
 - Same pass extracts **tables → CSV**, **images → PNG**, and **layout headings**.
 - Caches the parse to JSON (re-runs hit the cache and skip reprocessing).
+- The document conversion runs on a background thread, so the window stays
+  responsive; action buttons disable and a status line shows progress while a
+  job is running.
 - Interactive review window: step through each chunk, edit text/headings, then
   **Log / Skip / Use-previous-heading**. Logged chunks are auto-merged under
   common headings into a structured output JSON.

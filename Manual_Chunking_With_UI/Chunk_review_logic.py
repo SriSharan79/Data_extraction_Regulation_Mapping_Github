@@ -12,6 +12,7 @@ import os
 import json
 import re
 import logging
+import threading
 import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox,filedialog, scrolledtext
@@ -52,8 +53,10 @@ class ExtractionLauncherUI:
         
         btn_box = tk.Frame(frame_pdf, bg="white")
         btn_box.grid(row=2, column=1, pady=8, sticky="w")
-        tk.Button(btn_box, text="Generate Cache Only", bg="#3498db", fg="white", font=("Arial", 9, "bold"), command=self.run_cache_only).pack(side="left", padx=5)
-        tk.Button(btn_box, text="Run Extraction + Review Process", bg="#2ecc71", fg="white", font=("Arial", 9, "bold"), command=self.run_full_pipeline).pack(side="left", padx=5)
+        self.btn_cache_only = tk.Button(btn_box, text="Generate Cache Only", bg="#3498db", fg="white", font=("Arial", 9, "bold"), command=self.run_cache_only)
+        self.btn_cache_only.pack(side="left", padx=5)
+        self.btn_full_pipeline = tk.Button(btn_box, text="Run Extraction + Review Process", bg="#2ecc71", fg="white", font=("Arial", 9, "bold"), command=self.run_full_pipeline)
+        self.btn_full_pipeline.pack(side="left", padx=5)
 
         # Section B: Independent Review Process from Pre-existing Cache
         frame_cache = tk.LabelFrame(root, text=" Curation Only: Review Pre-existing Cache File From Scratch ", bg="white", font=("Arial", 10, "bold"), padx=10, pady=10)
@@ -69,7 +72,62 @@ class ExtractionLauncherUI:
         self.entry_store_cache.grid(row=1, column=1, padx=5, pady=2)
         tk.Button(frame_cache, text="Browse...", command=self.browse_storage_cache).grid(row=1, column=2, padx=2)
         
-        tk.Button(frame_cache, text="Launch Curation Review From Start", bg="#9b59b6", fg="white", font=("Arial", 9, "bold"), command=self.run_review_from_cache).grid(row=2, column=1, pady=8, sticky="w", padx=5)
+        self.btn_review_cache = tk.Button(frame_cache, text="Launch Curation Review From Start", bg="#9b59b6", fg="white", font=("Arial", 9, "bold"), command=self.run_review_from_cache)
+        self.btn_review_cache.grid(row=2, column=1, pady=8, sticky="w", padx=5)
+
+        # Buttons disabled while a background conversion is running.
+        self.action_buttons = [self.btn_cache_only, self.btn_full_pipeline, self.btn_review_cache]
+        self._busy = False
+
+        # Status line for background-task feedback.
+        self.status_label = tk.Label(root, text="", bg="#f4f4f6", fg="#2c3e50", font=("Arial", 9, "italic"), anchor="w")
+        self.status_label.pack(fill="x", padx=15, pady=(0, 8))
+
+    # --- Background-task helpers ------------------------------------------- #
+    def _set_busy(self, busy, message=""):
+        """Toggle the UI busy state (main thread only)."""
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        for btn in getattr(self, "action_buttons", []):
+            try:
+                btn.config(state=state)
+            except tk.TclError:
+                pass
+        try:
+            self.status_label.config(text=message)
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _run_in_background(self, work_fn, on_done, busy_message="Processing, please wait..."):
+        """Run work_fn() off the UI thread; call on_done(result, error) back on
+        the UI thread via after(). Keeps the docling conversion from freezing
+        the window."""
+        if self._busy:
+            messagebox.showinfo("Please wait", "A processing task is already running.")
+            return
+
+        self._set_busy(True, busy_message)
+        holder = {}
+
+        def worker():
+            try:
+                holder["result"] = work_fn()
+            except Exception as exc:  # surfaced to on_done on the UI thread
+                holder["error"] = exc
+            finally:
+                holder["done"] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            if holder.get("done"):
+                self._set_busy(False, "")
+                on_done(holder.get("result"), holder.get("error"))
+            else:
+                self.root.after(120, poll)
+
+        self.root.after(120, poll)
 
     def browse_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF Documents", "*.pdf")])
@@ -151,14 +209,23 @@ class ExtractionLauncherUI:
         # Ensure directories exist before generating logs
         os.makedirs(paths["dated_folder"], exist_ok=True)
         logger = self.init_runtime_logger(paths["log_file"])
-        
+
         print(Fore.YELLOW + "Executing background extraction task pipeline...")
-        chunks = generate_and_cache_document(pdf_path, paths, logger)
-        
-        if chunks:
-            messagebox.showinfo("Success", f"Cache structure created successfully!\nFile path:\n{paths['cache_file']}")
-        else:
-            messagebox.showerror("Execution Fail", "Extraction pipelines crashed. Review execution log.")
+
+        def work():
+            return generate_and_cache_document(pdf_path, paths, logger)
+
+        def done(chunks, error):
+            if error is not None:
+                logger.critical(f"Cache generation crashed: {error}")
+                messagebox.showerror("Execution Fail", f"Extraction pipeline crashed:\n{error}")
+                return
+            if chunks:
+                messagebox.showinfo("Success", f"Cache structure created successfully!\nFile path:\n{paths['cache_file']}")
+            else:
+                messagebox.showerror("Execution Fail", "Extraction pipelines crashed. Review execution log.")
+
+        self._run_in_background(work, done, "Generating cache — converting document, please wait...")
 
     def run_full_pipeline(self):
         pdf_path = self.entry_pdf.get().strip()
@@ -173,18 +240,27 @@ class ExtractionLauncherUI:
         
         os.makedirs(paths["dated_folder"], exist_ok=True)
         logger = self.init_runtime_logger(paths["log_file"])
-        
+
         print(Fore.CYAN + "Loading active document tracking logs...")
-        chunks_data = generate_and_cache_document(pdf_path, paths, logger)
-        
-        if not chunks_data:
-            messagebox.showerror("Error", "Extraction process failed.")
-            return
-            
-        logged_chunks, processed_indices = load_existing_progress_log(paths["output_file"], logger)
-        
-        self.root.destroy()
-        launch_review_app(chunks_data, logged_chunks, processed_indices, paths["output_file"], logger)
+
+        def work():
+            return generate_and_cache_document(pdf_path, paths, logger)
+
+        def done(chunks_data, error):
+            if error is not None:
+                logger.critical(f"Extraction crashed: {error}")
+                messagebox.showerror("Error", f"Extraction process failed:\n{error}")
+                return
+            if not chunks_data:
+                messagebox.showerror("Error", "Extraction process failed.")
+                return
+
+            logged_chunks, processed_indices = load_existing_progress_log(paths["output_file"], logger)
+
+            self.root.destroy()
+            launch_review_app(chunks_data, logged_chunks, processed_indices, paths["output_file"], logger)
+
+        self._run_in_background(work, done, "Running extraction — converting document, please wait...")
 
     def run_review_from_cache(self):
         cache_path = self.entry_cache.get().strip()

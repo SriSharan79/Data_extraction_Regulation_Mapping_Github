@@ -1,0 +1,29 @@
+# Python dependencies for Data Extraction & Regulation Mapping.
+#
+# Install everything:
+#     pip install -r requirements.txt
+#
+# Versions are intentionally left unpinned; once you have a known-good
+# environment, pin them with `pip freeze > requirements.lock.txt` for
+# reproducible installs.
+#
+# Tkinter is required but ships with the standard python.org installer,
+# so it is not listed here.
+
+# --- PDF extraction & chunk review (Docling pipeline) ---
+docling            # PDF -> document model + HybridChunker
+docling-core       # PictureItem / doc types used by the extractor
+pymupdf            # imported as `fitz`
+pandas             # table dataframes
+tqdm               # progress bars
+colorama           # colored console logs
+
+# --- EASA XML extraction & graph builder ---
+xmltodict          # raw XML -> JSON
+openpyxl           # Excel (.xlsx) output
+
+# --- PDF -> Markdown ---
+markitdown[pdf]    # MarkItDown with PDF support
+
+# --- Optional ---
+# imagehash        # enables perceptual de-duplication of extracted images
