@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./EASA_Data_Extractors",
+        "./Manual_Chunking_With_UI"
+    ]
+}
