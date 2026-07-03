@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple,Optional
 
 import fitz
-# import imagehash
+try:
+    import imagehash  # optional: enables perceptual de-duplication of images
+except ImportError:
+    imagehash = None
 import pandas as pd
 from tqdm import tqdm
 
@@ -188,12 +191,14 @@ class DoclingExtractor:
                 )
                 picture_counter += 1
 
-                # image_hash = self._get_image_hash(element, doc)
-
-                # if image_hash in self.image_hashes:
-                #     logger.debug(f"[Docling] Skipping duplicate image from page {page_no}")
-                #     continue
-                # self.image_hashes.add(image_hash)
+                # Perceptual de-duplication (only when the optional imagehash
+                # dependency is installed; otherwise every image is kept).
+                image_hash = self._get_image_hash(element, doc)
+                if image_hash is not None:
+                    if image_hash in self.image_hashes:
+                        logger.debug(f"[Docling] Skipping duplicate image from page {page_no}")
+                        continue
+                    self.image_hashes.add(image_hash)
 
                 image_name = f"{self.document_name}_page_{page_no}_picture_{picture_counter}.png"
                 image_path = self.images_output_path / image_name
@@ -210,7 +215,7 @@ class DoclingExtractor:
                     "page_no": page_no,
                     "image_path": str(image_path),
                     "bbox": bbox_to_dict(bbox),
-                    # "hash": image_hash,
+                    "hash": image_hash,
                 })
 
                 logger.debug(f"[Docling] Extracted image {picture_counter} from page {page_no}")
@@ -243,8 +248,17 @@ class DoclingExtractor:
 
         return headings
 
-    # def _get_image_hash(self, picture: PictureItem, doc) -> str:
-    #     """Generate perceptual hash to detect duplicate images."""
-    #     pil_image = picture.get_image(doc)
-    #     return str(imagehash.dhash(pil_image, hash_size=8))
+    def _get_image_hash(self, picture: PictureItem, doc) -> Optional[str]:
+        """Generate a perceptual hash to detect duplicate images.
+
+        Returns ``None`` when the optional ``imagehash`` dependency is not
+        installed, which disables de-duplication (every image is kept).
+        """
+        if imagehash is None:
+            return None
+        try:
+            pil_image = picture.get_image(doc)
+            return str(imagehash.dhash(pil_image, hash_size=8))
+        except Exception:
+            return None
 

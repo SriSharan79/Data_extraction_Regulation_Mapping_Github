@@ -21,12 +21,10 @@ from docling.chunking import HybridChunker
 from chunk_review_ui import ChunkReviewApp
 import traceback
 import hashlib
-from pathlib import PureWindowsPath, PurePosixPath
 
 
 from Table_image_extractor import DoclingExtractor
-
-REGISTRY_FILE = "/remotedata/U/DLR+kata_du/ALR DATA/00_Container/docling_workspace_registry.json"
+from workspace_config import REGISTRY_FILE
 # --- Initialize Colorama for background processing logs ---
 init(autoreset=True)
 
@@ -99,7 +97,6 @@ class ExtractionLauncherUI:
     def browse_storage_cache(self):
         path = filedialog.askdirectory()
         if path:
-            self.entry_store_cache.grid_frame = path
             self.entry_store_cache.delete(0, tk.END)
             self.entry_store_cache.insert(0, path)
 
@@ -109,7 +106,7 @@ class ExtractionLauncherUI:
         
         # If running from a cache file, strip the suffix to recover the root PDF name
         if base_filename.endswith("_docling_chunks_cache"):
-            doc_name=PureWindowsPath(reference_path).parent.name
+            doc_name = os.path.basename(os.path.dirname(reference_path))
         else:
             doc_name = base_filename
 

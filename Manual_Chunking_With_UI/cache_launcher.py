@@ -5,20 +5,19 @@ import logging
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from datetime import datetime
-from pathlib import PureWindowsPath, PurePosixPath
+
+from workspace_config import REGISTRY_FILE
 
 # Import the existing app hand-off hook from your main file
 try:
     from Chunk_review_logic import launch_review_app
 except ImportError:
     messagebox.showerror(
-        "Import Error", 
-        "Could not find 'main.py' in the current working directory.\n"
+        "Import Error",
+        "Could not find 'Chunk_review_logic' in the current working directory.\n"
         "Please ensure this script is saved in the same folder as your existing modules."
     )
     exit()
-
-REGISTRY_FILE = r"U:\ALR DATA\00_Container\docling_workspace_registry.json"
 class CacheReviewLauncher:
 
     def __init__(self, root):
@@ -110,12 +109,10 @@ class CacheReviewLauncher:
         base_filename = os.path.splitext(os.path.basename(cache_path))[0]
         
         if base_filename.endswith("_docling_chunks_cache"):
-            doc_name=PureWindowsPath(cache_path).parent.name
+            doc_name = os.path.basename(os.path.dirname(cache_path))
         else:
             doc_name = base_filename
-        
-        # doc_name=PureWindowsPath(cache_path).parent.name
-            
+
         target_root = os.path.join(storage_path, doc_name)
         current_date_str = datetime.now().strftime("%Y-%m-%d")
         dated_subfolder = os.path.join(target_root, current_date_str)
