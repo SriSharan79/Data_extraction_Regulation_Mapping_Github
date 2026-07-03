@@ -15,11 +15,12 @@ import logging
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox,filedialog, scrolledtext
+from tkinter import messagebox, filedialog, scrolledtext
 from colorama import Fore, Style, init
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 from chunk_review_ui import ChunkReviewApp
+from section_review_ui import SectionReviewApp
 import traceback
 import hashlib
 
@@ -184,166 +185,156 @@ class ExtractionLauncherUI:
             "images_path": os.path.join(dated_subfolder, "images")
         }
 
-    def init_runtime_logger(self, log_path):
-        logger = logging.getLogger("DoclingRuntimeUI")
-        logger.setLevel(logging.INFO)
-        # Clear past execution streams safely
-        if logger.hasHandlers():
-            logger.handlers.clear()
-        handler = logging.FileHandler(log_path, encoding='utf-8')
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(handler)
-        return logger
-
     def run_cache_only(self):
         pdf_path = self.entry_pdf.get().strip()
         storage_path = self.entry_store_pdf.get().strip()
         
         if not pdf_path or not storage_path:
-            messagebox.showerror("Error", "Please clarify valid target PDF and storage folders.")
+            messagebox.showerror("Missing input", "Please provide a PDF file and storage destination.")
             return
+        if not os.path.exists(pdf_path):
+            messagebox.showerror("File not found", f"PDF file does not exist:\n{pdf_path}")
+            return
+
+        def job():
+            paths = self.resolve_directory_structure(storage_path, pdf_path)
+            os.makedirs(paths["dated_folder"], exist_ok=True)
             
-        storage_path = self.validate_and_confirm_storage(storage_path, pdf_path, self.entry_store_pdf)
-        paths = self.resolve_directory_structure(storage_path, pdf_path)
-        
-        # Ensure directories exist before generating logs
-        os.makedirs(paths["dated_folder"], exist_ok=True)
-        logger = self.init_runtime_logger(paths["log_file"])
+            logger = logging.getLogger("ExtractionLauncher")
+            logger.setLevel(logging.INFO)
+            if not logger.handlers:
+                fh = logging.FileHandler(paths["log_file"], encoding="utf-8")
+                fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+                logger.addHandler(fh)
 
-        print(Fore.YELLOW + "Executing background extraction task pipeline...")
+            chunks_data = generate_and_cache_document(pdf_path, paths, logger)
+            print(Fore.GREEN + f"✓ Cache generation complete. {len(chunks_data)} chunks saved.")
 
-        def work():
-            return generate_and_cache_document(pdf_path, paths, logger)
-
-        def done(chunks, error):
-            if error is not None:
-                logger.critical(f"Cache generation crashed: {error}")
-                messagebox.showerror("Execution Fail", f"Extraction pipeline crashed:\n{error}")
-                return
-            if chunks:
-                messagebox.showinfo("Success", f"Cache structure created successfully!\nFile path:\n{paths['cache_file']}")
+        def on_done(result, error):
+            if error:
+                messagebox.showerror("Extraction Error", f"Extraction failed:\n{error}")
             else:
-                messagebox.showerror("Execution Fail", "Extraction pipelines crashed. Review execution log.")
+                messagebox.showinfo("Success", "Cache generation complete!")
 
-        self._run_in_background(work, done, "Generating cache — converting document, please wait...")
+        self._run_in_background(job, on_done, "Generating cache, please wait...")
 
     def run_full_pipeline(self):
         pdf_path = self.entry_pdf.get().strip()
         storage_path = self.entry_store_pdf.get().strip()
         
         if not pdf_path or not storage_path:
-            messagebox.showerror("Error", "Please clarify valid target PDF and storage folders.")
+            messagebox.showerror("Missing input", "Please provide a PDF file and storage destination.")
             return
+        if not os.path.exists(pdf_path):
+            messagebox.showerror("File not found", f"PDF file does not exist:\n{pdf_path}")
+            return
+
+        def job():
+            paths = self.resolve_directory_structure(storage_path, pdf_path)
+            os.makedirs(paths["dated_folder"], exist_ok=True)
             
-        storage_path = self.validate_and_confirm_storage(storage_path, pdf_path, self.entry_store_pdf)
-        paths = self.resolve_directory_structure(storage_path, pdf_path)
-        
-        os.makedirs(paths["dated_folder"], exist_ok=True)
-        logger = self.init_runtime_logger(paths["log_file"])
+            logger = logging.getLogger("ExtractionLauncher")
+            logger.setLevel(logging.INFO)
+            if not logger.handlers:
+                fh = logging.FileHandler(paths["log_file"], encoding="utf-8")
+                fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+                logger.addHandler(fh)
 
-        print(Fore.CYAN + "Loading active document tracking logs...")
+            chunks_data = generate_and_cache_document(pdf_path, paths, logger)
+            print(Fore.GREEN + f"✓ Extraction complete. {len(chunks_data)} chunks extracted.")
+            return (chunks_data, paths)
 
-        def work():
-            return generate_and_cache_document(pdf_path, paths, logger)
-
-        def done(chunks_data, error):
-            if error is not None:
-                logger.critical(f"Extraction crashed: {error}")
-                messagebox.showerror("Error", f"Extraction process failed:\n{error}")
+        def on_done(result, error):
+            if error:
+                messagebox.showerror("Extraction Error", f"Extraction failed:\n{error}")
                 return
-            if not chunks_data:
-                messagebox.showerror("Error", "Extraction process failed.")
-                return
-
-            logged_chunks, processed_indices = load_existing_progress_log(paths["output_file"], logger)
-
+            
+            chunks_data, paths = result
             self.root.destroy()
-            launch_review_app(chunks_data, logged_chunks, processed_indices, paths["output_file"], logger)
+            launch_review_app(chunks_data, [], set(), paths["output_file"], logging.getLogger("ExtractionLauncher"))
 
-        self._run_in_background(work, done, "Running extraction — converting document, please wait...")
+        self._run_in_background(job, on_done, "Extracting document, please wait...")
 
     def run_review_from_cache(self):
         cache_path = self.entry_cache.get().strip()
         storage_path = self.entry_store_cache.get().strip()
         
         if not cache_path or not storage_path or not os.path.exists(cache_path):
-            messagebox.showerror("Error", "Please provide a valid pre-existing cache file and storage directory destination.")
+            messagebox.showerror("Error", "Please provide a valid cache file path and base storage folder.")
             return
-            
-        storage_path = self.validate_and_confirm_storage(storage_path, cache_path, self.entry_store_cache)
+
         paths = self.resolve_directory_structure(storage_path, cache_path)
-        
         os.makedirs(paths["dated_folder"], exist_ok=True)
-        logger = self.init_runtime_logger(paths["log_file"])
-        
-        print(Fore.MAGENTA + "Reading configuration tracks from chosen custom cache file...")
+
+        logger = logging.getLogger("ExtractionLauncher")
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            fh = logging.FileHandler(paths["log_file"], encoding="utf-8")
+            fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logger.addHandler(fh)
+
         try:
             with open(cache_path, 'r', encoding='utf-8') as f:
                 payload = json.load(f)
                 chunks_data = payload.get("chunks", []) if isinstance(payload, dict) else payload
         except Exception as e:
-            messagebox.showerror("Cache Error", f"Failed parsing chosen cache file format: {e}")
+            messagebox.showerror("Cache Parsing Error", f"Failed to parse cache file:\n{e}")
             return
-            
+
         if not chunks_data:
-            messagebox.showerror("Data Error", "No data content allocations parsed inside the provided cache file.")
+            messagebox.showerror("Data Error", "No chunks found in cache file.")
             return
-            
+
         logged_chunks = []
         processed_indices = set()
-        
+
         if os.path.exists(paths["output_file"]):
             try:
                 with open(paths["output_file"], 'r', encoding='utf-8') as infile:
                     existing_data = json.load(infile)
-                    
-                history_records = existing_data.get("raw_session_history", []) if isinstance(existing_data, dict) else existing_data
+                    history_records = existing_data.get("raw_session_history", []) if isinstance(existing_data, dict) else existing_data
 
-                if len(history_records) > 0:
-                    ask_resume = messagebox.askyesno(
-                        "Previous Progress Detected",
-                        f"Found an existing progress log with {len(history_records)} reviewed chunks.\n\n"
-                        "Do you want to CONTINUE from where you left off?\n"
-                        "(Selecting 'No' will reset all progress and start from the beginning.)"
-                    )
-                    
-                    if ask_resume:
-                        logged_chunks = history_records
-                        for entry in logged_chunks:
-                            if "chunk_index" in entry:
-                                processed_indices.add(entry["chunk_index"])
-                    else:
-                        with open(paths["output_file"], 'w', encoding='utf-8') as outfile:
-                            json.dump({"merged_headings": [], "raw_session_history": []}, outfile, indent=4, ensure_ascii=False)
-                            
+                    if history_records:
+                        ask_resume = messagebox.askyesno(
+                            "Previous Progress Detected",
+                            f"Found {len(history_records)} completed chunks.\n\nContinue from where you left off?"
+                        )
+                        if ask_resume:
+                            logged_chunks = history_records
+                            for entry in logged_chunks:
+                                if "chunk_index" in entry:
+                                    processed_indices.add(entry["chunk_index"])
+                        else:
+                            with open(paths["output_file"], 'w', encoding='utf-8') as outfile:
+                                json.dump({"merged_headings": [], "raw_session_history": []}, outfile, indent=4, ensure_ascii=False)
             except Exception as e:
-                logger.warning(f"Error parsing existing output progress logs: {e}")
-        
+                logger.warning(f"Error checking existing progress: {e}")
+
         if not os.path.exists(paths["output_file"]):
             try:
                 with open(paths["output_file"], 'w', encoding='utf-8') as outfile:
                     json.dump({"merged_headings": [], "raw_session_history": []}, outfile, indent=4, ensure_ascii=False)
             except Exception as e:
-                logger.error(f"Failed creating empty log target: {e}")
+                logger.error(f"Failed to create output file: {e}")
 
         self.root.destroy()
-        launch_review_app(chunks_data, logged_chunks, processed_indices, paths["output_file"], logger)  
+        launch_review_app(chunks_data, logged_chunks, processed_indices, paths["output_file"], logger)
 
-
-
-    def get_registered_storage(self, file_path):
-        """Reads the global registry to find a previously paired storage location."""
+    def auto_populate_storage(self, file_path, entry_widget):
+        """Auto-populate storage from registry."""
         if os.path.exists(REGISTRY_FILE):
             try:
                 with open(REGISTRY_FILE, 'r', encoding='utf-8') as f:
                     reg = json.load(f)
-                    return reg.get(os.path.abspath(file_path))
+                    old_storage = reg.get(os.path.abspath(file_path))
+                    if old_storage:
+                        entry_widget.delete(0, tk.END)
+                        entry_widget.insert(0, old_storage)
             except Exception:
                 pass
-        return None
 
     def save_to_registry(self, file_path, storage_path):
-        """Saves or updates the file-to-storage mapping in the registry."""
+        """Save file-storage mapping to registry."""
         reg = {}
         if os.path.exists(REGISTRY_FILE):
             try:
@@ -358,39 +349,9 @@ class ExtractionLauncherUI:
         except Exception:
             pass
 
-    def auto_populate_storage(self, file_path, entry_widget):
-        """Auto-fills the UI storage entry if a history matching the file exists."""
-        old_storage = self.get_registered_storage(file_path)
-        if old_storage:
-            entry_widget.delete(0, tk.END)
-            entry_widget.insert(0, old_storage)
-            print(Fore.GREEN + f"[Registry] Auto-loaded previous workspace track: {old_storage}")
-
-
-    def validate_and_confirm_storage(self, storage_path, reference_path, entry_widget):
-        """Validates storage targets and syncs with workspace memory maps."""
-        paths = self.resolve_directory_structure(storage_path, reference_path)
-        
-        if os.path.exists(paths["output_file"]) or os.path.exists(paths["cache_file"]):
-            use_older = messagebox.askyesno(
-                "Existing Storage Footprint",
-                f"Processing files or logged histories already exist for this reference inside:\n{paths['root']}\n\n"
-                "Do you want to continue using this older destination folder?\n"
-                "(Selecting 'No' allows you to select a new base storage folder track entirely.)"
-            )
-            
-            if not use_older:
-                chosen_dir = filedialog.askdirectory(title="Select New Base Storage Destination Folder")
-                if chosen_dir:
-                    entry_widget.delete(0, tk.END)
-                    entry_widget.insert(0, chosen_dir)
-                    storage_path = chosen_dir
-
-        self.save_to_registry(reference_path, storage_path)
-        return storage_path
-
 
 def load_existing_progress_log(output_file_name, logger):
+    """Load existing progress from output file."""
     logged_chunks = []
     processed_indices = set()
     if os.path.exists(output_file_name):
@@ -398,7 +359,6 @@ def load_existing_progress_log(output_file_name, logger):
             with open(output_file_name, 'r', encoding='utf-8') as infile:
                 data = json.load(infile)
                 
-            # Safely unpack raw session history from new dict structure; fallback to legacy lists
             if isinstance(data, dict) and "raw_session_history" in data:
                 logged_chunks = data["raw_session_history"]
             elif isinstance(data, list):
@@ -407,21 +367,21 @@ def load_existing_progress_log(output_file_name, logger):
             for entry in logged_chunks:
                 if "chunk_index" in entry:
                     processed_indices.add(entry["chunk_index"])
-            print(Fore.CYAN + f">>> Resume validation checkpoint: found {len(processed_indices)} handled tracking elements.")
+            print(Fore.CYAN + f">>> Resume checkpoint: found {len(processed_indices)} processed chunks.")
         except Exception as e:
-            logger.warning(f"Failed to read existing progress log data tracks: {e}")
+            logger.warning(f"Failed to read existing progress: {e}")
     return logged_chunks, processed_indices
 
 
 def generate_and_cache_document(pdf_path, paths, logger):
-    """Processes document files through pipeline architectures and dumps metrics directly into the structured cache layer."""
+    """Process PDF and generate cache file."""
     chunks_data = []
     tables_data = []
     images_data = []
     headings_data = []
 
     if os.path.exists(paths["cache_file"]):
-        print(Fore.GREEN + Style.BRIGHT + f">>> Fetching structural entries from existing track cache path...")
+        print(Fore.GREEN + Style.BRIGHT + f">>> Using existing cache file...")
         try:
             with open(paths["cache_file"], 'r', encoding='utf-8') as cache_file:
                 cache_payload = json.load(cache_file)
@@ -429,11 +389,9 @@ def generate_and_cache_document(pdf_path, paths, logger):
                     return cache_payload.get("chunks", [])
                 return cache_payload
         except Exception as e:
-            logger.warning(f"Failed to cleanly process storage cache files: {e}")
-            traceback.print_exc()
+            logger.warning(f"Failed to load cache: {e}")
 
-    # Cache miss execution route
-    logger.info("Cache miss. Initializing DoclingExtractor parsing pipeline loops.")
+    logger.info("Cache miss. Initializing DoclingExtractor parsing pipeline.")
     try:
         chunker = HybridChunker()
         extractor = DoclingExtractor(
@@ -442,20 +400,20 @@ def generate_and_cache_document(pdf_path, paths, logger):
             images_output_path=paths["images_path"]
         )
         
-        logger.info(f"Starting single-pass document conversion logic configuration for: {pdf_path}")
+        logger.info(f"Starting document conversion for: {pdf_path}")
         conversion_result = extractor.doc_converter.convert(pdf_path)
         doc = conversion_result.document
         
-        logger.info("Extracting tables to sub-dated storage track...")
+        logger.info("Extracting tables...")
         tables_data = extractor._extract_tables(conversion_result)
         
-        logger.info("Extracting images to sub-dated storage track...")
+        logger.info("Extracting images...")
         images_data = extractor._extract_images(conversion_result)
         
-        logger.info("Extracting layout headings records...")
+        logger.info("Extracting headings...")
         headings_data = extractor._extract_headings(conversion_result)
         
-        logger.info("Executing text chunker token parsing engine rules...")
+        logger.info("Executing chunking engine...")
         raw_chunks = list(chunker.chunk(dl_doc=doc))
         
         for i, chunk in enumerate(raw_chunks):
@@ -513,7 +471,7 @@ def generate_and_cache_document(pdf_path, paths, logger):
             }
             chunks_data.append(chunk_dict)
 
-        logger.info("Cache extraction sequence run complete.")
+        logger.info("Cache extraction complete.")
         cache_payload = {
             "chunks": chunks_data,
             "tables": tables_data,
@@ -523,16 +481,31 @@ def generate_and_cache_document(pdf_path, paths, logger):
         
         with open(paths["cache_file"], 'w', encoding='utf-8') as cache_file:
             json.dump(cache_payload, cache_file, indent=4, ensure_ascii=False)
-        print(Fore.GREEN + f"Backend parsing complete. Structure saved directly to cache path location.")
+        print(Fore.GREEN + f">>> Cache saved successfully.")
         return chunks_data
     except Exception as e:
-        logger.critical(f"Pipeline processing failed to execute cleanly: {e}")
+        logger.critical(f"Pipeline processing failed: {e}")
         traceback.print_exc()
         return []
 
 
 def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file, logger):
-    """Triggers the curation user interface window."""
+    """
+    Launch chunk review with automatic section review continuation.
+    When chunk review completes, section review launches automatically.
+    """
+    def on_chunk_review_complete():
+        """Callback when chunk review finishes - auto-launch section review."""
+        logger.info("Chunk review completed. Launching section review...")
+        section_window = tk.Tk()
+        section_window.title("Section Review")
+        section_app = SectionReviewApp(
+            root=section_window,
+            output_file_path=output_file,
+            logger=logger
+        )
+        section_window.mainloop()
+
     review_window = tk.Tk()
     app = ChunkReviewApp(
         root=review_window,
@@ -540,7 +513,8 @@ def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file
         logged_chunks=logged_chunks,
         processed_indices=processed_indices,
         output_file_name=output_file,
-        logger=logger
+        logger=logger,
+        on_complete_callback=on_chunk_review_complete
     )
     review_window.mainloop()
 

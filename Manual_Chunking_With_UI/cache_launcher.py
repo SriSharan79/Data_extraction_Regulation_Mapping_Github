@@ -18,6 +18,7 @@ except ImportError:
         "Please ensure this script is saved in the same folder as your existing modules."
     )
     exit()
+
 class CacheReviewLauncher:
 
     def __init__(self, root):
@@ -60,6 +61,7 @@ class CacheReviewLauncher:
 
     # --- Registry & History Lookup Utilities ---
     def get_registered_storage(self, file_path):
+        """Retrieve previously used storage path from registry."""
         if os.path.exists(REGISTRY_FILE):
             try:
                 with open(REGISTRY_FILE, 'r', encoding='utf-8') as f:
@@ -70,6 +72,7 @@ class CacheReviewLauncher:
         return None
 
     def save_to_registry(self, file_path, storage_path):
+        """Save file-storage mapping to registry."""
         reg = {}
         if os.path.exists(REGISTRY_FILE):
             try:
@@ -85,6 +88,7 @@ class CacheReviewLauncher:
             pass
 
     def auto_populate_storage(self, file_path):
+        """Auto-populate storage field from registry history."""
         old_storage = self.get_registered_storage(file_path)
         if old_storage:
             self.entry_store.delete(0, tk.END)
@@ -92,6 +96,7 @@ class CacheReviewLauncher:
 
     # --- UI Event Handlers ---
     def browse_cache(self):
+        """Browse for cache JSON file."""
         path = filedialog.askopenfilename(filetypes=[("JSON Cache Files", "*.json")])
         if path:
             self.entry_cache.delete(0, tk.END)
@@ -99,6 +104,7 @@ class CacheReviewLauncher:
             self.auto_populate_storage(path)
             
     def browse_storage(self):
+        """Browse for storage destination directory."""
         path = filedialog.askdirectory(title="Select Base Storage Destination Folder")
         if path:
             self.entry_store.delete(0, tk.END)
@@ -129,6 +135,7 @@ class CacheReviewLauncher:
         }
 
     def validate_and_confirm_storage(self, storage_path, cache_path):
+        """Validate storage path and confirm if existing footprint found."""
         paths = self.resolve_paths(storage_path, cache_path)
         
         if os.path.exists(paths["output_file"]) or os.path.exists(paths["cache_file"]):
@@ -149,6 +156,7 @@ class CacheReviewLauncher:
         return storage_path
 
     def execute_review_session(self):
+        """Execute the complete review session: chunk review → section review."""
         cache_path = self.entry_cache.get().strip()
         storage_path = self.entry_store.get().strip()
         

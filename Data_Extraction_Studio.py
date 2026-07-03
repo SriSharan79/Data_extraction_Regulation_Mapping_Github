@@ -15,17 +15,23 @@ Design goals (intentional):
 How the hosting works
 ---------------------
 The existing UIs (`ExtractionLauncherUI`, `CacheReviewLauncher`,
-`SectionRewriterUI`) were written to own a top-level window: they call
-``root.title(...)``, ``root.geometry(...)``, ``root.destroy()`` etc. A notebook
-tab is a ``Frame``, not a window, so we hand each tool an ``_EmbeddedRoot`` -- a
-Frame that quietly no-ops the window-only calls and treats ``destroy()`` as
-"do nothing" so a tool 'closing its window' just leaves its tab in place.
+`SectionReviewApp`) were written to own a top-level
+window: they call ``root.title(...)``, ``root.geometry(...)``,
+``root.destroy()`` etc. A notebook tab is a ``Frame``, not a window, so we
+hand each tool an ``_EmbeddedRoot`` -- a Frame that quietly no-ops the
+window-only calls and treats ``destroy()`` as "do nothing" so a tool 'closing
+its window' just leaves its tab in place.
 
 The chunk-review window is normally opened by ``launch_review_app`` creating a
 brand new ``tk.Tk()``. With a studio already running that would spawn a second
 root + nested mainloop. We monkeypatch ``launch_review_app`` *on the imported
 modules only* (files on disk are untouched) to open a modal ``Toplevel`` of the
-studio instead.
+studio instead, then chain a Section Review modal automatically when chunk
+review completes.
+
+There is also a standalone "Section Review" tab that lets you open Section
+Review directly on an already-existing logged-chunks JSON, without needing to
+run chunk review again first.
 
 Tabs are built lazily on first view, each inside a try/except, so a tool whose
 heavy dependencies (docling, markitdown, PyMuPDF, ...) are not installed simply
@@ -34,6 +40,7 @@ shows an error panel in its own tab while every other tab keeps working.
 
 import importlib
 import importlib.util
+import logging
 import os
 import queue
 import sys
@@ -223,48 +230,32 @@ class _EasaTab(_JobTab):
             self.ent_src.insert(0, path)
 
     def _browse_store(self):
-        path = filedialog.askdirectory(title="Select workspace / storage directory")
+        path = filedialog.askdirectory(title="Select a workspace directory")
         if path:
             self.ent_store.delete(0, tk.END)
             self.ent_store.insert(0, path)
 
+    @staticmethod
+    def _load_easa_module():
+        path = BASE / "EASA_Data_Extractors" / "run_main.py"
+        spec = importlib.util.spec_from_file_location("easa_main", str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
     def _run(self):
         src = self.ent_src.get().strip()
-        store = self.ent_store.get().strip()
-        if not src or not store:
-            messagebox.showerror("Missing input", "Please provide a source and a storage directory.")
+        store_dir = self.ent_store.get().strip()
+        if not src or not store_dir:
+            messagebox.showerror("Missing input", "Please provide both a source and a storage directory.")
             return
         if not os.path.exists(src):
             messagebox.showerror("Not found", f"Source path does not exist:\n{src}")
             return
 
-        build_graph = self.var_graph.get()
-
         def job():
-            from EASA_Parser import extract_easa_from_zip_v3, resolve_paths
-            from EASA_Graph_builder import export_to_cosmograph_csv
-
-            if os.path.isdir(src):
-                targets = sorted(str(p) for p in Path(src).rglob("*.zip"))
-            elif src.lower().endswith(".zip"):
-                targets = [src]
-            else:
-                targets = []
-
-            if not targets:
-                print("No .zip files found at the source path.")
-                return
-
-            print(f"Found {len(targets)} archive(s) to process.")
-            for zip_path in targets:
-                print(f"\n=== Processing: {zip_path} ===")
-                extract_easa_from_zip_v3(zip_path, store)
-                if build_graph:
-                    try:
-                        paths = resolve_paths(store, zip_path)
-                        export_to_cosmograph_csv(paths["output_json"])
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[graph] Skipped graph build for {zip_path}: {exc}")
+            easa_mod = self._load_easa_module()
+            easa_mod.main(src_path=src, storage_base=store_dir, build_cosmograph=self.var_graph.get())
 
         self._run_threaded(job)
 
@@ -364,6 +355,96 @@ class _MarkdownTab(_JobTab):
 
 
 # --------------------------------------------------------------------------- #
+# Standalone Section Review tab                                              #
+# --------------------------------------------------------------------------- #
+class _SectionReviewTab:
+    """
+    Lets the user open Section Review directly on an existing output JSON
+    (the file chunk review writes to, containing "merged_headings"),
+    without needing to run chunk review first in this session. Useful for
+    re-opening and re-editing a document's sections later, independent of
+    the Cache Review / PDF Extraction tabs.
+    """
+
+    def __init__(self, frame):
+        self.frame = frame
+        self._build_picker()
+
+    def _build_picker(self):
+        form = ttk.LabelFrame(
+            self.frame,
+            text=" Open Section Review on an Existing Logged-Chunks JSON ",
+            padding=10,
+        )
+        form.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(
+            form,
+            text='Logged Chunks Output JSON (must contain "merged_headings"):',
+        ).grid(row=0, column=0, sticky="w")
+        self.ent_output = ttk.Entry(form, width=78)
+        self.ent_output.grid(row=1, column=0, padx=(0, 5), pady=3, sticky="we")
+        ttk.Button(form, text="Browse...", command=self._browse).grid(row=1, column=1)
+
+        self.btn_open = ttk.Button(
+            form, text="📝 Open Section Review", command=self._open
+        )
+        self.btn_open.grid(row=2, column=0, sticky="w", pady=8)
+
+        ttk.Label(
+            self.frame,
+            text=(
+                "Tip: this is the same output file chunk review writes to, e.g.\n"
+                "  <storage>/<doc_name>/<date>/<hash>_docling_logged_chunks.json"
+            ),
+            foreground="#666666",
+        ).pack(anchor="w", padx=10)
+
+    def _browse(self):
+        path = filedialog.askopenfilename(
+            title="Select logged chunks / sections JSON file",
+            filetypes=[("JSON Files", "*.json")],
+        )
+        if path:
+            self.ent_output.delete(0, tk.END)
+            self.ent_output.insert(0, path)
+
+    def _open(self):
+        output_path = self.ent_output.get().strip()
+        if not output_path or not os.path.exists(output_path):
+            messagebox.showerror("Error", "Please select a valid output JSON file.")
+            return
+
+        from section_review_ui import SectionReviewApp
+
+        # Tear down the picker UI and host SectionReviewApp in its place,
+        # inside the same tab (embedded, non-modal — consistent with the
+        # other embedded tabs in this studio).
+        for child in self.frame.winfo_children():
+            child.destroy()
+
+        logger = logging.getLogger("SectionReviewTab")
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            logger.addHandler(logging.StreamHandler())
+
+        host = _make_embedded_host(self.frame)
+        try:
+            SectionReviewApp(root=host, output_file_path=output_path, logger=logger)
+        except Exception as exc:  # noqa: BLE001 - surface into the tab itself
+            for child in self.frame.winfo_children():
+                tk.Frame.destroy(child)
+            message = (
+                "Section Review could not be loaded.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+            )
+            box = scrolledtext.ScrolledText(self.frame, wrap="word")
+            box.insert("1.0", message)
+            box.config(state="disabled")
+            box.pack(fill="both", expand=True, padx=10, pady=10)
+
+
+# --------------------------------------------------------------------------- #
 # Main studio window                                                         #
 # --------------------------------------------------------------------------- #
 class DataExtractionStudio:
@@ -389,7 +470,7 @@ class DataExtractionStudio:
         self._tabs = []
         self._add_tab("PDF Extraction & Review", self._build_extraction_tab)
         self._add_tab("Cache Review Launcher", self._build_cache_tab)
-        self._add_tab("Section Re-Writer", self._build_rewriter_tab)
+        self._add_tab("Section Review", self._build_section_review_tab)
         self._add_tab("EASA XML Extraction", self._build_easa_tab)
         self._add_tab("PDF -> Markdown", self._build_markdown_tab)
 
@@ -437,18 +518,44 @@ class DataExtractionStudio:
 
     # -- review-window launcher patch --------------------------------------- #
     def _make_review_launcher(self):
+        """
+        Creates a patched launch_review_app function that:
+        1. Opens chunk review in a Toplevel modal window.
+        2. When chunk review completes, auto-launches Section Review in a
+           second Toplevel modal window.
+        Used by both the PDF Extraction tab and the Cache Review tab.
+        """
         studio_root = self.root
 
         def _launch(chunks_data, logged_chunks, processed_indices, output_file, logger):
             from chunk_review_ui import ChunkReviewApp
+            from section_review_ui import SectionReviewApp
 
-            win = tk.Toplevel(studio_root)
-            win.transient(studio_root)
+            def on_chunk_review_complete():
+                logger.info("Chunk review completed. Launching section review...")
+                section_win = tk.Toplevel(studio_root)
+                section_win.transient(studio_root)
+                SectionReviewApp(
+                    root=section_win,
+                    output_file_path=output_file,
+                    logger=logger,
+                )
+                section_win.grab_set()
+                studio_root.wait_window(section_win)
+
+            chunk_win = tk.Toplevel(studio_root)
+            chunk_win.transient(studio_root)
             ChunkReviewApp(
-                win, chunks_data, logged_chunks, processed_indices, output_file, logger
+                root=chunk_win,
+                chunks_data=chunks_data,
+                logged_chunks=logged_chunks,
+                processed_indices=processed_indices,
+                output_file_name=output_file,
+                logger=logger,
+                on_complete_callback=on_chunk_review_complete,
             )
-            win.grab_set()
-            studio_root.wait_window(win)
+            chunk_win.grab_set()
+            studio_root.wait_window(chunk_win)
 
         return _launch
 
@@ -465,10 +572,8 @@ class DataExtractionStudio:
         host = _make_embedded_host(frame)
         cache_mod.CacheReviewLauncher(host)
 
-    def _build_rewriter_tab(self, frame):
-        rewriter_mod = importlib.import_module("Raw_sec_rewriter")
-        host = _make_embedded_host(frame)
-        rewriter_mod.SectionRewriterUI(host)
+    def _build_section_review_tab(self, frame):
+        _SectionReviewTab(frame)
 
     def _build_easa_tab(self, frame):
         _EasaTab(frame)

@@ -3,13 +3,14 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext
 
 class ChunkReviewApp:
-    def __init__(self, root, chunks_data, logged_chunks, processed_indices, output_file_name, logger):
+    def __init__(self, root, chunks_data, logged_chunks, processed_indices, output_file_name, logger, on_complete_callback=None):
         self.root = root
         self.chunks_data = chunks_data
         self.logged_chunks = logged_chunks
         self.processed_indices = processed_indices
         self.output_file_name = output_file_name
         self.logger = logger
+        self.on_complete_callback = on_complete_callback  # Callback when chunk review finishes
         
         self.current_pointer = 0
         
@@ -92,8 +93,12 @@ class ChunkReviewApp:
     def display_current_chunk(self):
         if self.current_pointer >= len(self.chunks_data):
             self.logger.info("All document chunks completed.")
-            messagebox.showinfo("Curation Complete", "All chunks have been successfully reviewed and processed!")
+            messagebox.showinfo("Curation Complete", "All chunks have been successfully reviewed and processed!\n\nProceeding to Section Review...")
+            
+            # --- NEW: Instead of destroying, call the callback to launch section review ---
             self.root.destroy()
+            if self.on_complete_callback:
+                self.on_complete_callback()
             return
         
         chunk = self.chunks_data[self.current_pointer]
