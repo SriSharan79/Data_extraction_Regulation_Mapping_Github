@@ -1,13 +1,3 @@
-import sys
-
-sys.path.extend([
-    r'src',
-    r'src/COLLECTION',
-    r'Working_Code',
-    r'src/DATA_ANALYSIS',
-    r'src/COMMON',
-    r'src/Command_Line_UI'
-])
 import os
 import json
 import re
@@ -20,14 +10,14 @@ from colorama import Fore, Style, init
 # NOTE: docling is heavyweight and only needed when an extraction actually runs.
 # It is imported lazily inside generate_and_cache_document() so this module (and
 # the launcher UIs that import it) load even when docling is not installed.
-from chunk_review_ui import ChunkReviewApp
-from section_review_ui import SectionReviewApp
+from .chunk_review_ui import ChunkReviewApp
+from .section_review_ui import SectionReviewApp
 import traceback
 import hashlib
 
 
-from Table_image_extractor import DoclingExtractor
-from workspace_config import REGISTRY_FILE
+from .table_image_extractor import DoclingExtractor
+from .workspace_config import REGISTRY_FILE
 # --- Initialize Colorama for background processing logs ---
 init(autoreset=True)
 

@@ -38,8 +38,8 @@ def main(src_path: str, storage_base: str, build_cosmograph: bool = False) -> li
     """
     # Imported lazily so simply importing this module (e.g. from the studio) does
     # not require xmltodict/openpyxl until an extraction is actually run.
-    from EASA_Parser import extract_easa_from_zip_v3, resolve_paths
-    from EASA_Graph_builder import export_to_cosmograph_csv
+    from .parser import extract_easa_from_zip_v3, resolve_paths
+    from .graph_builder import export_to_cosmograph_csv
 
     targets = collect_zip_targets(src_path)
     if not targets:

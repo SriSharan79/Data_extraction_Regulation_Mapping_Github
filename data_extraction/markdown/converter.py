@@ -1,9 +1,12 @@
 import os
 from pathlib import Path
 
-from markitdown import MarkItDown
 
 def convert_pdf_to_markdown(pdf_path, output_md_path):
+    # markitdown is heavyweight and only needed at conversion time; import it
+    # lazily so this module loads even when markitdown is not installed.
+    from markitdown import MarkItDown
+
     # Initialize the MarkItDown converter
     md = MarkItDown()
     

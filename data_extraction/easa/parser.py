@@ -1,14 +1,16 @@
 import hashlib
 import os
 import json
-import xmltodict
 import base64
 from pathlib import Path
 import re
 import zipfile
 import io
 import xml.etree.ElementTree as ET
-import openpyxl  # Ensure you run 'pip3 install openpyxl'
+
+# NOTE: xmltodict and openpyxl are imported lazily inside the functions that use
+# them so this module loads even when they are not installed (they are only
+# needed when an extraction actually runs).
 
 # Master global configurations mapping EASA custom layouts and MS Word OpenXML schemas
 NAMESPACES = {
@@ -159,6 +161,7 @@ def compile_hierarchy_tree(flat_nodes):
 
 def parse_document_body_stream(root, flat_nodes, rels_map, media_parts, images_dir, tables_dir):
     """Parses paragraphs, tables, and binary shapes out of the layout content stream."""
+    import openpyxl
     print("[DEBUG Body] Locating primary /word/document.xml package entry point...")
     doc_part = root.find(".//pkg:part[@pkg:name='/word/document.xml']", NAMESPACES)
     if doc_part is None:
@@ -395,6 +398,7 @@ def parse_document_body_stream(root, flat_nodes, rels_map, media_parts, images_d
     
 def generate_master_excel_index(flat_nodes, output_excel_path):
     """Generates a structured Master Index Excel file tracking all parsed keys, attributes, and text metrics."""
+    import openpyxl
     print(f"[DEBUG Excel] Compiling structural layout tracking matrix to: {output_excel_path}")
     
     wb = openpyxl.Workbook()
@@ -461,6 +465,7 @@ def generate_master_excel_index(flat_nodes, output_excel_path):
 
 def extract_easa_from_zip_v3(zip_path, storage_path):
     """Primary orchestration wrapper logic processing workspace initialization and extraction cycles."""
+    import xmltodict
     print(f"\n[DEBUG Main] Opening target archive: {zip_path}")
     
     paths = resolve_paths(storage_path, zip_path)

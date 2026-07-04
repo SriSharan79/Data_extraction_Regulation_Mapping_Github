@@ -1,14 +1,17 @@
 """
-Data Extraction Studio
-======================
+Studio base
+===========
 
-A single-window launcher that hosts every existing extraction/curation tool in
-this repository under one `ttk.Notebook`, one tab per tool.
+Shared infrastructure for the notebook-based launchers: the embedding shim,
+the background-job base class, the individual tab classes, and `_BaseStudio` —
+a notebook window that lazily builds fault-isolated tabs. Two launchers subclass
+it and pick which tabs to show: `data_extraction.studio.main`
+(DataExtractionStudio, the non-EASA tools) and `data_extraction.studio.easa`
+(EASAStudio, the EASA extraction/review tabs).
 
 Design goals (intentional):
-  * NON-INVASIVE. None of the existing tool files are modified. Each tool keeps
-    its own class / module and continues to run standalone via its own
-    ``__main__`` block. This file only *hosts* them.
+  * NON-INVASIVE. Each hosted tool keeps its own module and still runs on its
+    own (via `python -m ...`). This module only *hosts* them.
   * Each tool stays a self-contained panel in its own tab; their internals are
     never merged together.
 
@@ -38,8 +41,6 @@ heavy dependencies (docling, markitdown, PyMuPDF, ...) are not installed simply
 shows an error panel in its own tab while every other tab keeps working.
 """
 
-import importlib
-import importlib.util
 import logging
 import os
 import queue
@@ -49,14 +50,6 @@ import tkinter as tk
 import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-
-BASE = Path(__file__).resolve().parent
-
-# Make the tool packages importable without touching them.
-for _sub in ("Manual_Chunking_With_UI", "EASA_Data_Extractors", "Markdown_extraction"):
-    _p = str(BASE / _sub)
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 _SENTINEL = object()
 
@@ -235,14 +228,6 @@ class _EasaTab(_JobTab):
             self.ent_store.delete(0, tk.END)
             self.ent_store.insert(0, path)
 
-    @staticmethod
-    def _load_easa_module():
-        path = BASE / "EASA_Data_Extractors" / "run_main.py"
-        spec = importlib.util.spec_from_file_location("easa_main", str(path))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-
     def _run(self):
         src = self.ent_src.get().strip()
         store_dir = self.ent_store.get().strip()
@@ -254,8 +239,8 @@ class _EasaTab(_JobTab):
             return
 
         def job():
-            easa_mod = self._load_easa_module()
-            easa_mod.main(src_path=src, storage_base=store_dir, build_cosmograph=self.var_graph.get())
+            from data_extraction.easa import run_main
+            run_main.main(src_path=src, storage_base=store_dir, build_cosmograph=self.var_graph.get())
 
         self._run_threaded(job)
 
@@ -312,15 +297,6 @@ class _MarkdownTab(_JobTab):
             self.ent_out.delete(0, tk.END)
             self.ent_out.insert(0, path)
 
-    @staticmethod
-    def _load_md_module():
-        # The source filename contains a space, so it cannot be imported by name.
-        path = BASE / "Markdown_extraction" / "Process_files_to _Markdown.py"
-        spec = importlib.util.spec_from_file_location("process_files_to_markdown", str(path))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-
     def _run(self):
         src = self.ent_src.get().strip()
         out_dir = self.ent_out.get().strip()
@@ -332,7 +308,7 @@ class _MarkdownTab(_JobTab):
             return
 
         def job():
-            md_mod = self._load_md_module()
+            from data_extraction.markdown import converter as md_mod
             os.makedirs(out_dir, exist_ok=True)
 
             if os.path.isdir(src):
@@ -415,7 +391,7 @@ class _SectionReviewTab:
             messagebox.showerror("Error", "Please select a valid output JSON file.")
             return
 
-        from section_review_ui import SectionReviewApp
+        from data_extraction.chunking.section_review_ui import SectionReviewApp
 
         # Tear down the picker UI and host SectionReviewApp in its place,
         # inside the same tab (embedded, non-modal — consistent with the
@@ -445,35 +421,46 @@ class _SectionReviewTab:
 
 
 # --------------------------------------------------------------------------- #
-# Main studio window                                                         #
+# Base studio: shared notebook window, lazy fault-isolated tabs, and every     #
+# tab builder — reused by the main studio and the EASA studio.                 #
 # --------------------------------------------------------------------------- #
-class DataExtractionStudio:
+class _BaseStudio:
+    """A notebook window that lazily builds fault-isolated tabs.
+
+    Subclasses set WINDOW_TITLE / HEADER / GEOMETRY / MINSIZE and TAB_SPECS —
+    a list of (label, builder-method-name) pairs. Every tab builder lives on
+    this base class, so multiple launchers (the main studio, the EASA studio)
+    can compose their own subset of tabs without duplicating UI plumbing.
+    """
+
+    WINDOW_TITLE = "Studio"
+    HEADER = ""
+    GEOMETRY = "1320x880"
+    MINSIZE = (1000, 640)
+    TAB_SPECS = []  # [(label, builder_method_name), ...] — set by subclasses
+
     def __init__(self, root):
         self.root = root
-        root.title("Data Extraction Studio")
-        root.geometry("1320x880")
-        root.minsize(1000, 640)
+        root.title(self.WINDOW_TITLE)
+        root.geometry(self.GEOMETRY)
+        root.minsize(*self.MINSIZE)
 
         self._review_launcher = self._make_review_launcher()
 
-        header = ttk.Label(
-            root,
-            text="Data Extraction Studio — every tool in one place. Pick a tab to begin.",
-            font=("TkDefaultFont", 10, "bold"),
-            padding=(10, 6),
-        )
-        header.pack(fill="x")
+        if self.HEADER:
+            ttk.Label(
+                root,
+                text=self.HEADER,
+                font=("TkDefaultFont", 10, "bold"),
+                padding=(10, 6),
+            ).pack(fill="x")
 
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
 
         self._tabs = []
-        self._add_tab("PDF Extraction & Review", self._build_extraction_tab)
-        self._add_tab("Cache Review Launcher", self._build_cache_tab)
-        self._add_tab("Section Review", self._build_section_review_tab)
-        self._add_tab("EASA XML Extraction", self._build_easa_tab)
-        self._add_tab("EASA JSON Review", self._build_easa_review_tab)
-        self._add_tab("PDF -> Markdown", self._build_markdown_tab)
+        for label, builder_name in self.TAB_SPECS:
+            self._add_tab(label, getattr(self, builder_name))
 
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         # Build the initially-selected tab once the loop is running.
@@ -529,8 +516,8 @@ class DataExtractionStudio:
         studio_root = self.root
 
         def _launch(chunks_data, logged_chunks, processed_indices, output_file, logger):
-            from chunk_review_ui import ChunkReviewApp
-            from section_review_ui import SectionReviewApp
+            from data_extraction.chunking.chunk_review_ui import ChunkReviewApp
+            from data_extraction.chunking.section_review_ui import SectionReviewApp
 
             def on_chunk_review_complete():
                 logger.info("Chunk review completed. Launching section review...")
@@ -568,16 +555,16 @@ class DataExtractionStudio:
 
     # -- tab builders -------------------------------------------------------- #
     def _build_extraction_tab(self, frame):
-        chunk_logic = importlib.import_module("Chunk_review_logic")
-        chunk_logic.launch_review_app = self._review_launcher  # patch import only
+        from data_extraction.chunking import logic as chunk_logic
+        chunk_logic.launch_review_app = self._review_launcher  # patch module hook
         host = _make_embedded_host(frame)
         chunk_logic.ExtractionLauncherUI(host)
 
     def _build_cache_tab(self, frame):
-        cache_mod = importlib.import_module("cache_launcher")
-        cache_mod.launch_review_app = self._review_launcher  # patch import only
+        from data_extraction.chunking import cache_launcher
+        cache_launcher.launch_review_app = self._review_launcher  # patch module hook
         host = _make_embedded_host(frame)
-        cache_mod.CacheReviewLauncher(host)
+        cache_launcher.CacheReviewLauncher(host)
 
     def _build_section_review_tab(self, frame):
         _SectionReviewTab(frame)
@@ -586,19 +573,9 @@ class DataExtractionStudio:
         _EasaTab(frame)
 
     def _build_easa_review_tab(self, frame):
-        from EASA_Json_Review_UI import EASAJsonReviewApp
+        from data_extraction.easa.json_review_ui import EASAJsonReviewApp
         host = _make_embedded_host(frame)
         EASAJsonReviewApp(host)
 
     def _build_markdown_tab(self, frame):
         _MarkdownTab(frame)
-
-
-def main():
-    root = tk.Tk()
-    DataExtractionStudio(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()

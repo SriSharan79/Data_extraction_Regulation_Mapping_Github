@@ -22,12 +22,6 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-# Ensure sibling modules (run_main, EASA_Json_Review_UI) import cleanly when this
-# file is run directly.
-_HERE = str(Path(__file__).resolve().parent)
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
 _SENTINEL = object()
 
 
@@ -148,7 +142,7 @@ class EASAExtractionApp:
             sys.stdout = _QueueStream(self._q)
             produced = []
             try:
-                import run_main
+                from . import run_main
                 produced = run_main.main(src, store, build_cosmograph=build_graph)
             except Exception as exc:  # noqa: BLE001 - surfaced to the log
                 print(f"\n[ERROR] {exc}\n{traceback.format_exc()}\n")
@@ -188,7 +182,7 @@ class EASAExtractionApp:
             return
 
         try:
-            from EASA_Json_Review_UI import EASAJsonReviewApp
+            from .json_review_ui import EASAJsonReviewApp
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Review UI unavailable", f"Could not load the review UI:\n{exc}")
             return

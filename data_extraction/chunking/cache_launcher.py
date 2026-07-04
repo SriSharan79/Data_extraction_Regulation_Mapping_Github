@@ -6,13 +6,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from datetime import datetime
 
-from workspace_config import REGISTRY_FILE
+from .workspace_config import REGISTRY_FILE
 
-# Import the existing app hand-off hook from your main file. Re-raise on failure
-# (instead of exit()) so a hosting UI can catch it as a normal ImportError and
-# render an error panel, rather than the process being torn down by SystemExit.
+# Import the existing app hand-off hook from the logic module. Re-raise on
+# failure (instead of exit()) so a hosting UI can catch it as a normal
+# ImportError and render an error panel, rather than the process being torn
+# down by SystemExit.
 try:
-    from Chunk_review_logic import launch_review_app
+    from .logic import launch_review_app
 except ImportError:
     raise
 

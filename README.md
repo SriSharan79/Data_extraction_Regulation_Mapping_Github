@@ -4,129 +4,132 @@ Tools for turning regulatory source documents (PDFs and EASA e-Rules XML) into
 structured, human-curated data — chunked text, tables, images, section trees,
 metadata indexes, and cross-reference graphs.
 
-Every tool is reachable from a single launcher, **`Data_Extraction_Studio.py`**,
-which hosts each one as a tab. Each tool also still runs standalone.
+Everything lives in the `data_extraction` Python package and is reached through
+two notebook launchers.
 
 ## Quick start
 
 ```bash
 # from the repository root
-python3 Data_Extraction_Studio.py
+python run_studio.py        # PDF/chunk tools: extraction & review, cache review,
+                            # section review, PDF -> Markdown
+python run_easa_studio.py   # EASA tools: XML extraction, structured-JSON review
 ```
 
-The launcher opens a tabbed window. Tabs load lazily and are fault-isolated: if a
-tool's dependencies aren't installed, only that tab shows an error — the others
-keep working.
+Each launcher opens a tabbed window. Tabs load lazily and are fault-isolated: if
+a tool's heavy dependency isn't installed, only that tab shows an error (or the
+failure surfaces when you actually run it) — the other tabs keep working.
+
+## Layout
+
+```
+data_extraction/
+  chunking/    logic.py, chunk_review_ui.py, section_review_ui.py,
+               cache_launcher.py, table_image_extractor.py, workspace_config.py
+  easa/        parser.py, graph_builder.py, run_main.py,
+               extraction_ui.py, json_review_ui.py
+  markdown/    converter.py
+  studio/      base.py (shared _BaseStudio + tab classes),
+               main.py (DataExtractionStudio), easa.py (EASAStudio)
+run_studio.py, run_easa_studio.py     # entry points
+lib/           bundled UI resources
+archive/       experimental / superseded scripts (not imported)
+```
+
+All heavy third-party deps (docling, markitdown, PyMuPDF, xmltodict, openpyxl…)
+are imported **lazily**, so every module imports even when they are absent —
+they are only needed when an extraction actually runs.
 
 ## Requirements
 
 - Python 3.10+ with Tkinter (ships with the standard python.org installer)
-- Python packages — install everything from the pinned list:
+- Install everything from the pinned list:
 
   ```bash
   pip install -r requirements.txt
   ```
 
-  Or install only what a given tab needs:
-
-  | Tool / tab | Needs |
+  | Tool | Needs |
   |---|---|
-  | PDF Extraction & Review, Cache Review Launcher | `docling`, `docling-core`, `pymupdf`, `pandas`, `openpyxl`, `tqdm`, `colorama` |
-  | Section Re-Writer | (stdlib only) |
+  | PDF Extraction & Review, Cache Review | `docling`, `docling-core`, `pymupdf`, `pandas`, `openpyxl`, `tqdm`, `colorama` |
+  | Section Review | (stdlib only) |
   | EASA XML Extraction | `xmltodict`, `openpyxl` |
   | PDF → Markdown | `markitdown` |
 
 ## What each tab does
 
-### PDF Extraction & Review  /  Cache Review Launcher
-`Manual_Chunking_With_UI/Chunk_review_logic.py`, `Table_image_extractor.py`,
+### PDF Extraction & Review / Cache Review Launcher
+`data_extraction/chunking/` — `logic.py`, `table_image_extractor.py`,
 `chunk_review_ui.py`, `cache_launcher.py`
 
 - Converts a PDF with **Docling** and splits it into token-aware chunks
-  (**HybridChunker**), each tagged with headings, page numbers and doc-item types.
-- Same pass extracts **tables → CSV**, **images → PNG**, and **layout headings**.
-- Caches the parse to JSON (re-runs hit the cache and skip reprocessing).
-- The document conversion runs on a background thread, so the window stays
-  responsive; action buttons disable and a status line shows progress while a
-  job is running.
-- Interactive review window: step through each chunk, edit text/headings, then
-  **Log / Skip / Use-previous-heading**. Logged chunks are auto-merged under
-  common headings into a structured output JSON.
-- **Resume** prior progress or **Reset** it. A per-document / per-date workspace
-  is derived automatically, and a JSON registry remembers which storage folder
-  pairs with each source file.
-- Run modes: *generate cache only*, *cache + full review*, *review from an
-  existing cache*.
+  (**HybridChunker**), each tagged with headings, page numbers, doc-item types.
+- Same pass extracts **tables → CSV**, **images → PNG**, and layout headings.
+- Caches the parse to JSON (re-runs hit the cache). Conversion runs on a
+  background thread so the window stays responsive.
+- Interactive review: step through each chunk, edit text/headings, **Log / Skip /
+  Use-previous-heading**; logged chunks auto-merge under common headings, then
+  chain into **Section Review**. **Resume** or **Reset** prior progress.
 
-### Section Re-Writer
-`Manual_Chunking_With_UI/Raw_sec_rewriter.py`
+### Section Review
+`data_extraction/chunking/section_review_ui.py`
 
-Load a raw-chunks JSON (browsable tree + text inspector on the left) and
-build/edit target **sections** on the right (add, delete, rename, edit body).
-"Auto-reconstruction" bootstraps sections by grouping chunks under their first
-heading. Exports a clean sections JSON.
+Loads the merged sections from a chunk-review output JSON; select/edit/add/delete
+sections and export back to the file. Also available as its own tab to reopen an
+existing output later.
 
 ### EASA XML Extraction
-`EASA_Data_Extractors/EASA_Parser.py`
+`data_extraction/easa/parser.py` (+ `run_main.py`, `graph_builder.py`)
 
-Point at an EASA e-Rules **XML ZIP** (single file or a folder of them) to produce:
+Point at an EASA e-Rules **XML ZIP** (single file or a folder) to produce raw
+XML→JSON, a recursive **rules-hierarchy JSON**, extracted **images** and
+**tables (→ Excel)**, and a **Master Structural Index** Excel. Optionally builds
+the **Cosmograph** node/edge graph (CSV + Excel; unmatched links become
+"External Reference" nodes). Runs on a background thread with a live log.
 
-- raw XML → JSON,
-- a recursive **rules-hierarchy JSON** (topics, attributes, text, hyperlinks, children),
-- extracted **images** and **tables (→ Excel)** tagged to their sections,
-- a **Master Structural Index** Excel (22 EASA metadata attributes + per-node metrics).
+### EASA JSON Review
+`data_extraction/easa/json_review_ui.py`
 
-Optionally builds the cross-reference graph below in the same run. Runs on a
-background thread with a live log pane.
-
-### (EASA cross-reference graph)
-`EASA_Data_Extractors/EASA_Graph_builder.py`
-
-Turns an EASA extraction JSON into **Cosmograph node/edge tables** (CSV *and*
-Excel) by matching hyperlinks between topics. Unmatched links become
-"External Reference" nodes so cross-document references stay visible.
-Enabled via the checkbox on the EASA tab.
+Interactive tree viewer for the structured JSON: navigate the hierarchy, and per
+node see the text, EASA attributes, hyperlinks, and extracted images/tables
+(with native PNG/GIF preview and open-externally). Includes a search/filter.
 
 ### PDF → Markdown
-`Markdown_extraction/Process_files_to _Markdown.py`
+`data_extraction/markdown/converter.py`
 
-Batch-converts PDFs to Markdown via **MarkItDown** (single file or a folder),
-one `.md` per PDF. Threaded with a live log pane.
+Batch-converts PDFs to Markdown via **MarkItDown** (file or folder), one `.md`
+per PDF. Threaded with a live log.
 
-## How the launcher hosts the tools (non-invasive)
+## How the launchers host the tools
 
-`Data_Extraction_Studio.py` does not modify any tool file:
-
-- An `_EmbeddedRoot` shim lets each window-owning UI class run inside a notebook
-  tab unchanged (it no-ops window-only calls like `title`/`geometry`/`destroy`).
-- `launch_review_app` is monkeypatched **on the imported modules only** so the
-  chunk-review window opens as a modal `Toplevel` of the launcher instead of a
-  second root window.
+`studio/base.py` provides `_BaseStudio`: an `_EmbeddedRoot` shim lets each
+window-owning UI class run inside a notebook tab, and `launch_review_app` is
+patched so chunk review opens as a modal `Toplevel` (then chains Section Review)
+instead of spawning a second root window. `main.py` and `easa.py` just subclass
+`_BaseStudio` and declare their `TAB_SPECS`.
 
 ## Standalone use
 
-Each module still runs on its own, e.g.:
+Individual tools also run on their own via `-m` from the repo root:
 
 ```bash
-python3 Manual_Chunking_With_UI/Chunk_review_logic.py   # extraction + review launcher
-python3 Manual_Chunking_With_UI/Raw_sec_rewriter.py     # section re-writer
-python3 EASA_Data_Extractors/EASA_Parser.py             # EASA extraction (edit paths in __main__)
+python -m data_extraction.easa.extraction_ui         # EASA extraction window
+python -m data_extraction.easa.json_review_ui [file.json]   # EASA JSON review
+python -m data_extraction.studio.main                # same as run_studio.py
 ```
 
 ## Configuration
 
-- **Workspace registry path** — where the file-to-storage registry lives is
-  defined once in `Manual_Chunking_With_UI/workspace_config.py`. It defaults to
-  an OS-appropriate path and can be overridden with the
-  `DOCLING_WORKSPACE_REGISTRY` environment variable.
-- **Image de-duplication** — the PDF extractor de-duplicates images
-  perceptually only when the optional `imagehash` package is installed;
-  otherwise every image is kept.
+- **Workspace registry path** — defined once in
+  `data_extraction/chunking/workspace_config.py`; OS-appropriate default,
+  overridable with the `DOCLING_WORKSPACE_REGISTRY` environment variable.
+- **Image de-duplication** — the PDF extractor de-duplicates images perceptually
+  only when the optional `imagehash` package is installed; otherwise every image
+  is kept.
 
-## Known limitations / TODO
+## Known limitations
 
-- The launcher is byte-compile / import verified; the **live Tkinter GUI has not
-  been run** in CI — validate on the target (Windows) environment.
-- Some modules still contain **hardcoded example paths** in their `__main__`
-  blocks (`C:\Users\...`, `U:\...`); adjust these when running a module
-  standalone.
+- Import- and headless-Tk verified; the full GUI with real extractions needs the
+  heavy deps installed — validate on the target (Windows) environment.
+- Some backend modules keep hardcoded example paths in their `__main__` blocks;
+  adjust when running them directly.
