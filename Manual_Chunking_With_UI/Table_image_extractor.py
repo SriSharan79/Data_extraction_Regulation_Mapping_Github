@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 import logging
 import math
@@ -7,26 +8,34 @@ import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Tuple,Optional
+from typing import Dict, List, Tuple, Optional
 
-import fitz
 try:
     import imagehash  # optional: enables perceptual de-duplication of images
 except ImportError:
     imagehash = None
-import pandas as pd
-from tqdm import tqdm
 
-from docling_core.types.doc import PictureItem
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.base_models import InputFormat
+# NOTE: pandas, tqdm, docling and docling_core are heavyweight and only needed
+# when an extraction actually runs. They are imported lazily inside the methods
+# below so this module (and any UI that imports it) loads even when those
+# packages are not installed. `from __future__ import annotations` keeps the
+# docling type hints (e.g. PictureItem) from being evaluated at import time.
 
 
 logger = logging.getLogger(__name__)
 
 
 _IS_TTY = sys.stdout.isatty()
+
+
+def _tqdm(iterable, **kwargs):
+    """Wrap an iterable in a tqdm progress bar if tqdm is available; otherwise
+    return it unchanged (progress bars are cosmetic, not required)."""
+    try:
+        from tqdm import tqdm
+        return tqdm(iterable, **kwargs)
+    except ImportError:
+        return iterable
 
 def bbox_to_dict(bbox) -> Optional[Dict]:
     """
@@ -82,6 +91,11 @@ class DoclingExtractor:
         _ocr = enable_ocr if enable_ocr is not None else True
         _scale = image_resolution_scale if image_resolution_scale is not None else 1.0
 
+        # Heavy docling imports happen here (construction), not at module import.
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = _ocr
         pipeline_options.images_scale = _scale
@@ -120,11 +134,13 @@ class DoclingExtractor:
 
     def _extract_tables(self, doc) -> List[Dict]:
         """Extract all tables and save as CSV files."""
+        import pandas as pd
+
         tables_data = []
         self.tables_output_path.mkdir(parents=True, exist_ok=True)
 
         tables = doc.document.tables
-        for table_ix, table in enumerate(tqdm(tables, desc="[Docling] Extracting tables",
+        for table_ix, table in enumerate(_tqdm(tables, desc="[Docling] Extracting tables",
                                                unit="table", leave=False, disable=not _IS_TTY)):
             try:
                 df: pd.DataFrame = table.export_to_dataframe(doc)
@@ -177,12 +193,14 @@ class DoclingExtractor:
 
     def _extract_images(self, doc) -> List[Dict]:
         """Extract all images with deduplication. Includes 'hash' field per entry."""
+        from docling_core.types.doc import PictureItem
+
         images_data = []
         picture_counter = 0
         self.images_output_path.mkdir(parents=True, exist_ok=True)
 
         all_items = list(doc.document.iterate_items())
-        for element, _level in tqdm(all_items, desc="[Docling] Extracting images", unit="item",
+        for element, _level in _tqdm(all_items, desc="[Docling] Extracting images", unit="item",
                                     leave=False, disable=not _IS_TTY):
             if isinstance(element, PictureItem):
                 page_no = (

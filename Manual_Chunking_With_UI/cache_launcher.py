@@ -8,16 +8,13 @@ from datetime import datetime
 
 from workspace_config import REGISTRY_FILE
 
-# Import the existing app hand-off hook from your main file
+# Import the existing app hand-off hook from your main file. Re-raise on failure
+# (instead of exit()) so a hosting UI can catch it as a normal ImportError and
+# render an error panel, rather than the process being torn down by SystemExit.
 try:
     from Chunk_review_logic import launch_review_app
 except ImportError:
-    messagebox.showerror(
-        "Import Error",
-        "Could not find 'Chunk_review_logic' in the current working directory.\n"
-        "Please ensure this script is saved in the same folder as your existing modules."
-    )
-    exit()
+    raise
 
 class CacheReviewLauncher:
 

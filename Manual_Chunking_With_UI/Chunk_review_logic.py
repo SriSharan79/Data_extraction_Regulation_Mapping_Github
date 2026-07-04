@@ -17,8 +17,9 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, filedialog, scrolledtext
 from colorama import Fore, Style, init
-from docling.document_converter import DocumentConverter
-from docling.chunking import HybridChunker
+# NOTE: docling is heavyweight and only needed when an extraction actually runs.
+# It is imported lazily inside generate_and_cache_document() so this module (and
+# the launcher UIs that import it) load even when docling is not installed.
 from chunk_review_ui import ChunkReviewApp
 from section_review_ui import SectionReviewApp
 import traceback
@@ -393,6 +394,8 @@ def generate_and_cache_document(pdf_path, paths, logger):
 
     logger.info("Cache miss. Initializing DoclingExtractor parsing pipeline.")
     try:
+        from docling.chunking import HybridChunker  # heavy import, deferred to run time
+
         chunker = HybridChunker()
         extractor = DoclingExtractor(
             input_path=pdf_path,
