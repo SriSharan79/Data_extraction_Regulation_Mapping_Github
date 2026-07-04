@@ -1,13 +1,51 @@
-# Python bytecode / caches
+# Only source code and its resources are tracked.
+# Everything else — data inputs, extraction outputs, caches, envs — is ignored.
+
+# ── Python bytecode / caches ──────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────────────────────
 .venv/
 venv/
 env/
+.env
 
-# OS / editor cruft
+# ── OS / editor cruft ─────────────────────────────────────────────────────
 .DS_Store
 *.swp
+.vscode/
+.idea/
+
+# ── Data inputs & generated outputs ───────────────────────────────────────
+# (source XML dumps, extraction JSONs, master Excels, CSV tables, logs,
+#  archives, PDFs, and extracted media — all regenerable, none belong in git)
+*.json
+*.xml
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.log
+*.zip
+*.pdf
+*.docx
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.emf
+*.wmf
+*.bin
+*.faiss
+*.txt
+
+# ── Keep these project/config files (they are code, not data) ─────────────
+!requirements.txt
+
+# ── Keep the bundled UI resource libraries regardless of extension ─────────
+!lib/
+!lib/**
