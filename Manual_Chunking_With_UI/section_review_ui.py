@@ -30,40 +30,51 @@ class SectionReviewApp:
         self.accent_color = "#3498db"
         self.root.configure(bg=self.bg_color)
         
-        # Load data first
-        self.load_sections_from_output()
-        
+        # Load data first; if it fails the window is torn down, so stop before
+        # building any widgets on a destroyed root.
+        if not self.load_sections_from_output():
+            return
+
         # Build UI
         self.setup_ui()
         self.load_section_selector()
 
     def load_sections_from_output(self):
-        """Load merged_headings from chunk review output file."""
+        """Load merged_headings from the chunk review output file.
+
+        Returns True if sections were loaded and the window is usable; False if
+        the file was missing/invalid/empty (in which case the window has been
+        destroyed and __init__ must not continue to build the UI).
+        """
         if not self.output_file_path:
             self.logger.warning("No output file path provided for section review.")
-            return
-        
+            return False
+
         try:
             with open(self.output_file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
+
             self.sections_data = data.get("merged_headings", [])
             self.logger.info(f"Loaded {len(self.sections_data)} sections from chunk review output.")
-            
+
             if not self.sections_data:
                 messagebox.showwarning("No Sections Found", "No merged sections were found in the chunk review output.\nPlease complete chunk review first.")
                 self.root.destroy()
-                return
-                
+                return False
+            return True
+
         except FileNotFoundError:
             messagebox.showerror("File Not Found", f"Output file not found: {self.output_file_path}")
             self.root.destroy()
+            return False
         except json.JSONDecodeError as e:
             messagebox.showerror("JSON Error", f"Failed to parse output file: {e}")
             self.root.destroy()
+            return False
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load sections: {e}")
             self.root.destroy()
+            return False
 
     def setup_ui(self):
         """Build the section review interface."""

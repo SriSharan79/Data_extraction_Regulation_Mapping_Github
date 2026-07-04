@@ -555,8 +555,14 @@ class DataExtractionStudio:
                 logger=logger,
                 on_complete_callback=on_chunk_review_complete,
             )
-            chunk_win.grab_set()
-            studio_root.wait_window(chunk_win)
+            # If there was nothing to review (e.g. resuming an already-completed
+            # document, or an empty chunk set), ChunkReviewApp finishes inside its
+            # own __init__ and destroys chunk_win — and its on_complete callback
+            # has already run Section Review synchronously. Only grab/wait when the
+            # window is still alive, otherwise grab_set() would raise a TclError.
+            if chunk_win.winfo_exists():
+                chunk_win.grab_set()
+                studio_root.wait_window(chunk_win)
 
         return _launch
 
