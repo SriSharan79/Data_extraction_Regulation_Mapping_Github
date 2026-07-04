@@ -472,6 +472,7 @@ class DataExtractionStudio:
         self._add_tab("Cache Review Launcher", self._build_cache_tab)
         self._add_tab("Section Review", self._build_section_review_tab)
         self._add_tab("EASA XML Extraction", self._build_easa_tab)
+        self._add_tab("EASA JSON Review", self._build_easa_review_tab)
         self._add_tab("PDF -> Markdown", self._build_markdown_tab)
 
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -577,6 +578,11 @@ class DataExtractionStudio:
 
     def _build_easa_tab(self, frame):
         _EasaTab(frame)
+
+    def _build_easa_review_tab(self, frame):
+        from EASA_Json_Review_UI import EASAJsonReviewApp
+        host = _make_embedded_host(frame)
+        EASAJsonReviewApp(host)
 
     def _build_markdown_tab(self, frame):
         _MarkdownTab(frame)
