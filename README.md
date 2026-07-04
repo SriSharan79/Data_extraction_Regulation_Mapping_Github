@@ -100,6 +100,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
   per-element-type breakdown).
 - **Export** — node index → CSV/Excel, full text → Markdown, or the selected
   subtree → JSON.
+- **AI Review** (`data_extraction/ai_utils/`) — run an LLM (Blablador / DLR
+  Ollama / local) over a section with a preset or custom instruction; queue
+  several sections and run them in a **loop** ("batch"); export the results to
+  Markdown / CSV / JSON. LLM calls run on a background thread; set keys via the
+  `Ollama_DLR_API_Key` / `BlaBla_API_Key` env vars (or `API_keys_config.json`
+  under `ALR_MAIN_FOLDER`).
 
 ### PDF → Markdown
 `data_extraction/markdown/converter.py`

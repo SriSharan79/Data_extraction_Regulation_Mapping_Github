@@ -19,11 +19,29 @@ hosts it this way).
 
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+# Preset review instructions for the AI tab (label -> prompt sent with the
+# section text). "Custom…" leaves the box for the user to write their own.
+_AI_PRESETS = {
+    "Summarize this section": "Summarize this regulatory section concisely.",
+    "List key obligations / requirements":
+        "List the key obligations or requirements in this section as short bullet points.",
+    "Explain in plain language": "Explain this section in plain, non-legal language.",
+    "Extract defined terms": "Extract every defined term in this section and its definition.",
+    "Find references to other rules":
+        "List any references this section makes to other regulations, articles or sections.",
+    "Custom…": "",
+}
+
+# UI service label -> llm_call service code
+_AI_SERVICES = {"Blablador": "b", "DLR Ollama": "o", "Local model": "l"}
 
 
 def _open_externally(path: str):
@@ -54,6 +72,10 @@ class EASAJsonReviewApp:
         self.node_by_iid = {}
         self._node_count = 0
         self._preview_img = None      # keep a ref so Tk doesn't GC the preview
+        self._current_node = None     # node shown in the details pane
+        self._ai_batch = []           # queued (title, text) sections for looped AI runs
+        self._ai_results = []         # accumulated AI results for export
+        self._ai_busy = False
 
         self._build_ui()
 
@@ -207,6 +229,9 @@ class EASAJsonReviewApp:
 
         self.detail_nb.add(assets, text="Images & Tables")
 
+        # AI review tab
+        self._build_ai_tab()
+
     def _show_preview_widget(self, kind):
         """Show the image/message label ('image'/'message') or the table grid ('table')."""
         if kind == "table":
@@ -359,6 +384,7 @@ class EASAJsonReviewApp:
         self._show_node(node)
 
     def _show_node(self, node):
+        self._current_node = node
         attrs = node.get("attributes", {}) or {}
         title = attrs.get("source-title") or attrs.get("title") or node.get("element_type", "node")
         self.header_var.set(f"{title}")
@@ -714,6 +740,202 @@ class EASAJsonReviewApp:
             return
         self.status_var.set(f"Exported selected subtree → {path}")
         messagebox.showinfo("Export complete", f"Wrote selected subtree to:\n{path}")
+
+    # ----------------------------------------------------------------- AI -- #
+    def _node_title(self, node):
+        a = node.get("attributes", {}) or {}
+        return a.get("source-title") or a.get("title") or node.get("element_type", "node")
+
+    def _build_ai_tab(self):
+        ai = ttk.Frame(self.detail_nb, padding=6)
+
+        cfg = ttk.Frame(ai)
+        cfg.pack(fill="x")
+        ttk.Label(cfg, text="Service:").pack(side="left")
+        self.ai_service = ttk.Combobox(cfg, state="readonly", width=14,
+                                       values=list(_AI_SERVICES.keys()))
+        self.ai_service.set("Blablador")
+        self.ai_service.pack(side="left", padx=(4, 10))
+        ttk.Label(cfg, text="Model (optional):").pack(side="left")
+        self.ai_model = ttk.Entry(cfg, width=24)
+        self.ai_model.pack(side="left", padx=4)
+        ttk.Label(cfg, text="Preset:").pack(side="left", padx=(10, 0))
+        self.ai_preset = ttk.Combobox(cfg, state="readonly", width=28,
+                                      values=list(_AI_PRESETS.keys()))
+        self.ai_preset.pack(side="left", padx=4)
+        self.ai_preset.bind("<<ComboboxSelected>>", self._ai_on_preset)
+
+        ttk.Label(ai, text="Instruction (the selected section's text is appended automatically):").pack(
+            anchor="w", pady=(6, 0))
+        self.ai_prompt = scrolledtext.ScrolledText(ai, height=3, wrap="word")
+        self.ai_prompt.pack(fill="x")
+        self.ai_prompt.insert("1.0", _AI_PRESETS["Summarize this section"])
+        self.ai_preset.set("Summarize this section")
+
+        btns = ttk.Frame(ai)
+        btns.pack(fill="x", pady=6)
+        self.ai_run_btn = ttk.Button(btns, text="Run on current node", command=self._ai_run_current)
+        self.ai_run_btn.pack(side="left")
+        ttk.Button(btns, text="＋ Add to batch", command=self._ai_add_to_batch).pack(side="left", padx=4)
+        self.ai_batch_btn = ttk.Button(btns, text="Run batch (0)", command=self._ai_run_batch)
+        self.ai_batch_btn.pack(side="left")
+        ttk.Button(btns, text="Clear batch", command=self._ai_clear_batch).pack(side="left", padx=4)
+        ttk.Button(btns, text="Export results…", command=self._ai_export).pack(side="right")
+
+        body = ttk.PanedWindow(ai, orient="horizontal")
+        body.pack(fill="both", expand=True)
+
+        batch_wrap = ttk.LabelFrame(body, text=" Batch queue ", padding=4)
+        body.add(batch_wrap, weight=1)
+        self.ai_batch_list = tk.Listbox(batch_wrap, height=6)
+        self.ai_batch_list.pack(fill="both", expand=True)
+
+        res_wrap = ttk.LabelFrame(body, text=" Results ", padding=4)
+        body.add(res_wrap, weight=3)
+        self.ai_results = scrolledtext.ScrolledText(res_wrap, wrap="word", state="disabled")
+        self.ai_results.pack(fill="both", expand=True)
+
+        self.detail_nb.add(ai, text="AI Review")
+
+    def _ai_on_preset(self, event=None):
+        preset = self.ai_preset.get()
+        text = _AI_PRESETS.get(preset, "")
+        if preset == "Custom…":
+            return  # leave whatever the user typed
+        self.ai_prompt.delete("1.0", tk.END)
+        self.ai_prompt.insert("1.0", text)
+
+    def _ai_append(self, s):
+        self.ai_results.configure(state="normal")
+        self.ai_results.insert("end", s)
+        self.ai_results.see("end")
+        self.ai_results.configure(state="disabled")
+
+    def _ai_run_current(self):
+        if self._current_node is None:
+            messagebox.showinfo("No node", "Select a node in the tree first.")
+            return
+        node = self._current_node
+        self._ai_run([(self._node_title(node), node.get("text_content", "") or "")])
+
+    def _ai_add_to_batch(self):
+        if self._current_node is None:
+            messagebox.showinfo("No node", "Select a node in the tree first.")
+            return
+        node = self._current_node
+        title = self._node_title(node)
+        self._ai_batch.append((title, node.get("text_content", "") or ""))
+        self.ai_batch_list.insert("end", title)
+        self.ai_batch_btn.configure(text=f"Run batch ({len(self._ai_batch)})")
+
+    def _ai_clear_batch(self):
+        self._ai_batch = []
+        self.ai_batch_list.delete(0, tk.END)
+        self.ai_batch_btn.configure(text="Run batch (0)")
+
+    def _ai_run_batch(self):
+        if not self._ai_batch:
+            messagebox.showinfo("Empty batch", "Add one or more sections to the batch first.")
+            return
+        self._ai_run(list(self._ai_batch))
+
+    def _ai_run(self, jobs):
+        if self._ai_busy:
+            messagebox.showinfo("Busy", "An AI run is already in progress.")
+            return
+        instruction = self.ai_prompt.get("1.0", tk.END).strip()
+        if not instruction:
+            messagebox.showinfo("No instruction", "Enter or pick a review instruction first.")
+            return
+        # Read all Tk widget values on the main thread; the worker must not
+        # touch Tk (it runs off-thread).
+        service_label = self.ai_service.get()
+        service = _AI_SERVICES.get(service_label, "b")
+        model = self.ai_model.get().strip() or None
+
+        self._ai_busy = True
+        self.ai_run_btn.configure(state="disabled")
+        self.ai_batch_btn.configure(state="disabled")
+        self._ai_q = queue.Queue()
+        self._ai_append(f"\n=== Running on {len(jobs)} section(s) via {service_label} ===\n")
+        threading.Thread(target=self._ai_worker,
+                         args=(jobs, instruction, service, service_label, model),
+                         daemon=True).start()
+        self.root.after(150, self._ai_poll)
+
+    def _ai_worker(self, jobs, instruction, service, service_label, model):
+        try:
+            from data_extraction.ai_utils.llm_utils import llm_call
+        except Exception as exc:  # noqa: BLE001
+            self._ai_q.put(("error", f"Could not load LLM utilities: {exc}"))
+            self._ai_q.put(None)
+            return
+        for title, text in jobs:
+            prompt = f"{instruction}\n\n---\nSECTION: {title}\n\n{text}"
+            try:
+                resp = llm_call(prompt, None, service, model)
+            except Exception as exc:  # noqa: BLE001
+                resp = f"[ERROR] {exc}"
+            self._ai_q.put(("result", {
+                "title": title, "instruction": instruction, "response": resp,
+                "service": service_label, "model": model or "",
+            }))
+        self._ai_q.put(None)
+
+    def _ai_poll(self):
+        try:
+            while True:
+                item = self._ai_q.get_nowait()
+                if item is None:
+                    self._ai_busy = False
+                    self.ai_run_btn.configure(state="normal")
+                    self.ai_batch_btn.configure(state="normal")
+                    self.status_var.set(f"AI review complete — {len(self._ai_results)} result(s) total.")
+                    return
+                kind, payload = item
+                if kind == "error":
+                    self._ai_append(f"[ERROR] {payload}\n")
+                else:
+                    self._ai_results.append(payload)
+                    self._ai_append(f"\n## {payload['title']}\n{payload['response']}\n")
+        except queue.Empty:
+            pass
+        self.root.after(150, self._ai_poll)
+
+    def _ai_export(self):
+        if not self._ai_results:
+            messagebox.showinfo("No results", "Run an AI review first, then export.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("Text", "*.txt"), ("CSV", "*.csv"), ("JSON", "*.json")],
+            initialfile=self._default_export_name("ai_review", "md"))
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".json":
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self._ai_results, f, indent=2, ensure_ascii=False)
+            elif ext == ".csv":
+                import csv
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=["title", "service", "model", "instruction", "response"])
+                    w.writeheader()
+                    w.writerows(self._ai_results)
+            else:  # markdown / text
+                blocks = []
+                for r in self._ai_results:
+                    blocks.append(f"## {r['title']}\n"
+                                  f"*{r['service']} {r['model']}* — {r['instruction']}\n\n"
+                                  f"{r['response']}\n")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(blocks))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.status_var.set(f"Exported {len(self._ai_results)} AI result(s) → {path}")
+        messagebox.showinfo("Export complete", f"Wrote {len(self._ai_results)} result(s) to:\n{path}")
 
 
 def main():

@@ -25,6 +25,11 @@ openpyxl           # Excel (.xlsx) output
 # --- PDF -> Markdown ---
 markitdown[pdf]    # MarkItDown with PDF support
 
+# --- AI review (LLM calls to Blablador / DLR Ollama) ---
+requests           # HTTP calls to the OpenAI-compatible endpoints
+tiktoken           # token counting for the interaction log
+# (colorama and pandas, listed above, are also used by the AI utilities)
+
 # --- Optional ---
 # imagehash        # enables perceptual de-duplication of extracted images
 # Pillow           # broadens EASA JSON Review image preview to JPG/BMP/TIFF/…
