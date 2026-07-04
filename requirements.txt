@@ -27,3 +27,5 @@ markitdown[pdf]    # MarkItDown with PDF support
 
 # --- Optional ---
 # imagehash        # enables perceptual de-duplication of extracted images
+# Pillow           # broadens EASA JSON Review image preview to JPG/BMP/TIFF/…
+                   #   (PNG/GIF preview works without it)

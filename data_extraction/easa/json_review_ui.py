@@ -4,11 +4,14 @@ Interactive review UI for the EASA structured-extraction JSON.
 Opens the JSON produced by EASA_Parser (``{document_metadata, rules_hierarchy}``)
 and lets you navigate the regulation hierarchy as an expandable tree, with a
 details pane per node: full text, EASA attributes, hyperlinks, and extracted
-images/tables (with a native PNG/GIF preview and open-externally support).
-Includes a live search that filters the tree to matching branches.
+images/tables. Images preview inline (Pillow when available for JPG/BMP/TIFF/…,
+Tk's built-in PNG/GIF otherwise); tables (.xlsx) preview as a grid via openpyxl.
+A live search filters the tree, a Summary reviews the whole document at a glance,
+and the Export menu writes a node index (CSV/Excel), the full text (Markdown),
+or the selected subtree (JSON).
 
 Run standalone:
-    python EASA_Json_Review_UI.py [path/to/structured.json]
+    python -m data_extraction.easa.json_review_ui [path/to/structured.json]
 
 Also embeddable: pass a container Frame as ``root`` (the Data Extraction Studio
 hosts it this way).
@@ -75,6 +78,10 @@ class EASAJsonReviewApp:
         self.ent_search.bind("<Return>", lambda e: self._apply_filter())
         ttk.Button(bar, text="Find", command=self._apply_filter).pack(side="left")
         ttk.Button(bar, text="Clear", command=self._clear_filter).pack(side="left", padx=(4, 0))
+
+        # Right-aligned: review + export actions
+        self._build_export_menu(bar)
+        ttk.Button(bar, text="Summary", command=self._show_summary).pack(side="right", padx=(0, 6))
 
         # Document metadata line
         self.meta_var = tk.StringVar(value="No file loaded.")
@@ -158,31 +165,56 @@ class EASAJsonReviewApp:
         self.tab_links.pack(side="left", fill="both", expand=True)
         self.detail_nb.add(link_frame, text="Hyperlinks")
 
-        # Assets (images + tables)
+        # Assets (images + tables) with a switchable preview pane
         assets = ttk.Frame(self.detail_nb)
+
         lists = ttk.Frame(assets)
-        lists.pack(side="left", fill="both", expand=True)
+        lists.pack(side="left", fill="y")
 
         ttk.Label(lists, text="Images:").pack(anchor="w")
-        self.lst_images = tk.Listbox(lists, height=8, exportselection=False)
-        self.lst_images.pack(fill="both", expand=True)
+        self.lst_images = tk.Listbox(lists, height=8, width=36, exportselection=False)
+        self.lst_images.pack(fill="x")
         self.lst_images.bind("<<ListboxSelect>>", self._on_image_select)
         self.lst_images.bind("<Double-Button-1>", lambda e: self._open_selected_asset(self.lst_images, "images"))
 
         ttk.Label(lists, text="Tables:").pack(anchor="w", pady=(6, 0))
-        self.lst_tables = tk.Listbox(lists, height=6, exportselection=False)
-        self.lst_tables.pack(fill="both", expand=True)
+        self.lst_tables = tk.Listbox(lists, height=6, width=36, exportselection=False)
+        self.lst_tables.pack(fill="x")
+        self.lst_tables.bind("<<ListboxSelect>>", self._on_table_select)
         self.lst_tables.bind("<Double-Button-1>", lambda e: self._open_selected_asset(self.lst_tables, "tables"))
 
-        ttk.Label(assets, text="(double-click to open externally)", foreground="#777").pack(
-            side="bottom")
+        ttk.Label(lists, text="(double-click to open externally)", foreground="#777").pack(
+            anchor="w", pady=(6, 0))
 
-        preview = ttk.LabelFrame(assets, text=" Image preview (PNG/GIF) ", padding=6)
-        preview.pack(side="right", fill="both", expand=True, padx=(8, 0))
-        self.preview_label = ttk.Label(preview, text="Select an image to preview.")
-        self.preview_label.pack(fill="both", expand=True)
+        # Preview pane holds an image/message label OR a table grid; only one
+        # is packed at a time via _show_preview_widget().
+        self.preview = ttk.LabelFrame(assets, text=" Preview ", padding=6)
+        self.preview.pack(side="right", fill="both", expand=True, padx=(8, 0))
+
+        self.preview_label = ttk.Label(self.preview, anchor="center",
+                                       text="Select an image or table to preview.")
+
+        self.table_wrap = ttk.Frame(self.preview)
+        self.table_preview = ttk.Treeview(self.table_wrap, show="headings", height=12)
+        tp_y = ttk.Scrollbar(self.table_wrap, orient="vertical", command=self.table_preview.yview)
+        tp_x = ttk.Scrollbar(self.table_wrap, orient="horizontal", command=self.table_preview.xview)
+        self.table_preview.configure(yscrollcommand=tp_y.set, xscrollcommand=tp_x.set)
+        tp_y.pack(side="right", fill="y")
+        tp_x.pack(side="bottom", fill="x")
+        self.table_preview.pack(side="left", fill="both", expand=True)
+
+        self._show_preview_widget("message")
 
         self.detail_nb.add(assets, text="Images & Tables")
+
+    def _show_preview_widget(self, kind):
+        """Show the image/message label ('image'/'message') or the table grid ('table')."""
+        if kind == "table":
+            self.preview_label.pack_forget()
+            self.table_wrap.pack(fill="both", expand=True)
+        else:
+            self.table_wrap.pack_forget()
+            self.preview_label.pack(fill="both", expand=True)
 
     # --------------------------------------------------------------- load -- #
     def _browse(self):
@@ -370,7 +402,8 @@ class EASAJsonReviewApp:
         self.lst_tables.delete(0, tk.END)
         for tbl in tables:
             self.lst_tables.insert(tk.END, tbl)
-        self.preview_label.configure(image="", text="Select an image to preview.")
+        self._show_preview_widget("message")
+        self.preview_label.configure(image="", text="Select an image or table to preview.")
         self._preview_img = None
 
     def _resolve_asset(self, filename, kind):
@@ -383,30 +416,104 @@ class EASAJsonReviewApp:
         # Fall back to the filename as-is (in case it is already a full path).
         return filename if os.path.exists(filename) else None
 
+    def _make_preview_photo(self, path, max_px=500):
+        """Return a Tk-displayable image for ``path``, or None if the format
+        cannot be previewed inline. Uses Pillow when available (JPG/BMP/TIFF/PNG/
+        GIF/…), falling back to Tk's built-in PNG/GIF support."""
+        try:
+            from PIL import Image, ImageTk
+            with Image.open(path) as im:
+                if im.mode not in ("RGB", "RGBA", "L"):
+                    im = im.convert("RGBA")
+                im.thumbnail((max_px, max_px))
+                return ImageTk.PhotoImage(im)
+        except ImportError:
+            pass  # Pillow not installed — try the Tk-native path below.
+        except Exception:
+            return None  # Pillow is present but cannot decode this format (e.g. EMF).
+        try:
+            photo = tk.PhotoImage(file=path)
+            w = photo.width()
+            if w > max_px:
+                f = max(1, w // max_px)
+                photo = photo.subsample(f, f)
+            return photo
+        except Exception:
+            return None
+
     def _on_image_select(self, event=None):
         sel = self.lst_images.curselection()
         if not sel:
             return
         filename = self.lst_images.get(sel[0])
         path = self._resolve_asset(filename, "images")
+        self._show_preview_widget("image")
         if not path:
             self.preview_label.configure(image="", text=f"(file not found)\n{filename}")
             self._preview_img = None
             return
-        # Tk's PhotoImage supports PNG/GIF natively; other formats fall back.
-        try:
-            self._preview_img = tk.PhotoImage(file=path)
-            # Downscale very large images so they fit the pane.
-            w = self._preview_img.width()
-            if w > 520:
-                factor = max(1, w // 520)
-                self._preview_img = self._preview_img.subsample(factor, factor)
+        photo = self._make_preview_photo(path)
+        if photo is not None:
+            self._preview_img = photo  # keep a ref so Tk doesn't GC it
             self.preview_label.configure(image=self._preview_img, text="")
-        except Exception:
+        else:
             self._preview_img = None
             self.preview_label.configure(
-                image="", text=f"No inline preview for this format.\nDouble-click to open:\n{filename}"
+                image="",
+                text=f"No inline preview for this format.\nDouble-click to open externally:\n{filename}",
             )
+
+    def _on_table_select(self, event=None):
+        sel = self.lst_tables.curselection()
+        if not sel:
+            return
+        filename = self.lst_tables.get(sel[0])
+        path = self._resolve_asset(filename, "tables")
+        if not path:
+            self._show_preview_widget("message")
+            self.preview_label.configure(image="", text=f"(file not found)\n{filename}")
+            return
+        self._show_table_preview(path, filename)
+
+    def _show_table_preview(self, path, filename, max_rows=200, max_cols=30):
+        """Render the first sheet of an .xlsx table as a grid via openpyxl."""
+        try:
+            import openpyxl
+        except ImportError:
+            self._show_preview_widget("message")
+            self.preview_label.configure(
+                image="",
+                text="openpyxl is not installed — cannot preview tables inline.\n"
+                     "Double-click to open the file externally.",
+            )
+            return
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                rows.append(row)
+                if i >= max_rows - 1:
+                    break
+            wb.close()
+        except Exception as exc:  # noqa: BLE001
+            self._show_preview_widget("message")
+            self.preview_label.configure(image="", text=f"Could not read table:\n{exc}")
+            return
+
+        ncols = min(max((len(r) for r in rows), default=0), max_cols)
+        cols = [f"c{i}" for i in range(ncols)]
+        self.table_preview.delete(*self.table_preview.get_children())
+        self.table_preview.configure(columns=cols)
+        for i, c in enumerate(cols):
+            self.table_preview.heading(c, text=f"Col {i + 1}")
+            self.table_preview.column(c, width=110, anchor="w", stretch=False)
+        for r in rows:
+            vals = ["" if v is None else str(v) for v in r][:ncols]
+            vals += [""] * (ncols - len(vals))
+            self.table_preview.insert("", "end", values=vals)
+        self._show_preview_widget("table")
+        self.status_var.set(f"Table '{filename}': showing {len(rows)} row(s) (capped at {max_rows}).")
 
     def _open_selected_asset(self, listbox, kind):
         sel = listbox.curselection()
@@ -418,6 +525,195 @@ class EASAJsonReviewApp:
             _open_externally(path)
         else:
             messagebox.showinfo("Not found", f"Could not locate the file on disk:\n{filename}")
+
+    # ------------------------------------------------------------- review -- #
+    def _iter_nodes(self, nodes=None, depth=0):
+        """Yield (node, depth) for every node in the loaded hierarchy, depth-first."""
+        if nodes is None:
+            nodes = getattr(self, "_hierarchy", []) or []
+        for node in nodes:
+            yield node, depth
+            yield from self._iter_nodes(node.get("children") or [], depth + 1)
+
+    def _show_summary(self):
+        """Pop up a document-level overview: totals and a per-type breakdown."""
+        if not getattr(self, "_hierarchy", None):
+            messagebox.showinfo("Nothing loaded", "Load a structured JSON first.")
+            return
+        from collections import Counter
+
+        types = Counter()
+        totals = {"nodes": 0, "images": 0, "tables": 0, "hyperlinks": 0, "text": 0}
+        for node, _ in self._iter_nodes():
+            totals["nodes"] += 1
+            types[node.get("element_type", "?")] += 1
+            totals["images"] += len(node.get("extracted_images") or [])
+            totals["tables"] += len(node.get("extracted_tables") or [])
+            totals["hyperlinks"] += len(node.get("hyperlinks") or [])
+            totals["text"] += len(node.get("text_content", "") or "")
+
+        meta = self.data.get("document_metadata", {}) if isinstance(self.data, dict) else {}
+        stem = Path(self.json_path).stem if self.json_path else ""
+        lines = [
+            f"Document : {meta.get('source-title', stem)}",
+            f"Domain   : {meta.get('Domain', '')}",
+            "",
+            f"Total nodes      : {totals['nodes']}",
+            f"Total hyperlinks : {totals['hyperlinks']}",
+            f"Total images     : {totals['images']}",
+            f"Total tables     : {totals['tables']}",
+            f"Total text       : {totals['text']:,} chars",
+            "",
+            "Nodes by element type:",
+        ]
+        for t, c in types.most_common():
+            lines.append(f"   {t:<22} {c}")
+
+        win = tk.Toplevel(self.root)
+        win.title("Document Summary")
+        win.geometry("480x440")
+        txt = scrolledtext.ScrolledText(win, wrap="word", font=("TkFixedFont", 10))
+        txt.insert("1.0", "\n".join(lines))
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
+
+    # ------------------------------------------------------------- export -- #
+    def _build_export_menu(self, bar):
+        mb = ttk.Menubutton(bar, text="Export ▾")
+        menu = tk.Menu(mb, tearoff=False)
+        menu.add_command(label="Node index → CSV…", command=lambda: self._export_index("csv"))
+        menu.add_command(label="Node index → Excel…", command=lambda: self._export_index("xlsx"))
+        menu.add_separator()
+        menu.add_command(label="All text → Markdown…", command=self._export_text)
+        menu.add_command(label="Selected subtree → JSON…", command=self._export_subtree)
+        mb["menu"] = menu
+        mb.pack(side="right", padx=(0, 6))
+
+    def _default_export_name(self, kind, ext):
+        stem = Path(self.json_path).stem if self.json_path else "easa"
+        return f"{stem}_{kind}.{ext}"
+
+    def _flatten_rows(self):
+        """Flatten the hierarchy into one row per node — an overview table."""
+        rows = []
+        for node, depth in self._iter_nodes():
+            attrs = node.get("attributes", {}) or {}
+            text = node.get("text_content", "") or ""
+            rows.append({
+                "sdt_id": attrs.get("sdt-id", ""),
+                "element_type": node.get("element_type", ""),
+                "title": attrs.get("source-title") or attrs.get("title") or "",
+                "domain": attrs.get("Domain", ""),
+                "type_of_content": attrs.get("TypeOfContent", ""),
+                "depth": depth,
+                "n_children": len(node.get("children") or []),
+                "n_hyperlinks": len(node.get("hyperlinks") or []),
+                "n_images": len(node.get("extracted_images") or []),
+                "n_tables": len(node.get("extracted_tables") or []),
+                "text_length": len(text),
+                "text_preview": text[:200].replace("\n", " "),
+            })
+        return rows
+
+    def _export_index(self, fmt):
+        if not getattr(self, "_hierarchy", None):
+            messagebox.showinfo("Nothing loaded", "Load a structured JSON first.")
+            return
+        rows = self._flatten_rows()
+        headers = list(rows[0].keys()) if rows else []
+
+        if fmt == "csv":
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+                initialfile=self._default_export_name("node_index", "csv"))
+            if not path:
+                return
+            try:
+                import csv
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=headers)
+                    w.writeheader()
+                    w.writerows(rows)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Export failed", str(exc))
+                return
+        else:
+            try:
+                import openpyxl
+            except ImportError:
+                messagebox.showerror("openpyxl needed", "Install openpyxl to export to Excel.")
+                return
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+                initialfile=self._default_export_name("node_index", "xlsx"))
+            if not path:
+                return
+            try:
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Node Index"
+                ws.append(headers)
+                for r in rows:
+                    ws.append([r[h] for h in headers])
+                wb.save(path)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Export failed", str(exc))
+                return
+
+        self.status_var.set(f"Exported {len(rows)} nodes → {path}")
+        messagebox.showinfo("Export complete", f"Wrote {len(rows)} rows to:\n{path}")
+
+    def _export_text(self):
+        if not getattr(self, "_hierarchy", None):
+            messagebox.showinfo("Nothing loaded", "Load a structured JSON first.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".md", filetypes=[("Markdown", "*.md"), ("Text", "*.txt")],
+            initialfile=self._default_export_name("text", "md"))
+        if not path:
+            return
+        lines = []
+        for node, depth in self._iter_nodes():
+            attrs = node.get("attributes", {}) or {}
+            title = attrs.get("source-title") or attrs.get("title")
+            text = (node.get("text_content", "") or "").strip()
+            if title:
+                lines.append(f"{'#' * min(depth + 1, 6)} {title}")
+            if text:
+                lines.append(text)
+            if title or text:
+                lines.append("")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.status_var.set(f"Exported document text → {path}")
+        messagebox.showinfo("Export complete", f"Wrote text to:\n{path}")
+
+    def _export_subtree(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a node in the tree first.")
+            return
+        node = self.node_by_iid.get(sel[0])
+        if node is None:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", filetypes=[("JSON", "*.json")],
+            initialfile=self._default_export_name("subtree", "json"))
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(node, f, indent=2, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.status_var.set(f"Exported selected subtree → {path}")
+        messagebox.showinfo("Export complete", f"Wrote selected subtree to:\n{path}")
 
 
 def main():

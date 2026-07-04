@@ -91,8 +91,15 @@ the **Cosmograph** node/edge graph (CSV + Excel; unmatched links become
 `data_extraction/easa/json_review_ui.py`
 
 Interactive tree viewer for the structured JSON: navigate the hierarchy, and per
-node see the text, EASA attributes, hyperlinks, and extracted images/tables
-(with native PNG/GIF preview and open-externally). Includes a search/filter.
+node see the text, EASA attributes, hyperlinks, and extracted assets:
+
+- **Image preview** — inline, using Pillow when available (JPG/BMP/TIFF/PNG/GIF)
+  and Tk's built-in PNG/GIF otherwise; anything else opens externally.
+- **Table preview** — `.xlsx` tables render as a grid (via openpyxl).
+- **Search/filter** the tree; **Summary** gives a document overview (totals and a
+  per-element-type breakdown).
+- **Export** — node index → CSV/Excel, full text → Markdown, or the selected
+  subtree → JSON.
 
 ### PDF → Markdown
 `data_extraction/markdown/converter.py`
