@@ -40,10 +40,10 @@ def resolve_paths(storage_path, zip_file_path):
         "images_dir": os.path.join(target_root, "images"),
         "tables_dir": os.path.join(target_root, "tables"),
         "output_json": os.path.join(target_root, f"{base_hash}_Extraction_Json.json"),
-        "output_json_com": os.path.join(Com_root, f"{doc_name}.json"),
+        "output_json_com": os.path.join(Structured_Json_root, f"{doc_name}.json"),
         "Raw_xml_json_com": os.path.join(Raw_xml_root, f"{doc_name}.json"),
         'master_excel' : os.path.join(target_root, f"Master_Structural_Index.xlsx"),
-        'master_excel_com' : os.path.join(Com_root,f"{doc_name}.xlsx")
+        'master_excel_com' : os.path.join(excel_com_root,f"{doc_name}.xlsx")
     }
 def sanitize_filename(name):
     """Converts a topic title into a safe, clean string usable as an OS filename."""
