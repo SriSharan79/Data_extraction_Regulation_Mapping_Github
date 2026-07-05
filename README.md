@@ -103,9 +103,10 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
 - **AI Review** (`data_extraction/ai_utils/`) — run an LLM (Blablador / DLR
   Ollama / local) over a section with a preset or custom instruction; queue
   several sections and run them in a **loop** ("batch"); export the results to
-  Markdown / CSV / JSON. LLM calls run on a background thread; set keys via the
-  `Ollama_DLR_API_Key` / `BlaBla_API_Key` env vars (or `API_keys_config.json`
-  under `ALR_MAIN_FOLDER`).
+  Markdown / CSV / JSON. LLM calls run on a background thread. Manage keys with
+  the **API keys…** button on the tab (add / edit / clear, persisted to
+  `API_keys_config.json` under `ALR_MAIN_FOLDER`); the
+  `Ollama_DLR_API_Key` / `BlaBla_API_Key` env vars still take precedence.
 
 ### PDF → Markdown
 `data_extraction/markdown/converter.py`

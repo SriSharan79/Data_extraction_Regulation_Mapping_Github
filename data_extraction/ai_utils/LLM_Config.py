@@ -84,6 +84,22 @@ def set_api_key(API_Key_type, api_key):
     return api_key
 
 
+def delete_api_key(API_Key_type):
+    """Remove a stored API key from the environment and the config file."""
+    env_name = KEY_ENV_NAMES.get(API_Key_type)
+    if env_name:
+        os.environ.pop(env_name, None)
+
+    config_data = _load_config()
+    if API_Key_type in config_data:
+        del config_data[API_Key_type]
+        try:
+            with open(API_keys_config, 'w') as file:
+                json.dump(config_data, file, indent=4)
+        except OSError as e:
+            print(f"Warning: could not update {API_keys_config}: {e}")
+
+
 def get_api_key(API_Key_type):
     """
     CLI helper: return the stored key, or prompt for it on the console and

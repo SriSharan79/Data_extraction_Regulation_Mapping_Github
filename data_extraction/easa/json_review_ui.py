@@ -764,6 +764,7 @@ class EASAJsonReviewApp:
                                       values=list(_AI_PRESETS.keys()))
         self.ai_preset.pack(side="left", padx=4)
         self.ai_preset.bind("<<ComboboxSelected>>", self._ai_on_preset)
+        ttk.Button(cfg, text="API keys…", command=self._ai_manage_keys).pack(side="right")
 
         ttk.Label(ai, text="Instruction (the selected section's text is appended automatically):").pack(
             anchor="w", pady=(6, 0))
@@ -796,6 +797,14 @@ class EASAJsonReviewApp:
         self.ai_results.pack(fill="both", expand=True)
 
         self.detail_nb.add(ai, text="AI Review")
+
+    def _ai_manage_keys(self):
+        try:
+            from ..ai_utils.key_manager_ui import open_api_key_dialog
+        except Exception as exc:  # pragma: no cover - ai_utils should always ship
+            messagebox.showerror("API Keys", f"Key manager unavailable:\n{exc}")
+            return
+        open_api_key_dialog(self.root)
 
     def _ai_on_preset(self, event=None):
         preset = self.ai_preset.get()
