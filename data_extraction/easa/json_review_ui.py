@@ -43,6 +43,16 @@ _AI_PRESETS = {
 # UI service label -> llm_call service code
 _AI_SERVICES = {"Blablador": "b", "DLR Ollama": "o", "Local model": "l"}
 
+# Answer-format label -> directive appended to the LLM prompt ("" = free-form)
+_AI_OUTPUT_FORMATS = {
+    "Plain text": "",
+    "Markdown": "Format your entire answer as Markdown.",
+    "JSON": ("Return your entire answer as a single valid JSON object — "
+             "no code fences, no commentary outside the JSON."),
+    "CSV table": ("Return your entire answer as CSV with a header row — "
+                  "no code fences, no commentary outside the CSV."),
+}
+
 
 def _open_externally(path: str):
     """Open a file with the OS default application (cross-platform)."""
@@ -764,6 +774,11 @@ class EASAJsonReviewApp:
                                       values=list(_AI_PRESETS.keys()))
         self.ai_preset.pack(side="left", padx=4)
         self.ai_preset.bind("<<ComboboxSelected>>", self._ai_on_preset)
+        ttk.Label(cfg, text="Answer as:").pack(side="left", padx=(10, 0))
+        self.ai_format = ttk.Combobox(cfg, state="readonly", width=10,
+                                      values=list(_AI_OUTPUT_FORMATS.keys()))
+        self.ai_format.set("Plain text")
+        self.ai_format.pack(side="left", padx=4)
         ttk.Button(cfg, text="API keys…", command=self._ai_manage_keys).pack(side="right")
 
         ttk.Label(ai, text="Instruction (the selected section's text is appended automatically):").pack(
@@ -846,7 +861,34 @@ class EASAJsonReviewApp:
         if not self._ai_batch:
             messagebox.showinfo("Empty batch", "Add one or more sections to the batch first.")
             return
+        fmt = self._ai_ask_format()
+        if fmt is None:  # user cancelled
+            return
+        self.ai_format.set(fmt)
         self._ai_run(list(self._ai_batch))
+
+    def _ai_ask_format(self):
+        """Modal dialog: how should the LLM format the results? None = cancel."""
+        win = tk.Toplevel(self.root)
+        win.title("Result format")
+        win.transient(self.root.winfo_toplevel())
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="In which format should the LLM return the batch results?\n"
+                            "(The instruction is sent to the model with every section.)").pack(anchor="w")
+        var = tk.StringVar(value=self.ai_format.get() or "Plain text")
+        for fmt in _AI_OUTPUT_FORMATS:
+            ttk.Radiobutton(frm, text=fmt, value=fmt, variable=var).pack(anchor="w", pady=1)
+        chosen = []
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="e", pady=(8, 0))
+        ttk.Button(btns, text="Run", command=lambda: (chosen.append(var.get()), win.destroy())).pack(
+            side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left")
+        win.grab_set()
+        win.wait_window()
+        return chosen[0] if chosen else None
 
     def _ai_run(self, jobs):
         if self._ai_busy:
@@ -861,33 +903,39 @@ class EASAJsonReviewApp:
         service_label = self.ai_service.get()
         service = _AI_SERVICES.get(service_label, "b")
         model = self.ai_model.get().strip() or None
+        fmt = self.ai_format.get() or "Plain text"
+        directive = _AI_OUTPUT_FORMATS.get(fmt, "")
 
         self._ai_busy = True
         self.ai_run_btn.configure(state="disabled")
         self.ai_batch_btn.configure(state="disabled")
         self._ai_q = queue.Queue()
-        self._ai_append(f"\n=== Running on {len(jobs)} section(s) via {service_label} ===\n")
+        self._ai_append(f"\n=== Running on {len(jobs)} section(s) via {service_label}"
+                        f" — answer as {fmt} ===\n")
         threading.Thread(target=self._ai_worker,
-                         args=(jobs, instruction, service, service_label, model),
+                         args=(jobs, instruction, service, service_label, model,
+                               fmt, directive),
                          daemon=True).start()
         self.root.after(150, self._ai_poll)
 
-    def _ai_worker(self, jobs, instruction, service, service_label, model):
+    def _ai_worker(self, jobs, instruction, service, service_label, model,
+                   fmt, directive):
         try:
             from data_extraction.ai_utils.llm_utils import llm_call
         except Exception as exc:  # noqa: BLE001
             self._ai_q.put(("error", f"Could not load LLM utilities: {exc}"))
             self._ai_q.put(None)
             return
+        full_instruction = f"{instruction}\n{directive}" if directive else instruction
         for title, text in jobs:
-            prompt = f"{instruction}\n\n---\nSECTION: {title}\n\n{text}"
+            prompt = f"{full_instruction}\n\n---\nSECTION: {title}\n\n{text}"
             try:
                 resp = llm_call(prompt, None, service, model)
             except Exception as exc:  # noqa: BLE001
                 resp = f"[ERROR] {exc}"
             self._ai_q.put(("result", {
                 "title": title, "instruction": instruction, "response": resp,
-                "service": service_label, "model": model or "",
+                "service": service_label, "model": model or "", "format": fmt,
             }))
         self._ai_q.put(None)
 
@@ -917,11 +965,13 @@ class EASAJsonReviewApp:
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".md",
-            filetypes=[("Markdown", "*.md"), ("Text", "*.txt"), ("CSV", "*.csv"), ("JSON", "*.json")],
+            filetypes=[("Markdown", "*.md"), ("Text", "*.txt"), ("CSV", "*.csv"),
+                       ("Excel", "*.xlsx"), ("JSON", "*.json")],
             initialfile=self._default_export_name("ai_review", "md"))
         if not path:
             return
         ext = os.path.splitext(path)[1].lower()
+        columns = ["title", "service", "model", "format", "instruction", "response"]
         try:
             if ext == ".json":
                 with open(path, "w", encoding="utf-8") as f:
@@ -929,9 +979,28 @@ class EASAJsonReviewApp:
             elif ext == ".csv":
                 import csv
                 with open(path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=["title", "service", "model", "instruction", "response"])
+                    w = csv.DictWriter(f, fieldnames=columns)
                     w.writeheader()
                     w.writerows(self._ai_results)
+            elif ext == ".xlsx":
+                from openpyxl import Workbook
+                from openpyxl.styles import Alignment, Font
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "AI Review"
+                ws.append([c.capitalize() for c in columns])
+                for cell in ws[1]:
+                    cell.font = Font(bold=True)
+                for r in self._ai_results:
+                    ws.append([str(r.get(c, "")) for c in columns])
+                widths = {"A": 40, "B": 12, "C": 18, "D": 12, "E": 40, "F": 90}
+                for col, width in widths.items():
+                    ws.column_dimensions[col].width = width
+                wrap = Alignment(wrap_text=True, vertical="top")
+                for row in ws.iter_rows(min_row=2):
+                    for cell in row:
+                        cell.alignment = wrap
+                wb.save(path)
             else:  # markdown / text
                 blocks = []
                 for r in self._ai_results:
