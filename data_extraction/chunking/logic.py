@@ -513,6 +513,8 @@ def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file
 
 
 def main():
+    from ..crash_logging import install
+    install()
     root = tk.Tk()
     launcher = ExtractionLauncherUI(root)
     root.mainloop()

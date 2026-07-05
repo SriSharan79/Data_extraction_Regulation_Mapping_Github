@@ -27,6 +27,8 @@ class EASAStudio(_BaseStudio):
 
 
 def main():
+    from ..crash_logging import install
+    install()
     root = tk.Tk()
     EASAStudio(root)
     root.mainloop()

@@ -225,6 +225,8 @@ class CacheReviewLauncher:
         launch_review_app(chunks_data, logged_chunks, processed_indices, paths["output_file"], logger)
 
 if __name__ == "__main__":
+    from ..crash_logging import install
+    install()
     main_window = tk.Tk()
     app = CacheReviewLauncher(main_window)
     main_window.mainloop()

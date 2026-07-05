@@ -139,6 +139,12 @@ python -m data_extraction.studio.main                # same as run_studio.py
 - **Image de-duplication** — the PDF extractor de-duplicates images perceptually
   only when the optional `imagehash` package is installed; otherwise every image
   is kept.
+- **Crash logs** — every launcher installs `data_extraction/crash_logging.py` at
+  startup, so any uncaught exception (main thread, background thread, or Tk
+  callback) is written with its full traceback to
+  `~/.data_extraction/logs/crashes.log` (override the folder with the
+  `DATA_EXTRACTION_LOG_DIR` environment variable). Tk-callback crashes also show
+  an error dialog pointing at the log file instead of failing silently.
 
 ## Known limitations
 

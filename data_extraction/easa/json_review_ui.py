@@ -939,6 +939,8 @@ class EASAJsonReviewApp:
 
 
 def main():
+    from ..crash_logging import install
+    install()
     path = sys.argv[1] if len(sys.argv) > 1 else None
     root = tk.Tk()
     EASAJsonReviewApp(root, json_path=path)

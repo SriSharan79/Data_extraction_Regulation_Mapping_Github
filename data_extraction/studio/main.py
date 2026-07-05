@@ -28,6 +28,8 @@ class DataExtractionStudio(_BaseStudio):
 
 
 def main():
+    from ..crash_logging import install
+    install()
     root = tk.Tk()
     DataExtractionStudio(root)
     root.mainloop()

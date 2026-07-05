@@ -192,6 +192,8 @@ class EASAExtractionApp:
 
 
 def main():
+    from ..crash_logging import install
+    install()
     root = tk.Tk()
     EASAExtractionApp(root)
     root.mainloop()

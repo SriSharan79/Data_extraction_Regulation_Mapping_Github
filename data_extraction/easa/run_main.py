@@ -69,6 +69,9 @@ def main(src_path: str, storage_base: str, build_cosmograph: bool = False) -> li
 if __name__ == "__main__":
     import argparse
 
+    from ..crash_logging import install
+    install()
+
     parser = argparse.ArgumentParser(description="Extract EASA XML ZIP archives.")
     parser.add_argument("source", help="A .zip file or a folder of .zip files")
     parser.add_argument("storage", help="Workspace / storage directory")
