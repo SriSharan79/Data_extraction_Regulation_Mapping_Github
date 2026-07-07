@@ -98,6 +98,11 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
 - **Table preview** — `.xlsx` tables render as a grid (via openpyxl).
 - **Search/filter** the tree; **Summary** gives a document overview (totals and a
   per-element-type breakdown).
+- **Checkbox selection** — every node has a ✓ checkbox (click it, or press
+  Space on the highlighted row); **Select all** / **Clear checks** buttons and
+  the ✓ column heading toggle all visible nodes at once. Checks survive
+  filtering, and **＋ Add checked to batch** queues all checked sections for a
+  looped AI run in document order (duplicates are skipped).
 - **Export** — node index → CSV/Excel, full text → Markdown, or the selected
   subtree → JSON.
 - **AI Review** (`data_extraction/ai_utils/`) — run an LLM (Blablador / DLR

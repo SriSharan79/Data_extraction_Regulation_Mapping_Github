@@ -81,6 +81,7 @@ class EASAJsonReviewApp:
         self.assets_base = None       # dir that holds images/ and tables/
         self.node_by_iid = {}
         self._node_count = 0
+        self._checked = {}            # id(node) -> node, survives re-filtering
         self._preview_img = None      # keep a ref so Tk doesn't GC the preview
         self._current_node = None     # node shown in the details pane
         self._ai_batch = []           # queued (title, text) sections for looped AI runs
@@ -131,13 +132,22 @@ class EASAJsonReviewApp:
         tree_tools.pack(fill="x")
         ttk.Button(tree_tools, text="Expand all", command=lambda: self._set_all_open(True)).pack(side="left")
         ttk.Button(tree_tools, text="Collapse all", command=lambda: self._set_all_open(False)).pack(side="left", padx=4)
+        ttk.Button(tree_tools, text="Select all", command=self._select_all_checks).pack(side="left", padx=(8, 0))
+        ttk.Button(tree_tools, text="Clear checks", command=self._clear_checks).pack(side="left", padx=4)
+        self.check_var = tk.StringVar(value="0 checked")
+        ttk.Label(tree_tools, textvariable=self.check_var, foreground="#444444").pack(side="right")
 
-        self.tree = ttk.Treeview(left, show="tree", selectmode="browse")
+        self.tree = ttk.Treeview(left, columns=("sel",), show="tree headings", selectmode="browse")
+        self.tree.heading("#0", text="Node")
+        self.tree.heading("sel", text="✓", command=self._toggle_check_all)
+        self.tree.column("sel", width=34, minwidth=28, anchor="center", stretch=False)
         yscroll = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
         yscroll.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True, pady=(4, 0))
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._toggle_check_selected)
 
         right = ttk.Frame(paned)
         paned.add(right, weight=2)
@@ -308,6 +318,8 @@ class EASAJsonReviewApp:
         self.meta_var.set(f"📄 {title}" + (f"   ·   Domain: {domain}" if domain else ""))
 
         self._hierarchy = hierarchy
+        self._checked.clear()
+        self._update_check_status()
         self._populate_tree()
 
     # --------------------------------------------------------------- tree -- #
@@ -335,7 +347,8 @@ class EASAJsonReviewApp:
     def _insert_node(self, parent_iid, node, filt):
         if filt and not self._subtree_matches(node, filt):
             return
-        iid = self.tree.insert(parent_iid, "end", text=self._node_label(node))
+        iid = self.tree.insert(parent_iid, "end", text=self._node_label(node),
+                               values=("☑" if id(node) in self._checked else "☐",))
         self.node_by_iid[iid] = node
         self._node_count += 1
         for child in (node.get("children") or []):
@@ -376,6 +389,74 @@ class EASAJsonReviewApp:
                 walk(c)
         for iid in self.tree.get_children():
             walk(iid)
+
+    # -------------------------------------------------------- checkboxes -- #
+    def _set_check(self, iid, node, checked):
+        if checked:
+            self._checked[id(node)] = node
+        else:
+            self._checked.pop(id(node), None)
+        self.tree.set(iid, "sel", "☑" if checked else "☐")
+
+    def _on_tree_click(self, event):
+        # Toggle only when the click lands in the ✓ column; everything else
+        # keeps the normal select/expand behaviour.
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            return None
+        if self.tree.identify_column(event.x) != "#1":
+            return None
+        iid = self.tree.identify_row(event.y)
+        node = self.node_by_iid.get(iid)
+        if node is None:
+            return None
+        self._set_check(iid, node, id(node) not in self._checked)
+        self._update_check_status()
+        return "break"
+
+    def _toggle_check_selected(self, event=None):
+        for iid in self.tree.selection():
+            node = self.node_by_iid.get(iid)
+            if node is not None:
+                self._set_check(iid, node, id(node) not in self._checked)
+        self._update_check_status()
+        return "break"
+
+    def _select_all_checks(self):
+        """Check every visible node (respects an active search filter)."""
+        for iid, node in self.node_by_iid.items():
+            self._set_check(iid, node, True)
+        self._update_check_status()
+
+    def _clear_checks(self):
+        self._checked.clear()
+        for iid in self.node_by_iid:
+            self.tree.set(iid, "sel", "☐")
+        self._update_check_status()
+
+    def _toggle_check_all(self):
+        """✓ heading click: select all visible, or clear if all are checked."""
+        if self.node_by_iid and all(id(n) in self._checked
+                                    for n in self.node_by_iid.values()):
+            self._clear_checks()
+        else:
+            self._select_all_checks()
+
+    def _update_check_status(self):
+        self.check_var.set(f"{len(self._checked)} checked")
+
+    def _checked_in_doc_order(self):
+        """Checked nodes in document order (including any hidden by a filter)."""
+        out = []
+
+        def walk(node):
+            if id(node) in self._checked:
+                out.append(node)
+            for child in (node.get("children") or []):
+                walk(child)
+
+        for node in (getattr(self, "_hierarchy", None) or []):
+            walk(node)
+        return out
 
     # ------------------------------------------------------------ details -- #
     def _set_text(self, widget, content):
@@ -793,6 +874,7 @@ class EASAJsonReviewApp:
         self.ai_run_btn = ttk.Button(btns, text="Run on current node", command=self._ai_run_current)
         self.ai_run_btn.pack(side="left")
         ttk.Button(btns, text="＋ Add to batch", command=self._ai_add_to_batch).pack(side="left", padx=4)
+        ttk.Button(btns, text="＋ Add checked to batch", command=self._ai_add_checked).pack(side="left")
         self.ai_batch_btn = ttk.Button(btns, text="Run batch (0)", command=self._ai_run_batch)
         self.ai_batch_btn.pack(side="left")
         ttk.Button(btns, text="Clear batch", command=self._ai_clear_batch).pack(side="left", padx=4)
@@ -851,6 +933,26 @@ class EASAJsonReviewApp:
         self._ai_batch.append((title, node.get("text_content", "") or ""))
         self.ai_batch_list.insert("end", title)
         self.ai_batch_btn.configure(text=f"Run batch ({len(self._ai_batch)})")
+
+    def _ai_add_checked(self):
+        nodes = self._checked_in_doc_order()
+        if not nodes:
+            messagebox.showinfo(
+                "Nothing checked",
+                "Tick the ✓ checkboxes in the tree first (or use Select all).")
+            return
+        queued = {(t, txt) for t, txt in self._ai_batch}
+        added = 0
+        for node in nodes:
+            job = (self._node_title(node), node.get("text_content", "") or "")
+            if job in queued:
+                continue
+            self._ai_batch.append(job)
+            self.ai_batch_list.insert("end", job[0])
+            added += 1
+        self.ai_batch_btn.configure(text=f"Run batch ({len(self._ai_batch)})")
+        self.status_var.set(f"Added {added} checked section(s) to the AI batch"
+                            + (f" ({len(nodes) - added} already queued)." if added < len(nodes) else "."))
 
     def _ai_clear_batch(self):
         self._ai_batch = []
