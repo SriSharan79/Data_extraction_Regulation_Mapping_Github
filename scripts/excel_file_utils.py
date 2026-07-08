@@ -33,10 +33,10 @@ def save_unique_elements_to_new_sheet(
     separator=";",
 ):
     try:
-        # 1. Read the Excel file to extract data
+        # 1. Read the source Excel file to extract data
         df = pd.read_excel(file_path)
 
-        # Check if the column exists
+        # Check if the column exists in the source data
         if column_name not in df.columns:
             print(f"Error: Column '{column_name}' not found in the Excel file.")
             return
@@ -49,21 +49,34 @@ def save_unique_elements_to_new_sheet(
             unique_elements.update(elements)
 
         # Convert the sorted unique elements into a DataFrame
+        new_col_name = f"Unique_{column_name}"
         unique_df = pd.DataFrame(
-            sorted(list(unique_elements)), columns=[f"Unique_{column_name}"]
+            sorted(list(unique_elements)), columns=[new_col_name]
         )
 
-        # 2. Append the new sheet to the same Excel file
-        # 'mode="a"' appends to the file, and 'if_sheet_exists="replace"'
-        # overwrites the sheet if you run the script multiple times.
+        # 2. Check if the target sheet already exists
+        existing_sheets = pd.ExcelFile(file_path).sheet_names
+        
+        if new_sheet_name in existing_sheets:
+            # Read the existing data in the target sheet
+            existing_df = pd.read_excel(file_path, sheet_name=new_sheet_name)
+            
+            # Combine the existing columns with the new column
+            # pd.concat with axis=1 handles columns of different lengths automatically
+            target_df = pd.concat([existing_df, unique_df], axis=1)
+        else:
+            # If the sheet doesn't exist yet, our new dataframe is the target
+            target_df = unique_df
+
+        # 3. Write the combined data back to the Excel file
         with pd.ExcelWriter(
             file_path, mode="a", engine="openpyxl", if_sheet_exists="replace"
         ) as writer:
-            unique_df.to_excel(writer, sheet_name=new_sheet_name, index=False)
+            target_df.to_excel(writer, sheet_name=new_sheet_name, index=False)
 
         print(
-            f"Success! Extracted {len(unique_elements)} unique elements and saved them "
-            f"into the sheet '{new_sheet_name}' inside '{file_path}'."
+            f"Success! Added '{new_col_name}' ({len(unique_elements)} elements) "
+            f"into the sheet '{new_sheet_name}'."
         )
 
     except Exception as e:
@@ -134,33 +147,37 @@ def organize_pdf_files(
 # --- Configuration ---
 if __name__ == "__main__":
     
-    #     # Replace with your actual file path, column name, and desired new sheet name
-    # EXCEL_FILE = r"U:\ALR DATA\AI_SE-Domains_pdfs\IEEE Excels on the Content in IEEE Explore\IEEEXplore_Global_All-Conference-Series.xlsx"
-    # COLUMN_TO_PROCESS = "subjects"
-    # NEW_SHEET = "Unique Categories"
-    
-    # save_unique_elements_to_new_sheet(
-    #     EXCEL_FILE, COLUMN_TO_PROCESS, new_sheet_name=NEW_SHEET
-    # )
-    
-    # unique_results = get_unique_elements(EXCEL_FILE, COLUMN_TO_PROCESS)
+        # Replace with your actual file path, column name, and desired new sheet name
+    EXCEL_FILE = r"C:\Users\kata_du\Documents\Literature\EASA\XML _Data_extractions\EAR for CS-25 Amdt 27 (xml) fix 12.22 FINAL (1)\CS-25 _Section_analysis_by AI.xlsx"
+    COLUMNS_TO_PROCESS = [
+                        "System Info",
+                        "Personal Involved",
+                        "References"
+                         ]
+    NEW_SHEET = "Unique Categories"
+    for col in COLUMNS_TO_PROCESS:
+        save_unique_elements_to_new_sheet(
+            EXCEL_FILE, col, new_sheet_name=NEW_SHEET
+        )
+        
+        unique_results = get_unique_elements(EXCEL_FILE, col)
 
-    # print(f"\nFound {len(unique_results)} unique elements:\n")
-    # for item in sorted(unique_results):
-    #     print(f"- {item}")
+        print(f"\nFound {len(unique_results)} unique elements:\n")
+        for item in sorted(unique_results):
+            print(f"- {item}")
 
     # Update these paths and column names to match your environment
-    EXCEL_FILE_PATH = r"U:\ALR DATA\IEEE Systems Conference\publications_metadata.xlsx"
-    FILENAME_COLUMN = "File_Name"  # e.g., 'document_1.pdf'
-    CATEGORY_COLUMN = "Container"  # e.g., 'Computing and Processing'
+    # EXCEL_FILE_PATH = r"U:\ALR DATA\IEEE Systems Conference\publications_metadata.xlsx"
+    # FILENAME_COLUMN = "File_Name"  # e.g., 'document_1.pdf'
+    # CATEGORY_COLUMN = "Container"  # e.g., 'Computing and Processing'
 
-    SOURCE_FOLDER = r"U:\ALR DATA\IEEE Systems Conference\failed_pdfs"
-    STORAGE_FOLDER = r"U:\ALR DATA\IEEE Systems Conference"
+    # SOURCE_FOLDER = r"U:\ALR DATA\IEEE Systems Conference\failed_pdfs"
+    # STORAGE_FOLDER = r"U:\ALR DATA\IEEE Systems Conference"
 
-    organize_pdf_files(
-        excel_path=EXCEL_FILE_PATH,
-        file_col=FILENAME_COLUMN,
-        category_col=CATEGORY_COLUMN,
-        source_dir=SOURCE_FOLDER,
-        target_dir=STORAGE_FOLDER,
-    )
+    # organize_pdf_files(
+    #     excel_path=EXCEL_FILE_PATH,
+    #     file_col=FILENAME_COLUMN,
+    #     category_col=CATEGORY_COLUMN,
+    #     source_dir=SOURCE_FOLDER,
+    #     target_dir=STORAGE_FOLDER,
+    # )

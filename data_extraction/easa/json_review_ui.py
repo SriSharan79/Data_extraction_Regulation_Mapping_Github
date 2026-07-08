@@ -27,6 +27,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from data_extraction.ai_utils.llm_utils import get_selected_model, list_available_models, set_selected_model
+
 # Preset review instructions for the AI tab (label -> prompt sent with the
 # section text). "Custom…" leaves the box for the user to write their own.
 _AI_PRESETS = {
@@ -854,17 +856,20 @@ class EASAJsonReviewApp:
         ai = ttk.Frame(self.main_nb, padding=6)
         self.main_nb.add(ai, text="AI Review")
 
-        cfg = ttk.Frame(ai)
-        cfg.pack(fill="x")
-        ttk.Label(cfg, text="Service:").pack(side="left")
-        self.ai_service = ttk.Combobox(cfg, state="readonly", width=14,
-                                       values=list(_AI_SERVICES.keys()))
-        self.ai_service.set("Blablador")
-        self.ai_service.pack(side="left", padx=(4, 10))
-        ttk.Label(cfg, text="Model (optional):").pack(side="left")
-        self.ai_model = ttk.Entry(cfg, width=24)
-        self.ai_model.pack(side="left", padx=4)
-        ttk.Button(cfg, text="API keys…", command=self._ai_manage_keys).pack(side="right")
+        # Integrated Modern Service Engine Frame
+        llm_frame = ttk.Frame(ai)
+        llm_frame.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(llm_frame, text="LLM Processing Service Engine:").pack(side="left", padx=5)
+        self.llm_choice_an = ttk.Combobox(llm_frame, values=["O", "B"], width=5, state="readonly")
+        self.llm_choice_an.set("O")
+        self.llm_choice_an.pack(side="left", padx=5)
+        
+        ttk.Button(llm_frame, text="Choose Model...",
+                   command=lambda: self._choose_model_action(self.llm_choice_an.get())
+                   ).pack(side="left", padx=5)
+        
+        ttk.Button(llm_frame, text="API keys…", command=self._ai_manage_keys).pack(side="right", padx=5)
 
         body = ttk.PanedWindow(ai, orient="horizontal")
         body.pack(fill="both", expand=True, pady=(6, 0))
@@ -1095,11 +1100,13 @@ class EASAJsonReviewApp:
         if not instruction:
             messagebox.showinfo("No instruction", "Enter or pick a review instruction first.")
             return
-        # Read all Tk widget values on the main thread; the worker must not
-        # touch Tk (it runs off-thread).
-        service_label = self.ai_service.get()
-        service = _AI_SERVICES.get(service_label, "b")
-        model = self.ai_model.get().strip() or None
+            
+        # Dynamically map the modern engine panel to active session choices
+        provider_code = self.llm_choice_an.get().upper()
+        service = "o" if provider_code == "O" else "b"
+        service_label = "DLR Ollama" if provider_code == "O" else "BlaBla"
+        model = get_selected_model(service_label)
+        
         fmt = self.ai_format.get() or "Plain text"
         directive = _AI_OUTPUT_FORMATS.get(fmt, "")
 
@@ -1107,7 +1114,7 @@ class EASAJsonReviewApp:
         self._ai_set_busy_buttons("disabled")
         self._ai_q = queue.Queue()
         self._ai_append(f"\n=== Running on {len(jobs)} section(s) via {service_label}"
-                        f" — answer as {fmt} ===\n")
+                        f" ({model or 'default'}) — answer as {fmt} ===\n")
         threading.Thread(target=self._ai_worker,
                          args=(jobs, instruction, service, service_label, model,
                                fmt, directive),
@@ -1209,6 +1216,61 @@ class EASAJsonReviewApp:
             return
         self.status_var.set(f"Exported {len(self._ai_results)} AI result(s) → {path}")
         messagebox.showinfo("Export complete", f"Wrote {len(self._ai_results)} result(s) to:\n{path}")
+        
+    def _choose_model_action(self, provider_code):
+        """
+        Fetch the live list of available models for the selected provider
+        ('O' = DLR Ollama, 'B' = Blablador), let the user pick one, and store
+        it as the session model used by all subsequent LLM calls.
+        """
+        service = "DLR Ollama" if str(provider_code).upper() == "O" else "BlaBla"
+
+        print(f"Fetching available {service} models...")
+        try:
+            models = list_available_models(service)
+        except Exception as e:
+            messagebox.showerror("Model list failed", f"Could not fetch models for {service}:\n{e}")
+            return
+
+        if not models:
+            messagebox.showwarning("No models", f"No models returned for {service}.\nKeeping current: {get_selected_model(service)}")
+            return
+
+        current = get_selected_model(service)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Select {service} Model")
+        dialog.geometry("560x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text=f"Available {service} models (current: {current}):",
+                  font=("Arial", 10, "bold")).pack(padx=10, pady=8, anchor="w")
+
+        list_frame = ttk.Frame(dialog)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
+        listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set)
+        scrollbar.config(command=listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+
+        for m in models:
+            listbox.insert(tk.END, m)
+        if current in models:
+            idx = models.index(current)
+            listbox.selection_set(idx)
+            listbox.see(idx)
+
+        def _on_confirm():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showinfo("No selection", "Please select a model, or close the dialog to keep the current one.")
+                return
+            set_selected_model(service, models[sel[0]])
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Use Selected Model", command=_on_confirm).pack(pady=10)
 
     def _ai_set_busy_buttons(self, state):
         self.ai_run_btn.configure(state=state)
@@ -1289,9 +1351,12 @@ class EASAJsonReviewApp:
         jobs = list(self._ai_batch)
         columns = [name for name, _ in self._ai_columns]
         prompt_head = self._col_prompt_text()
-        service_label = self.ai_service.get()
-        service = _AI_SERVICES.get(service_label, "b")
-        model = self.ai_model.get().strip() or None
+        
+        # Dynamically map modern engine panel values to active session configurations
+        provider_code = self.llm_choice_an.get().upper()
+        service = "o" if provider_code == "O" else "b"
+        service_label = "DLR Ollama" if provider_code == "O" else "BlaBla"
+        model = get_selected_model(service_label)
 
         # New run: rebuild the table for the current column set.
         self._col_results = []
