@@ -105,13 +105,22 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
   looped AI run in document order (duplicates are skipped).
 - **Export** — node index → CSV/Excel, full text → Markdown, or the selected
   subtree → JSON.
-- **AI Review** (`data_extraction/ai_utils/`) — run an LLM (Blablador / DLR
-  Ollama / local) over a section with a preset or custom instruction; queue
-  several sections and run them in a **loop** ("batch"). An **Answer as**
-  picker (Plain text / Markdown / JSON / CSV table) is sent to the model so
-  responses come back in that format — batch runs ask for it explicitly before
-  starting. Export the results to Markdown / CSV / **Excel** / JSON. LLM calls
-  run on a background thread. Manage keys with
+- **AI Review** (`data_extraction/ai_utils/`) — a full-width top-level page
+  next to *Browse & Review*, fed by a shared **sections queue** (add the
+  current node or all checked nodes; remove/clear). Two modes:
+  - *Free-form review* — preset or custom instruction per section, run on the
+    current node or loop over the queue. An **Answer as** picker (Plain text /
+    Markdown / JSON / CSV table) is sent to the model so responses come back in
+    that format — queued runs ask for it explicitly before starting. Export to
+    Markdown / CSV / Excel / JSON.
+  - *Column analysis* — define **columns** (name + what the LLM should
+    extract); a live **prompt preview** rebuilds as you add/edit/remove them.
+    Each queued section is analyzed into one table row per section with one
+    cell per column (the model is asked for strict JSON; unparseable replies
+    are surfaced as `[unparsed]`). Double-click a row for full values; export
+    the table to Excel / CSV / JSON.
+
+  LLM calls run on a background thread. Manage keys with
   the **API keys…** button on the tab (add / edit / clear, persisted to
   `API_keys_config.json` under `ALR_MAIN_FOLDER`); the
   `Ollama_DLR_API_Key` / `BlaBla_API_Key` env vars still take precedence.

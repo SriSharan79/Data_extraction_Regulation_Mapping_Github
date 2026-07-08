@@ -85,8 +85,14 @@ class EASAJsonReviewApp:
         self._preview_img = None      # keep a ref so Tk doesn't GC the preview
         self._current_node = None     # node shown in the details pane
         self._ai_batch = []           # queued (title, text) sections for looped AI runs
-        self._ai_results = []         # accumulated AI results for export
+        self._ai_results = []         # accumulated free-form AI results for export
         self._ai_busy = False
+        self._ai_columns = [          # (name, what the LLM should extract)
+            ("Summary", "A one-sentence summary of the section."),
+            ("References", "Other rules, articles or sections this section refers to."),
+        ]
+        self._col_results = []        # column-analysis rows (dicts) for export
+        self._col_table_cols = []     # column names currently shown in the table
 
         self._build_ui()
 
@@ -121,9 +127,16 @@ class EASAJsonReviewApp:
         ttk.Label(self.root, textvariable=self.meta_var, foreground="#444444",
                   padding=(10, 0)).pack(fill="x")
 
+        # Top-level pages: Browse & Review | AI Review
+        self.main_nb = ttk.Notebook(self.root)
+        self.main_nb.pack(fill="both", expand=True, padx=8, pady=6)
+
+        browse = ttk.Frame(self.main_nb)
+        self.main_nb.add(browse, text="Browse & Review")
+
         # Main split: tree (left) | details (right)
-        paned = ttk.PanedWindow(self.root, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=8, pady=6)
+        paned = ttk.PanedWindow(browse, orient="horizontal")
+        paned.pack(fill="both", expand=True)
 
         left = ttk.Frame(paned)
         paned.add(left, weight=1)
@@ -159,6 +172,9 @@ class EASAJsonReviewApp:
         self.detail_nb = ttk.Notebook(right)
         self.detail_nb.pack(fill="both", expand=True)
         self._build_detail_tabs()
+
+        # Full-width AI Review page (second top-level tab)
+        self._build_ai_tab()
 
         # Status bar
         self.status_var = tk.StringVar(value="")
@@ -248,9 +264,6 @@ class EASAJsonReviewApp:
         self._show_preview_widget("message")
 
         self.detail_nb.add(assets, text="Images & Tables")
-
-        # AI review tab
-        self._build_ai_tab()
 
     def _show_preview_widget(self, kind):
         """Show the image/message label ('image'/'message') or the table grid ('table')."""
@@ -838,7 +851,8 @@ class EASAJsonReviewApp:
         return a.get("source-title") or a.get("title") or node.get("element_type", "node")
 
     def _build_ai_tab(self):
-        ai = ttk.Frame(self.detail_nb, padding=6)
+        ai = ttk.Frame(self.main_nb, padding=6)
+        self.main_nb.add(ai, text="AI Review")
 
         cfg = ttk.Frame(ai)
         cfg.pack(fill="x")
@@ -850,7 +864,36 @@ class EASAJsonReviewApp:
         ttk.Label(cfg, text="Model (optional):").pack(side="left")
         self.ai_model = ttk.Entry(cfg, width=24)
         self.ai_model.pack(side="left", padx=4)
-        ttk.Label(cfg, text="Preset:").pack(side="left", padx=(10, 0))
+        ttk.Button(cfg, text="API keys…", command=self._ai_manage_keys).pack(side="right")
+
+        body = ttk.PanedWindow(ai, orient="horizontal")
+        body.pack(fill="both", expand=True, pady=(6, 0))
+
+        # Left: the shared sections queue both run modes consume
+        batch_wrap = ttk.LabelFrame(body, text=" Sections queue ", padding=4)
+        body.add(batch_wrap, weight=1)
+        self.ai_batch_list = tk.Listbox(batch_wrap, height=6, selectmode="extended")
+        self.ai_batch_list.pack(fill="both", expand=True)
+        qbtns = ttk.Frame(batch_wrap)
+        qbtns.pack(fill="x", pady=(4, 0))
+        ttk.Button(qbtns, text="＋ Current node", command=self._ai_add_to_batch).pack(side="left")
+        ttk.Button(qbtns, text="＋ Checked", command=self._ai_add_checked).pack(side="left", padx=4)
+        ttk.Button(qbtns, text="Remove", command=self._ai_remove_selected).pack(side="left")
+        ttk.Button(qbtns, text="Clear", command=self._ai_clear_batch).pack(side="left", padx=4)
+
+        # Right: free-form review | column analysis
+        self.ai_nb = ttk.Notebook(body)
+        body.add(self.ai_nb, weight=3)
+        self._build_ai_freeform_tab()
+        self._build_ai_columns_tab()
+
+    def _build_ai_freeform_tab(self):
+        ff = ttk.Frame(self.ai_nb, padding=6)
+        self.ai_nb.add(ff, text="Free-form review")
+
+        cfg = ttk.Frame(ff)
+        cfg.pack(fill="x")
+        ttk.Label(cfg, text="Preset:").pack(side="left")
         self.ai_preset = ttk.Combobox(cfg, state="readonly", width=28,
                                       values=list(_AI_PRESETS.keys()))
         self.ai_preset.pack(side="left", padx=4)
@@ -860,40 +903,81 @@ class EASAJsonReviewApp:
                                       values=list(_AI_OUTPUT_FORMATS.keys()))
         self.ai_format.set("Plain text")
         self.ai_format.pack(side="left", padx=4)
-        ttk.Button(cfg, text="API keys…", command=self._ai_manage_keys).pack(side="right")
 
-        ttk.Label(ai, text="Instruction (the selected section's text is appended automatically):").pack(
+        ttk.Label(ff, text="Instruction (the section's text is appended automatically):").pack(
             anchor="w", pady=(6, 0))
-        self.ai_prompt = scrolledtext.ScrolledText(ai, height=3, wrap="word")
+        self.ai_prompt = scrolledtext.ScrolledText(ff, height=3, wrap="word")
         self.ai_prompt.pack(fill="x")
         self.ai_prompt.insert("1.0", _AI_PRESETS["Summarize this section"])
         self.ai_preset.set("Summarize this section")
 
-        btns = ttk.Frame(ai)
+        btns = ttk.Frame(ff)
         btns.pack(fill="x", pady=6)
         self.ai_run_btn = ttk.Button(btns, text="Run on current node", command=self._ai_run_current)
         self.ai_run_btn.pack(side="left")
-        ttk.Button(btns, text="＋ Add to batch", command=self._ai_add_to_batch).pack(side="left", padx=4)
-        ttk.Button(btns, text="＋ Add checked to batch", command=self._ai_add_checked).pack(side="left")
-        self.ai_batch_btn = ttk.Button(btns, text="Run batch (0)", command=self._ai_run_batch)
-        self.ai_batch_btn.pack(side="left")
-        ttk.Button(btns, text="Clear batch", command=self._ai_clear_batch).pack(side="left", padx=4)
+        self.ai_batch_btn = ttk.Button(btns, text="Run queued (0)", command=self._ai_run_batch)
+        self.ai_batch_btn.pack(side="left", padx=4)
         ttk.Button(btns, text="Export results…", command=self._ai_export).pack(side="right")
 
-        body = ttk.PanedWindow(ai, orient="horizontal")
-        body.pack(fill="both", expand=True)
-
-        batch_wrap = ttk.LabelFrame(body, text=" Batch queue ", padding=4)
-        body.add(batch_wrap, weight=1)
-        self.ai_batch_list = tk.Listbox(batch_wrap, height=6)
-        self.ai_batch_list.pack(fill="both", expand=True)
-
-        res_wrap = ttk.LabelFrame(body, text=" Results ", padding=4)
-        body.add(res_wrap, weight=3)
+        res_wrap = ttk.LabelFrame(ff, text=" Results ", padding=4)
+        res_wrap.pack(fill="both", expand=True)
         self.ai_results = scrolledtext.ScrolledText(res_wrap, wrap="word", state="disabled")
         self.ai_results.pack(fill="both", expand=True)
 
-        self.detail_nb.add(ai, text="AI Review")
+    def _build_ai_columns_tab(self):
+        ca = ttk.Frame(self.ai_nb, padding=6)
+        self.ai_nb.add(ca, text="Column analysis")
+
+        top = ttk.PanedWindow(ca, orient="horizontal")
+        top.pack(fill="x")
+
+        # Column definitions: every change here rebuilds the prompt preview.
+        cols_wrap = ttk.LabelFrame(top, text=" Columns to extract ", padding=4)
+        top.add(cols_wrap, weight=1)
+        self.col_defs = ttk.Treeview(cols_wrap, columns=("what",), show="tree headings", height=5)
+        self.col_defs.heading("#0", text="Column")
+        self.col_defs.heading("what", text="What should the LLM extract?")
+        self.col_defs.column("#0", width=140, anchor="w")
+        self.col_defs.column("what", width=380, anchor="w")
+        self.col_defs.pack(fill="x")
+        self.col_defs.bind("<<TreeviewSelect>>", self._col_on_select)
+
+        edit = ttk.Frame(cols_wrap)
+        edit.pack(fill="x", pady=(4, 0))
+        ttk.Label(edit, text="Name:").pack(side="left")
+        self.col_name = ttk.Entry(edit, width=16)
+        self.col_name.pack(side="left", padx=4)
+        ttk.Label(edit, text="Extract:").pack(side="left")
+        self.col_what = ttk.Entry(edit)
+        self.col_what.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(edit, text="Add / Update", command=self._col_add_update).pack(side="left")
+        ttk.Button(edit, text="Remove", command=self._col_remove).pack(side="left", padx=4)
+        ttk.Button(edit, text="Clear all", command=self._col_clear).pack(side="left")
+
+        prev_wrap = ttk.LabelFrame(top, text=" Prompt preview (sent per section) ", padding=4)
+        top.add(prev_wrap, weight=1)
+        self.col_preview = scrolledtext.ScrolledText(prev_wrap, height=8, wrap="word",
+                                                     state="disabled")
+        self.col_preview.pack(fill="both", expand=True)
+
+        run_row = ttk.Frame(ca)
+        run_row.pack(fill="x", pady=6)
+        self.col_run_btn = ttk.Button(run_row, text="Analyze queued (0)", command=self._col_run)
+        self.col_run_btn.pack(side="left")
+        ttk.Button(run_row, text="Export table…", command=self._col_export).pack(side="right")
+
+        table_wrap = ttk.LabelFrame(ca, text=" Analysis table (one row per section) ", padding=4)
+        table_wrap.pack(fill="both", expand=True)
+        self.col_table = ttk.Treeview(table_wrap, show="headings")
+        ct_y = ttk.Scrollbar(table_wrap, orient="vertical", command=self.col_table.yview)
+        ct_x = ttk.Scrollbar(table_wrap, orient="horizontal", command=self.col_table.xview)
+        self.col_table.configure(yscrollcommand=ct_y.set, xscrollcommand=ct_x.set)
+        ct_y.pack(side="right", fill="y")
+        ct_x.pack(side="bottom", fill="x")
+        self.col_table.pack(side="left", fill="both", expand=True)
+        self.col_table.bind("<Double-Button-1>", self._col_show_row)
+
+        self._col_refresh_defs()
 
     def _ai_manage_keys(self):
         try:
@@ -932,7 +1016,7 @@ class EASAJsonReviewApp:
         title = self._node_title(node)
         self._ai_batch.append((title, node.get("text_content", "") or ""))
         self.ai_batch_list.insert("end", title)
-        self.ai_batch_btn.configure(text=f"Run batch ({len(self._ai_batch)})")
+        self._ai_update_queue_counts()
 
     def _ai_add_checked(self):
         nodes = self._checked_in_doc_order()
@@ -950,14 +1034,25 @@ class EASAJsonReviewApp:
             self._ai_batch.append(job)
             self.ai_batch_list.insert("end", job[0])
             added += 1
-        self.ai_batch_btn.configure(text=f"Run batch ({len(self._ai_batch)})")
+        self._ai_update_queue_counts()
         self.status_var.set(f"Added {added} checked section(s) to the AI batch"
                             + (f" ({len(nodes) - added} already queued)." if added < len(nodes) else "."))
+
+    def _ai_remove_selected(self):
+        for i in reversed(self.ai_batch_list.curselection()):
+            del self._ai_batch[i]
+            self.ai_batch_list.delete(i)
+        self._ai_update_queue_counts()
 
     def _ai_clear_batch(self):
         self._ai_batch = []
         self.ai_batch_list.delete(0, tk.END)
-        self.ai_batch_btn.configure(text="Run batch (0)")
+        self._ai_update_queue_counts()
+
+    def _ai_update_queue_counts(self):
+        n = len(self._ai_batch)
+        self.ai_batch_btn.configure(text=f"Run queued ({n})")
+        self.col_run_btn.configure(text=f"Analyze queued ({n})")
 
     def _ai_run_batch(self):
         if not self._ai_batch:
@@ -1009,8 +1104,7 @@ class EASAJsonReviewApp:
         directive = _AI_OUTPUT_FORMATS.get(fmt, "")
 
         self._ai_busy = True
-        self.ai_run_btn.configure(state="disabled")
-        self.ai_batch_btn.configure(state="disabled")
+        self._ai_set_busy_buttons("disabled")
         self._ai_q = queue.Queue()
         self._ai_append(f"\n=== Running on {len(jobs)} section(s) via {service_label}"
                         f" — answer as {fmt} ===\n")
@@ -1047,8 +1141,7 @@ class EASAJsonReviewApp:
                 item = self._ai_q.get_nowait()
                 if item is None:
                     self._ai_busy = False
-                    self.ai_run_btn.configure(state="normal")
-                    self.ai_batch_btn.configure(state="normal")
+                    self._ai_set_busy_buttons("normal")
                     self.status_var.set(f"AI review complete — {len(self._ai_results)} result(s) total.")
                     return
                 kind, payload = item
@@ -1116,6 +1209,234 @@ class EASAJsonReviewApp:
             return
         self.status_var.set(f"Exported {len(self._ai_results)} AI result(s) → {path}")
         messagebox.showinfo("Export complete", f"Wrote {len(self._ai_results)} result(s) to:\n{path}")
+
+    def _ai_set_busy_buttons(self, state):
+        self.ai_run_btn.configure(state=state)
+        self.ai_batch_btn.configure(state=state)
+        self.col_run_btn.configure(state=state)
+
+    # ------------------------------------------------- AI column analysis -- #
+    def _col_refresh_defs(self):
+        """Redraw the column-definition list and the live prompt preview."""
+        self.col_defs.delete(*self.col_defs.get_children())
+        for name, what in self._ai_columns:
+            self.col_defs.insert("", "end", text=name, values=(what,))
+        self.col_preview.configure(state="normal")
+        self.col_preview.delete("1.0", tk.END)
+        if self._ai_columns:
+            self.col_preview.insert("1.0", self._col_prompt_text()
+                                    + "\n\n---\nSECTION: <title>\n\n<section text>")
+        else:
+            self.col_preview.insert("1.0", "Add at least one column to build the prompt.")
+        self.col_preview.configure(state="disabled")
+
+    def _col_prompt_text(self):
+        lines = ["Analyze the regulatory section below and extract the following data.",
+                 "Return ONLY one valid JSON object with exactly these keys "
+                 "(no code fences, no commentary):"]
+        for name, what in self._ai_columns:
+            lines.append(f'- "{name}": {what or "extract this value"}')
+        lines.append('Use "" for any value the section does not contain.')
+        return "\n".join(lines)
+
+    def _col_on_select(self, event=None):
+        sel = self.col_defs.selection()
+        if not sel:
+            return
+        name = self.col_defs.item(sel[0], "text")
+        what = (self.col_defs.item(sel[0], "values") or [""])[0]
+        self.col_name.delete(0, tk.END)
+        self.col_name.insert(0, name)
+        self.col_what.delete(0, tk.END)
+        self.col_what.insert(0, what)
+
+    def _col_add_update(self):
+        name = self.col_name.get().strip()
+        what = self.col_what.get().strip()
+        if not name:
+            messagebox.showinfo("Column name missing", "Give the column a name first.")
+            return
+        for i, (existing, _) in enumerate(self._ai_columns):
+            if existing == name:
+                self._ai_columns[i] = (name, what)
+                break
+        else:
+            self._ai_columns.append((name, what))
+        self._col_refresh_defs()
+
+    def _col_remove(self):
+        names = {self.col_defs.item(iid, "text") for iid in self.col_defs.selection()}
+        if not names:
+            return
+        self._ai_columns = [(n, w) for n, w in self._ai_columns if n not in names]
+        self._col_refresh_defs()
+
+    def _col_clear(self):
+        self._ai_columns = []
+        self._col_refresh_defs()
+
+    def _col_run(self):
+        if self._ai_busy:
+            messagebox.showinfo("Busy", "An AI run is already in progress.")
+            return
+        if not self._ai_columns:
+            messagebox.showinfo("No columns", "Define at least one column to extract.")
+            return
+        if not self._ai_batch:
+            messagebox.showinfo("Empty queue",
+                                "Add sections to the queue first (current node or checked nodes).")
+            return
+        jobs = list(self._ai_batch)
+        columns = [name for name, _ in self._ai_columns]
+        prompt_head = self._col_prompt_text()
+        service_label = self.ai_service.get()
+        service = _AI_SERVICES.get(service_label, "b")
+        model = self.ai_model.get().strip() or None
+
+        # New run: rebuild the table for the current column set.
+        self._col_results = []
+        self._col_table_cols = ["Section"] + columns
+        self.col_table.delete(*self.col_table.get_children())
+        self.col_table.configure(columns=self._col_table_cols)
+        for c in self._col_table_cols:
+            self.col_table.heading(c, text=c)
+            self.col_table.column(c, width=140 if c == "Section" else 180, anchor="w")
+
+        self._ai_busy = True
+        self._ai_set_busy_buttons("disabled")
+        self._col_q = queue.Queue()
+        self.status_var.set(f"Analyzing {len(jobs)} section(s) into {len(columns)} column(s)…")
+        threading.Thread(target=self._col_worker,
+                         args=(jobs, columns, prompt_head, service, model),
+                         daemon=True).start()
+        self.root.after(150, self._col_poll)
+
+    def _col_worker(self, jobs, columns, prompt_head, service, model):
+        try:
+            from data_extraction.ai_utils.llm_utils import llm_call
+        except Exception as exc:  # noqa: BLE001
+            self._col_q.put(("error", f"Could not load LLM utilities: {exc}"))
+            self._col_q.put(None)
+            return
+        for title, text in jobs:
+            prompt = f"{prompt_head}\n\n---\nSECTION: {title}\n\n{text}"
+            try:
+                resp = llm_call(prompt, None, service, model)
+            except Exception as exc:  # noqa: BLE001
+                resp = None
+                parsed = {columns[0]: f"[ERROR] {exc}"}
+            else:
+                parsed = self._parse_llm_json(resp)
+                if parsed is None:
+                    parsed = {columns[0]: f"[unparsed] {resp}"}
+            row = {"Section": title}
+            for c in columns:
+                v = parsed.get(c, "")
+                if isinstance(v, (list, tuple)):
+                    v = "; ".join(str(x) for x in v)
+                elif isinstance(v, dict):
+                    v = json.dumps(v, ensure_ascii=False)
+                row[c] = "" if v is None else str(v)
+            self._col_q.put(("row", row))
+        self._col_q.put(None)
+
+    @staticmethod
+    def _parse_llm_json(resp):
+        """Best-effort: pull the first {...} object out of an LLM reply."""
+        if not resp or not isinstance(resp, str):
+            return None
+        start, end = resp.find("{"), resp.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            parsed = json.loads(resp[start:end + 1])
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _col_poll(self):
+        try:
+            while True:
+                item = self._col_q.get_nowait()
+                if item is None:
+                    self._ai_busy = False
+                    self._ai_set_busy_buttons("normal")
+                    self.status_var.set(
+                        f"Column analysis complete — {len(self._col_results)} row(s).")
+                    return
+                kind, payload = item
+                if kind == "error":
+                    messagebox.showerror("Column analysis", payload)
+                else:
+                    self._col_results.append(payload)
+                    self.col_table.insert("", "end", values=[
+                        payload.get(c, "") for c in self._col_table_cols])
+        except queue.Empty:
+            pass
+        self.root.after(150, self._col_poll)
+
+    def _col_show_row(self, event=None):
+        sel = self.col_table.selection()
+        if not sel or not self._col_table_cols:
+            return
+        values = self.col_table.item(sel[0], "values")
+        win = tk.Toplevel(self.root)
+        win.title("Row details")
+        win.transient(self.root.winfo_toplevel())
+        txt = scrolledtext.ScrolledText(win, wrap="word", width=90, height=24)
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        for col, val in zip(self._col_table_cols, values):
+            txt.insert(tk.END, f"■ {col}\n{val}\n\n")
+        txt.configure(state="disabled")
+
+    def _col_export(self):
+        if not self._col_results:
+            messagebox.showinfo("No table", "Run a column analysis first, then export.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("JSON", "*.json")],
+            initialfile=self._default_export_name("ai_columns", "xlsx"))
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        cols = self._col_table_cols
+        try:
+            if ext == ".json":
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self._col_results, f, indent=2, ensure_ascii=False)
+            elif ext == ".csv":
+                import csv
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=cols)
+                    w.writeheader()
+                    w.writerows(self._col_results)
+            else:  # Excel
+                from openpyxl import Workbook
+                from openpyxl.styles import Alignment, Font
+                from openpyxl.utils import get_column_letter
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "AI Column Analysis"
+                ws.append(cols)
+                for cell in ws[1]:
+                    cell.font = Font(bold=True)
+                for r in self._col_results:
+                    ws.append([str(r.get(c, "")) for c in cols])
+                ws.column_dimensions["A"].width = 40
+                for i in range(2, len(cols) + 1):
+                    ws.column_dimensions[get_column_letter(i)].width = 50
+                wrap = Alignment(wrap_text=True, vertical="top")
+                for row in ws.iter_rows(min_row=2):
+                    for cell in row:
+                        cell.alignment = wrap
+                wb.save(path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.status_var.set(f"Exported {len(self._col_results)} analysis row(s) → {path}")
+        messagebox.showinfo("Export complete",
+                            f"Wrote {len(self._col_results)} row(s) to:\n{path}")
 
 
 def main():
