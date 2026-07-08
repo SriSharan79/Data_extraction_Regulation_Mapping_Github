@@ -29,8 +29,7 @@ def get_unique_elements(file_path, column_name, separator=";"):
 def save_unique_elements_to_new_sheet(
     file_path,
     column_name,
-    new_sheet_name="Unique Elements",
-    separator=";",
+    new_sheet_name="Unique Elements"
 ):
     try:
         # 1. Read the source Excel file to extract data
@@ -42,10 +41,28 @@ def save_unique_elements_to_new_sheet(
             return
 
         unique_elements = set()
+        
+        # Define the list of candidate separators to check
+        candidate_separators = [',', '/', ';', ':', '.', '-']
 
-        # Extract unique elements
+        # 2. Extract unique elements with dynamic separator detection
         for row in df[column_name].dropna():
-            elements = [el.strip() for el in str(row).split(separator)]
+            text = str(row)
+            
+            # Count how many times each separator appears in the current text
+            sep_counts = {sep: text.count(sep) for sep in candidate_separators}
+            
+            # Find the separator that has the highest count
+            best_sep = max(sep_counts, key=sep_counts.get)
+            
+            # If the most frequent separator actually exists in the string (count > 0)
+            if sep_counts[best_sep] > 0:
+                # Split by the best separator and remove empty strings/whitespace
+                elements = [el.strip() for el in text.split(best_sep) if el.strip()]
+            else:
+                # If none of the separators are in the string, treat it as a single element
+                elements = [text.strip()] if text.strip() else []
+                
             unique_elements.update(elements)
 
         # Convert the sorted unique elements into a DataFrame
@@ -54,7 +71,7 @@ def save_unique_elements_to_new_sheet(
             sorted(list(unique_elements)), columns=[new_col_name]
         )
 
-        # 2. Check if the target sheet already exists
+        # 3. Check if the target sheet already exists
         existing_sheets = pd.ExcelFile(file_path).sheet_names
         
         if new_sheet_name in existing_sheets:
@@ -62,13 +79,12 @@ def save_unique_elements_to_new_sheet(
             existing_df = pd.read_excel(file_path, sheet_name=new_sheet_name)
             
             # Combine the existing columns with the new column
-            # pd.concat with axis=1 handles columns of different lengths automatically
             target_df = pd.concat([existing_df, unique_df], axis=1)
         else:
             # If the sheet doesn't exist yet, our new dataframe is the target
             target_df = unique_df
 
-        # 3. Write the combined data back to the Excel file
+        # 4. Write the combined data back to the Excel file
         with pd.ExcelWriter(
             file_path, mode="a", engine="openpyxl", if_sheet_exists="replace"
         ) as writer:
