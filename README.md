@@ -123,8 +123,15 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     file**: choosing the *same* `.xlsx` again adds each new run as its own
     snapshot sheet (`Run N <timestamp>`) holding all sections of that batch,
     so one workbook accumulates the whole history (CSV/JSON hold the latest
-    batch). Results save automatically when the run finishes; double-click a
-    row for full values; **Export table…** appends the same kind of snapshot.
+    batch). Saving is **row by row**: the file (and the run's sheet) is
+    created with the first LLM reply and re-saved after every further
+    section, so nothing is lost if a long batch is interrupted. After each
+    saved row a companion `Uniq Run N …` sheet is refreshed via
+    `scripts/excel_file_utils.save_unique_elements_to_new_sheet`: every
+    column definition has a ✓ checkbox (heading click toggles all; new
+    columns start checked) and only the **checked** columns are collected,
+    each unique element with its occurrence **count** in the adjacent cell. Double-click a row for full
+    values; **Export table…** appends the same kind of snapshot.
 
   LLM calls run on a background thread. Manage keys with
   the **API keys…** button on the tab (add / edit / clear, persisted to
