@@ -126,8 +126,8 @@ class CacheReviewLauncher:
             "root": target_root,
             "dated_folder": dated_subfolder,
             "cache_file": os.path.join(target_root, f"{base_hash}_docling_chunks_cache.json"),
-            "output_file": os.path.join(dated_subfolder, f"{base_hash}_docling_logged_chunks.json"),
-            "log_file": os.path.join(dated_subfolder, f"{base_hash}_docling_execution.log"),
+            "output_file": os.path.join(dated_subfolder, f"Processed_chunks.json"),
+            "log_file": os.path.join(target_root, f"{base_hash}_Review_execution.log"),
             "tables_path": os.path.join(dated_subfolder, "tables"),
             "images_path": os.path.join(dated_subfolder, "images")
         }

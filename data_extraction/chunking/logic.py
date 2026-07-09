@@ -51,7 +51,7 @@ class ExtractionLauncherUI:
         self.btn_full_pipeline.pack(side="left", padx=5)
 
         # Section B: Independent Review Process from Pre-existing Cache
-        frame_cache = tk.LabelFrame(root, text=" Curation Only: Review Pre-existing Cache File From Scratch ", bg="white", font=("Arial", 10, "bold"), padx=10, pady=10)
+        frame_cache = tk.LabelFrame(root, text=" Curation of the chunks extracted", bg="white", font=("Arial", 10, "bold"), padx=10, pady=10)
         frame_cache.pack(fill="x", padx=15, pady=10)
         
         tk.Label(frame_cache, text="Cache JSON File:", bg="white").grid(row=0, column=0, sticky="w")
@@ -63,9 +63,16 @@ class ExtractionLauncherUI:
         self.entry_store_cache = tk.Entry(frame_cache, width=50)
         self.entry_store_cache.grid(row=1, column=1, padx=5, pady=2)
         tk.Button(frame_cache, text="Browse...", command=self.browse_storage_cache).grid(row=1, column=2, padx=2)
+        note="""
+        Note: 1. Raw chucks are stored in cache JSON file are processed into a structured output
+              2. Only the processed chunks are stored in the output file Processed_chunks.json of the particular date folder
+        """
+        tk.Label(frame_cache, text="Please always choose a storage folder that was used to generate the cache file", bg="#d1421e").grid(row=2, column=1, sticky="w")
         
-        self.btn_review_cache = tk.Button(frame_cache, text="Launch Curation Review From Start", bg="#9b59b6", fg="white", font=("Arial", 9, "bold"), command=self.run_review_from_cache)
-        self.btn_review_cache.grid(row=2, column=1, pady=8, sticky="w", padx=5)
+        tk.Label(frame_cache, text=note, bg="#d1841e").grid(row=3, column=1, sticky="w")
+        
+        self.btn_review_cache = tk.Button(frame_cache, text="Launch Chunk Curation Review", bg="#9b59b6", fg="white", font=("Arial", 9, "bold"), command=self.run_review_from_cache)
+        self.btn_review_cache.grid(row=4, column=1, pady=8, sticky="w", padx=5)
 
         # Buttons disabled while a background conversion is running.
         self.action_buttons = [self.btn_cache_only, self.btn_full_pipeline, self.btn_review_cache]
@@ -170,8 +177,8 @@ class ExtractionLauncherUI:
             "root": target_root,
             "dated_folder": dated_subfolder,
             "cache_file": os.path.join(target_root, f"{base_hash}_docling_chunks_cache.json"),
-            "output_file": os.path.join(dated_subfolder, f"{base_hash}_docling_logged_chunks.json"),
-            "log_file": os.path.join(dated_subfolder, f"{base_hash}_docling_execution.log"),
+            "output_file": os.path.join(dated_subfolder, f"Processed_chunks.json"),
+            "log_file": os.path.join(target_root, f"{base_hash}_Review_execution.log"),
             "tables_path": os.path.join(dated_subfolder, "tables"),
             "images_path": os.path.join(dated_subfolder, "images")
         }

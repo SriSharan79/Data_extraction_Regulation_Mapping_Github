@@ -32,15 +32,19 @@ modules only* (files on disk are untouched) to open a modal ``Toplevel`` of the
 studio instead, then chain a Section Review modal automatically when chunk
 review completes.
 
-There is also a standalone "Section Review" tab that lets you open Section
-Review directly on an already-existing logged-chunks JSON, without needing to
-run chunk review again first.
+There is also a standalone "Section Review" tab. The Section Review editor
+lives permanently *inside* that tab: a picker bar stays pinned at the top,
+and whenever a valid logged-chunks JSON is selected the embedded editor
+below it is (re)loaded for that file. Invalid selections are validated
+up-front and simply rejected with a dialog — they never tear down the tab
+or the currently loaded review.
 
 Tabs are built lazily on first view, each inside a try/except, so a tool whose
 heavy dependencies (docling, markitdown, PyMuPDF, ...) are not installed simply
 shows an error panel in its own tab while every other tab keeps working.
 """
 
+import json
 import logging
 import os
 import queue
@@ -335,46 +339,64 @@ class _MarkdownTab(_JobTab):
 # --------------------------------------------------------------------------- #
 class _SectionReviewTab:
     """
-    Lets the user open Section Review directly on an existing output JSON
-    (the file chunk review writes to, containing "merged_headings"),
-    without needing to run chunk review first in this session. Useful for
-    re-opening and re-editing a document's sections later, independent of
-    the Cache Review / PDF Extraction tabs.
+    Hosts the Section Review editor permanently inside the tab.
+
+    Layout:
+      * A picker bar pinned at the top (entry + Browse + Load/Reload) that
+        never goes away.
+      * A body area below it that holds either a hint placeholder (nothing
+        loaded yet) or an embedded `SectionReviewApp` for the selected file.
+
+    Selecting a different valid logged-chunks JSON swaps the embedded editor
+    in place. Every candidate file is validated *before* the current editor
+    is touched, so a missing/corrupt/empty file only produces an error dialog
+    and leaves the tab — and whatever review is currently open — fully intact.
+    Because the editor runs on an `_EmbeddedRoot`, its own "close the window"
+    paths (Export & Finish, Exit) are no-ops and the editor simply stays open
+    in the tab, which is the intended behavior here.
     """
 
     def __init__(self, frame):
         self.frame = frame
+        self._app = None          # current SectionReviewApp instance (or None)
+        self._host = None         # its _EmbeddedRoot host frame (or None)
+        self._loaded_path = None  # path currently loaded into the editor
+
+        self._logger = logging.getLogger("SectionReviewTab")
+        self._logger.setLevel(logging.INFO)
+        if not self._logger.handlers:
+            self._logger.addHandler(logging.StreamHandler())
+
         self._build_picker()
 
+        # Body container: holds either the placeholder or the embedded app.
+        self.body = ttk.Frame(self.frame)
+        self.body.pack(fill="both", expand=True)
+        self._show_placeholder()
+
+    # -- persistent picker bar ---------------------------------------------- #
     def _build_picker(self):
         form = ttk.LabelFrame(
             self.frame,
-            text=" Open Section Review on an Existing Logged-Chunks JSON ",
+            text=" Logged-Chunks JSON — Section Review opens below ",
             padding=10,
         )
-        form.pack(fill="x", padx=10, pady=10)
+        form.pack(fill="x", padx=10, pady=(10, 4))
 
         ttk.Label(
             form,
             text='Logged Chunks Output JSON (must contain "merged_headings"):',
         ).grid(row=0, column=0, sticky="w")
+
         self.ent_output = ttk.Entry(form, width=78)
         self.ent_output.grid(row=1, column=0, padx=(0, 5), pady=3, sticky="we")
         ttk.Button(form, text="Browse...", command=self._browse).grid(row=1, column=1)
+        self.btn_load = ttk.Button(form, text="Load / Reload", command=self._load_clicked)
+        self.btn_load.grid(row=1, column=2, padx=(4, 0))
+        form.columnconfigure(0, weight=1)
 
-        self.btn_open = ttk.Button(
-            form, text="📝 Open Section Review", command=self._open
-        )
-        self.btn_open.grid(row=2, column=0, sticky="w", pady=8)
-
-        ttk.Label(
-            self.frame,
-            text=(
-                "Tip: this is the same output file chunk review writes to, e.g.\n"
-                "  <storage>/<doc_name>/<date>/<hash>_docling_logged_chunks.json"
-            ),
-            foreground="#666666",
-        ).pack(anchor="w", padx=10)
+        self.lbl_status = ttk.Label(form, text="No file loaded.", foreground="#666666")
+        self.lbl_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
     def _browse(self):
         path = filedialog.askopenfilename(
@@ -384,40 +406,134 @@ class _SectionReviewTab:
         if path:
             self.ent_output.delete(0, tk.END)
             self.ent_output.insert(0, path)
+            # Browsing to a file loads it immediately — no extra click needed.
+            self._load(path)
 
-    def _open(self):
-        output_path = self.ent_output.get().strip()
-        if not output_path or not os.path.exists(output_path):
-            messagebox.showerror("Error", "Please select a valid output JSON file.")
+    def _load_clicked(self):
+        self._load(self.ent_output.get().strip())
+
+    # -- body management ------------------------------------------------------ #
+    def _show_placeholder(self):
+        self._clear_body()
+        ttk.Label(
+            self.body,
+            text=(
+                "Select a logged-chunks output JSON above — Section Review will "
+                "open right here and update whenever you pick a different file.\n\n"
+                "Tip: this is the same output file chunk review writes to, e.g.\n"
+                "  <storage>/<doc_name>/<date>/<hash>_docling_logged_chunks.json"
+            ),
+            foreground="#666666",
+            padding=20,
+            justify="left",
+        ).pack(anchor="w")
+
+    def _clear_body(self):
+        for child in self.body.winfo_children():
+            try:
+                # Force a *real* destroy even for _EmbeddedRoot, whose own
+                # destroy() is intentionally a no-op.
+                tk.Frame.destroy(child)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                try:
+                    child.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._app = None
+        self._host = None
+
+    # -- loading -------------------------------------------------------------- #
+    def _load(self, path):
+        """Validate `path` and (re)load the embedded Section Review editor.
+
+        All failure paths return *before* the currently loaded editor is
+        touched, so a bad selection can never blank or crash the tab.
+        """
+        if not path:
+            messagebox.showerror("Error", "Please select an output JSON file.")
+            return
+        if not os.path.isfile(path):
+            messagebox.showerror("File Not Found", f"Output file not found:\n{path}")
             return
 
-        from data_extraction.chunking.section_review_ui import SectionReviewApp
-
-        # Tear down the picker UI and host SectionReviewApp in its place,
-        # inside the same tab (embedded, non-modal — consistent with the
-        # other embedded tabs in this studio).
-        for child in self.frame.winfo_children():
-            child.destroy()
-
-        logger = logging.getLogger("SectionReviewTab")
-        logger.setLevel(logging.INFO)
-        if not logger.handlers:
-            logger.addHandler(logging.StreamHandler())
-
-        host = _make_embedded_host(self.frame)
+        # Pre-validate the file ourselves so SectionReviewApp's internal
+        # error handling (which destroys its root) is never triggered.
         try:
-            SectionReviewApp(root=host, output_file_path=output_path, logger=logger)
-        except Exception as exc:  # noqa: BLE001 - surface into the tab itself
-            for child in self.frame.winfo_children():
-                tk.Frame.destroy(child)
-            message = (
-                "Section Review could not be loaded.\n\n"
-                f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as exc:
+            messagebox.showerror("JSON Error", f"Failed to parse output file:\n{exc}")
+            return
+        except OSError as exc:
+            messagebox.showerror("Error", f"Failed to read output file:\n{exc}")
+            return
+
+        sections = data.get("merged_headings") if isinstance(data, dict) else None
+        if not sections:
+            messagebox.showwarning(
+                "No Sections Found",
+                "No merged sections were found in the selected file.\n"
+                'It must be a chunk-review output JSON containing "merged_headings".',
             )
-            box = scrolledtext.ScrolledText(self.frame, wrap="word")
-            box.insert("1.0", message)
-            box.config(state="disabled")
-            box.pack(fill="both", expand=True, padx=10, pady=10)
+            return
+
+        # Import lazily so a missing module only affects loading, not the tab.
+        try:
+            from data_extraction.chunking.section_review_ui import SectionReviewApp
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            messagebox.showerror(
+                "Section Review Unavailable",
+                f"Could not import Section Review:\n\n{type(exc).__name__}: {exc}",
+            )
+            return
+
+        # Protect unsaved edits in the currently open review before swapping.
+        if self._app is not None and getattr(self._app, "unsaved_changes", False):
+            if not messagebox.askyesno(
+                "Unsaved Changes",
+                "The currently open review has unsaved changes.\n\n"
+                "Discard them and load the selected file?",
+            ):
+                return
+
+        # Swap: tear down the old editor (or placeholder) and embed a new one.
+        self._clear_body()
+        host = _make_embedded_host(self.body)
+        try:
+            app = SectionReviewApp(
+                root=host, output_file_path=path, logger=self._logger
+            )
+        except Exception as exc:  # noqa: BLE001 - surface into the tab itself
+            try:
+                tk.Frame.destroy(host)
+            except Exception:  # noqa: BLE001
+                pass
+            self._show_placeholder()
+            self.lbl_status.config(text="Failed to load — see error dialog.")
+            messagebox.showerror(
+                "Section Review Error",
+                "Section Review could not be loaded.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
+            )
+            return
+
+        # Belt-and-suspenders: if the app bailed out of __init__ early (its
+        # loader returned False), it never built its widgets. Fall back to
+        # the placeholder instead of leaving an empty frame behind.
+        if not hasattr(app, "status_label"):
+            try:
+                tk.Frame.destroy(host)
+            except Exception:  # noqa: BLE001
+                pass
+            self._show_placeholder()
+            self.lbl_status.config(text="Could not load sections from the selected file.")
+            return
+
+        self._app = app
+        self._host = host
+        self._loaded_path = path
+        self.lbl_status.config(text=f"Loaded: {path}")
+        self._logger.info("Section Review loaded in-tab for: %s", path)
 
 
 # --------------------------------------------------------------------------- #
