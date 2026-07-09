@@ -43,7 +43,7 @@ def save_unique_elements_to_new_sheet(
         unique_elements = set()
         
         # Define the list of candidate separators to check
-        candidate_separators = [',', '/', ';', ':', '.', '-']
+        candidate_separators = [',',  ';']
 
         # 2. Extract unique elements with dynamic separator detection
         for row in df[column_name].dropna():

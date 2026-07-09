@@ -237,6 +237,29 @@ def get_embedding(
             "raw": <raw JSON response from the API>,
         }
     """
+    
+    time.sleep(3)
+        
+    # --- RATE LIMITER LOGIC ---
+    current_time = time.time()
+    
+    # If we have already hit our 20 request capacity, check the oldest request
+    if len(REQUEST_TIMES) == 10:
+        oldest_request_time = REQUEST_TIMES[0]
+        elapsed_since_oldest = current_time - oldest_request_time
+        
+        # If the oldest request happened less than 60 seconds ago, we must wait
+        if elapsed_since_oldest < 60:
+            sleep_time = 60 - elapsed_since_oldest
+            print(Fore.YELLOW + f"⚠️ Rate limit approaching. Sleeping for {sleep_time:.2f} seconds..." + Style.RESET_ALL)
+            time.sleep(sleep_time)
+            
+    # Record the current timestamp for this request execution
+    REQUEST_TIMES.append(time.time())
+    # --------------------------
+
+    start_time = time.time()
+    
     if service not in ("BlaBla", "DLR Ollama"):
         raise ValueError(f"Unknown service '{service}'. Expected 'BlaBla' or 'DLR Ollama'.")
 
@@ -573,6 +596,27 @@ def Ollama_ask_llm(
     max_tokens: int = 2000,
     model: str = None,
 ) -> str:
+    time.sleep(3)
+        
+    # --- RATE LIMITER LOGIC ---
+    current_time = time.time()
+    
+    # If we have already hit our 20 request capacity, check the oldest request
+    if len(REQUEST_TIMES) == 10:
+        oldest_request_time = REQUEST_TIMES[0]
+        elapsed_since_oldest = current_time - oldest_request_time
+        
+        # If the oldest request happened less than 60 seconds ago, we must wait
+        if elapsed_since_oldest < 60:
+            sleep_time = 60 - elapsed_since_oldest
+            print(Fore.YELLOW + f"⚠️ Rate limit approaching. Sleeping for {sleep_time:.2f} seconds..." + Style.RESET_ALL)
+            time.sleep(sleep_time)
+            
+    # Record the current timestamp for this request execution
+    REQUEST_TIMES.append(time.time())
+    # --------------------------
+
+    start_time = time.time()
 
     # print_with_separator("DebugLog",'/')
 
