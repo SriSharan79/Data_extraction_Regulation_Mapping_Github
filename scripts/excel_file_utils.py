@@ -51,7 +51,10 @@ def save_unique_elements_to_new_sheet(
             column_names = [column_names]
 
         # Define the list of candidate separators to check
-        candidate_separators = [',',  ';']
+        candidate_separators = [
+            # ';',
+            ','
+            ]
 
         blocks = []
         for column_name in column_names:
@@ -180,11 +183,13 @@ def organize_pdf_files(
 if __name__ == "__main__":
     
         # Replace with your actual file path, column name, and desired new sheet name
-    EXCEL_FILE = r"C:\Users\kata_du\Documents\Literature\EASA\XML _Data_extractions\EAR for CS-25 Amdt 27 (xml) fix 12.22 FINAL (1)\CS-25 _Section_analysis_by AI.xlsx"
+    EXCEL_FILE = r"U:\ALR DATA\Only_Required_cols_database_export.xlsx"
     COLUMNS_TO_PROCESS = [
-                        "System Info",
-                        "Personal Involved",
-                        "References"
+                        "research_areas",
+                        "key_concepts",
+                        "publication_year",
+                        "publisher",
+                        "abstract_classification",
                          ]
     NEW_SHEET = "Unique Categories"
     # One call with all columns: the sheet is rebuilt per call, so per-column
