@@ -111,14 +111,27 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
   - *Free-form review* — preset or custom instruction per section, run on the
     current node or loop over the queue. An **Answer as** picker (Plain text /
     Markdown / JSON / CSV table) is sent to the model so responses come back in
-    that format — queued runs ask for it explicitly before starting. Export to
-    Markdown / CSV / Excel / JSON.
+    that format — queued runs ask for it explicitly before starting. Every run
+    first asks **where to store the results** (the file type — Markdown / CSV /
+    Excel / JSON — is the export format) and writes them there automatically
+    when the run finishes; cancel the dialog to abort the run.
   - *Column analysis* — define **columns** (name + what the LLM should
     extract); a live **prompt preview** rebuilds as you add/edit/remove them.
     Each queued section is analyzed into one table row per section with one
     cell per column (the model is asked for strict JSON; unparseable replies
-    are surfaced as `[unparsed]`). Double-click a row for full values; export
-    the table to Excel / CSV / JSON.
+    are surfaced as `[unparsed]`). Every analysis first asks for a **storage
+    file**: choosing the *same* `.xlsx` again adds each new run as its own
+    snapshot sheet (`Run N <timestamp>`) holding all sections of that batch,
+    so one workbook accumulates the whole history (CSV/JSON hold the latest
+    batch). Saving is **row by row**: the file (and the run's sheet) is
+    created with the first LLM reply and re-saved after every further
+    section, so nothing is lost if a long batch is interrupted. After each
+    saved row a companion `Uniq Run N …` sheet is refreshed via
+    `scripts/excel_file_utils.save_unique_elements_to_new_sheet`: every
+    column definition has a ✓ checkbox (heading click toggles all; new
+    columns start checked) and only the **checked** columns are collected,
+    each unique element with its occurrence **count** in the adjacent cell. Double-click a row for full
+    values; **Export table…** appends the same kind of snapshot.
 
   LLM calls run on a background thread. Manage keys with
   the **API keys…** button on the tab (add / edit / clear, persisted to

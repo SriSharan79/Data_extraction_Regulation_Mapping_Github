@@ -56,6 +56,22 @@ _AI_OUTPUT_FORMATS = {
 }
 
 
+_EXCEL_UTILS = None
+
+
+def _excel_utils():
+    """Load scripts/excel_file_utils.py (repo root) once, by file path."""
+    global _EXCEL_UTILS
+    if _EXCEL_UTILS is None:
+        import importlib.util
+        p = Path(__file__).resolve().parents[2] / "scripts" / "excel_file_utils.py"
+        spec = importlib.util.spec_from_file_location("excel_file_utils", str(p))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _EXCEL_UTILS = mod
+    return _EXCEL_UTILS
+
+
 def _open_externally(path: str):
     """Open a file with the OS default application (cross-platform)."""
     try:
@@ -95,6 +111,15 @@ class EASAJsonReviewApp:
         ]
         self._col_results = []        # column-analysis rows (dicts) for export
         self._col_table_cols = []     # column names currently shown in the table
+        self._col_uniq_checked = {name for name, _ in self._ai_columns}
+        self._col_run_uniq_cols = []  # checked columns snapshotted at run start
+        self._ai_autosave_path = None # where the current free-form run auto-saves
+        self._ai_run_start = 0        # index of the first result of the current run
+        self._ai_save_error_shown = False
+        self._col_store_path = None   # workbook the column analyses accumulate into
+        self._col_rows_saved = 0      # rows of the current run already on disk
+        self._col_run_sheet = None    # snapshot sheet of the current run (.xlsx)
+        self._col_save_error_shown = False
 
         self._build_ui()
 
@@ -937,15 +962,20 @@ class EASAJsonReviewApp:
         top.pack(fill="x")
 
         # Column definitions: every change here rebuilds the prompt preview.
-        cols_wrap = ttk.LabelFrame(top, text=" Columns to extract ", padding=4)
+        cols_wrap = ttk.LabelFrame(top, text=" Columns to extract (✓ = collect unique elements) ",
+                                   padding=4)
         top.add(cols_wrap, weight=1)
-        self.col_defs = ttk.Treeview(cols_wrap, columns=("what",), show="tree headings", height=5)
+        self.col_defs = ttk.Treeview(cols_wrap, columns=("uniq", "what"),
+                                     show="tree headings", height=5)
         self.col_defs.heading("#0", text="Column")
+        self.col_defs.heading("uniq", text="✓", command=self._col_toggle_uniq_all)
         self.col_defs.heading("what", text="What should the LLM extract?")
         self.col_defs.column("#0", width=140, anchor="w")
-        self.col_defs.column("what", width=380, anchor="w")
+        self.col_defs.column("uniq", width=34, minwidth=28, anchor="center", stretch=False)
+        self.col_defs.column("what", width=350, anchor="w")
         self.col_defs.pack(fill="x")
         self.col_defs.bind("<<TreeviewSelect>>", self._col_on_select)
+        self.col_defs.bind("<Button-1>", self._col_defs_click)
 
         edit = ttk.Frame(cols_wrap)
         edit.pack(fill="x", pady=(4, 0))
@@ -1100,7 +1130,21 @@ class EASAJsonReviewApp:
         if not instruction:
             messagebox.showinfo("No instruction", "Enter or pick a review instruction first.")
             return
-            
+
+        # Always pick the storage file first; its extension is the export format.
+        path = filedialog.asksaveasfilename(
+            title="Store this run's results as… (file type = format)",
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("Text", "*.txt"), ("CSV", "*.csv"),
+                       ("Excel", "*.xlsx"), ("JSON", "*.json")],
+            initialfile=self._default_export_name("ai_review", "md"))
+        if not path:
+            self.status_var.set("AI run cancelled — no storage file chosen.")
+            return
+        self._ai_autosave_path = path
+        self._ai_run_start = len(self._ai_results)
+        self._ai_save_error_shown = False
+
         # Dynamically map the modern engine panel to active session choices
         provider_code = self.llm_choice_an.get().upper()
         service = "o" if provider_code == "O" else "b"
@@ -1149,7 +1193,11 @@ class EASAJsonReviewApp:
                 if item is None:
                     self._ai_busy = False
                     self._ai_set_busy_buttons("normal")
-                    self.status_var.set(f"AI review complete — {len(self._ai_results)} result(s) total.")
+                    done = f"AI review complete — {len(self._ai_results)} result(s) total"
+                    saved = len(self._ai_results) - self._ai_run_start
+                    if self._ai_autosave_path and saved:
+                        done += f", {saved} saved to {os.path.basename(self._ai_autosave_path)}"
+                    self.status_var.set(done + ".")
                     return
                 kind, payload = item
                 if kind == "error":
@@ -1157,6 +1205,7 @@ class EASAJsonReviewApp:
                 else:
                     self._ai_results.append(payload)
                     self._ai_append(f"\n## {payload['title']}\n{payload['response']}\n")
+                    self._ai_autosave()  # keep the file current after every result
         except queue.Empty:
             pass
         self.root.after(150, self._ai_poll)
@@ -1172,50 +1221,70 @@ class EASAJsonReviewApp:
             initialfile=self._default_export_name("ai_review", "md"))
         if not path:
             return
-        ext = os.path.splitext(path)[1].lower()
-        columns = ["title", "service", "model", "format", "instruction", "response"]
         try:
-            if ext == ".json":
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self._ai_results, f, indent=2, ensure_ascii=False)
-            elif ext == ".csv":
-                import csv
-                with open(path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=columns)
-                    w.writeheader()
-                    w.writerows(self._ai_results)
-            elif ext == ".xlsx":
-                from openpyxl import Workbook
-                from openpyxl.styles import Alignment, Font
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "AI Review"
-                ws.append([c.capitalize() for c in columns])
-                for cell in ws[1]:
-                    cell.font = Font(bold=True)
-                for r in self._ai_results:
-                    ws.append([str(r.get(c, "")) for c in columns])
-                widths = {"A": 40, "B": 12, "C": 18, "D": 12, "E": 40, "F": 90}
-                for col, width in widths.items():
-                    ws.column_dimensions[col].width = width
-                wrap = Alignment(wrap_text=True, vertical="top")
-                for row in ws.iter_rows(min_row=2):
-                    for cell in row:
-                        cell.alignment = wrap
-                wb.save(path)
-            else:  # markdown / text
-                blocks = []
-                for r in self._ai_results:
-                    blocks.append(f"## {r['title']}\n"
-                                  f"*{r['service']} {r['model']}* — {r['instruction']}\n\n"
-                                  f"{r['response']}\n")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(blocks))
+            self._write_ai_results(path, self._ai_results)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Export failed", str(exc))
             return
         self.status_var.set(f"Exported {len(self._ai_results)} AI result(s) → {path}")
         messagebox.showinfo("Export complete", f"Wrote {len(self._ai_results)} result(s) to:\n{path}")
+
+    @staticmethod
+    def _write_ai_results(path, results):
+        """Write free-form results; the extension picks the format. Raises on failure."""
+        ext = os.path.splitext(path)[1].lower()
+        columns = ["title", "service", "model", "format", "instruction", "response"]
+        if ext == ".json":
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+        elif ext == ".csv":
+            import csv
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=columns)
+                w.writeheader()
+                w.writerows(results)
+        elif ext == ".xlsx":
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "AI Review"
+            ws.append([c.capitalize() for c in columns])
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for r in results:
+                ws.append([str(r.get(c, "")) for c in columns])
+            widths = {"A": 40, "B": 12, "C": 18, "D": 12, "E": 40, "F": 90}
+            for col, width in widths.items():
+                ws.column_dimensions[col].width = width
+            wrap = Alignment(wrap_text=True, vertical="top")
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.alignment = wrap
+            wb.save(path)
+        else:  # markdown / text
+            blocks = []
+            for r in results:
+                blocks.append(f"## {r['title']}\n"
+                              f"*{r['service']} {r['model']}* — {r['instruction']}\n\n"
+                              f"{r['response']}\n")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(blocks))
+
+    def _ai_autosave(self):
+        """Rewrite the storage file with the current run's results so far —
+        called after every LLM reply, so the file grows result by result."""
+        path = self._ai_autosave_path
+        results = self._ai_results[self._ai_run_start:]
+        if not path or not results:
+            return
+        try:
+            self._write_ai_results(path, results)
+        except Exception as exc:  # noqa: BLE001
+            if not self._ai_save_error_shown:
+                self._ai_save_error_shown = True
+                messagebox.showerror("Auto-save failed", f"{path}\n\n{exc}")
+            self.status_var.set(f"Auto-save failed: {exc}")
         
     def _choose_model_action(self, provider_code):
         """
@@ -1282,7 +1351,8 @@ class EASAJsonReviewApp:
         """Redraw the column-definition list and the live prompt preview."""
         self.col_defs.delete(*self.col_defs.get_children())
         for name, what in self._ai_columns:
-            self.col_defs.insert("", "end", text=name, values=(what,))
+            glyph = "☑" if name in self._col_uniq_checked else "☐"
+            self.col_defs.insert("", "end", text=name, values=(glyph, what))
         self.col_preview.configure(state="normal")
         self.col_preview.delete("1.0", tk.END)
         if self._ai_columns:
@@ -1306,11 +1376,38 @@ class EASAJsonReviewApp:
         if not sel:
             return
         name = self.col_defs.item(sel[0], "text")
-        what = (self.col_defs.item(sel[0], "values") or [""])[0]
+        values = self.col_defs.item(sel[0], "values") or ("", "")
+        what = values[1] if len(values) > 1 else ""
         self.col_name.delete(0, tk.END)
         self.col_name.insert(0, name)
         self.col_what.delete(0, tk.END)
         self.col_what.insert(0, what)
+
+    def _col_defs_click(self, event):
+        """Toggle unique-element collection when the ✓ cell is clicked."""
+        if self.col_defs.identify("region", event.x, event.y) != "cell":
+            return None
+        if self.col_defs.identify_column(event.x) != "#1":
+            return None
+        iid = self.col_defs.identify_row(event.y)
+        if not iid:
+            return None
+        name = self.col_defs.item(iid, "text")
+        if name in self._col_uniq_checked:
+            self._col_uniq_checked.discard(name)
+        else:
+            self._col_uniq_checked.add(name)
+        self.col_defs.set(iid, "uniq", "☑" if name in self._col_uniq_checked else "☐")
+        return "break"
+
+    def _col_toggle_uniq_all(self):
+        """✓ heading click: check every column, or clear if all are checked."""
+        names = {name for name, _ in self._ai_columns}
+        if names and names <= self._col_uniq_checked:
+            self._col_uniq_checked -= names
+        else:
+            self._col_uniq_checked |= names
+        self._col_refresh_defs()
 
     def _col_add_update(self):
         name = self.col_name.get().strip()
@@ -1324,6 +1421,7 @@ class EASAJsonReviewApp:
                 break
         else:
             self._ai_columns.append((name, what))
+            self._col_uniq_checked.add(name)   # new columns collect uniques by default
         self._col_refresh_defs()
 
     def _col_remove(self):
@@ -1331,10 +1429,12 @@ class EASAJsonReviewApp:
         if not names:
             return
         self._ai_columns = [(n, w) for n, w in self._ai_columns if n not in names]
+        self._col_uniq_checked -= names
         self._col_refresh_defs()
 
     def _col_clear(self):
         self._ai_columns = []
+        self._col_uniq_checked.clear()
         self._col_refresh_defs()
 
     def _col_run(self):
@@ -1351,7 +1451,30 @@ class EASAJsonReviewApp:
         jobs = list(self._ai_batch)
         columns = [name for name, _ in self._ai_columns]
         prompt_head = self._col_prompt_text()
-        
+
+        # Always pick the storage file first. Re-choosing the same .xlsx appends
+        # this run as a new snapshot sheet instead of overwriting.
+        opts = {}
+        if self._col_store_path:
+            opts["initialdir"] = os.path.dirname(self._col_store_path)
+            opts["initialfile"] = os.path.basename(self._col_store_path)
+        else:
+            opts["initialfile"] = self._default_export_name("ai_columns", "xlsx")
+        store = filedialog.asksaveasfilename(
+            title="Store analysis results in… (existing .xlsx gets this run as a new sheet)",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx"), ("CSV", "*.csv"), ("JSON", "*.json")],
+            confirmoverwrite=False, **opts)
+        if not store:
+            self.status_var.set("Column analysis cancelled — no storage file chosen.")
+            return
+        self._col_store_path = store
+        self._col_rows_saved = 0        # file/sheet is created with the 1st row
+        self._col_run_sheet = None
+        self._col_save_error_shown = False
+        # Only ✓-checked columns get unique-element collection this run.
+        self._col_run_uniq_cols = [c for c in columns if c in self._col_uniq_checked]
+
         # Dynamically map modern engine panel values to active session configurations
         provider_code = self.llm_choice_an.get().upper()
         service = "o" if provider_code == "O" else "b"
@@ -1426,8 +1549,12 @@ class EASAJsonReviewApp:
                 if item is None:
                     self._ai_busy = False
                     self._ai_set_busy_buttons("normal")
-                    self.status_var.set(
-                        f"Column analysis complete — {len(self._col_results)} row(s).")
+                    done = f"Column analysis complete — {len(self._col_results)} row(s)"
+                    if self._col_store_path and self._col_rows_saved:
+                        done += f", saved to {os.path.basename(self._col_store_path)}"
+                        if self._col_run_sheet:
+                            done += f" (sheet '{self._col_run_sheet}')"
+                    self.status_var.set(done + ".")
                     return
                 kind, payload = item
                 if kind == "error":
@@ -1436,6 +1563,7 @@ class EASAJsonReviewApp:
                     self._col_results.append(payload)
                     self.col_table.insert("", "end", values=[
                         payload.get(c, "") for c in self._col_table_cols])
+                    self._col_save_row(payload)
         except queue.Empty:
             pass
         self.root.after(150, self._col_poll)
@@ -1454,6 +1582,130 @@ class EASAJsonReviewApp:
             txt.insert(tk.END, f"■ {col}\n{val}\n\n")
         txt.configure(state="disabled")
 
+    @staticmethod
+    def _col_write_store(path, cols, rows):
+        """Write one analysis snapshot. An existing .xlsx gets a new sheet per
+        run (accumulating workbook); CSV/JSON hold the latest batch. Returns
+        the sheet name used for .xlsx, else None. Raises on failure."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".json":
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=2, ensure_ascii=False)
+            return None
+        if ext == ".csv":
+            import csv
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=cols)
+                w.writeheader()
+                w.writerows(rows)
+            return None
+        # Excel: one snapshot sheet per analysis run
+        from datetime import datetime
+
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.styles import Alignment, Font
+        from openpyxl.utils import get_column_letter
+        if os.path.exists(path):
+            wb = load_workbook(path)
+            ws = wb.create_sheet()
+        else:
+            wb = Workbook()
+            ws = wb.active
+        stamp = datetime.now().strftime("%Y-%m-%d %H.%M.%S")
+        run_no = sum(1 for s in wb.sheetnames if s.startswith("Run ")) + 1
+        ws.title = f"Run {run_no} {stamp}"[:31]
+        ws.append(cols)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for r in rows:
+            ws.append([str(r.get(c, "")) for c in cols])
+        ws.column_dimensions["A"].width = 40
+        for i in range(2, len(cols) + 1):
+            ws.column_dimensions[get_column_letter(i)].width = 50
+        wrap = Alignment(wrap_text=True, vertical="top")
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = wrap
+        wb.save(path)
+        return ws.title
+
+    def _col_save_row(self, row):
+        """Write one finished section to the storage file immediately: the file
+        (and, for .xlsx, the run's snapshot sheet) is created with the first
+        row, then updated and saved again for every further row."""
+        path = self._col_store_path
+        if not path:
+            return
+        cols = self._col_table_cols
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".json":
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self._col_results, f, indent=2, ensure_ascii=False)
+            elif ext == ".csv":
+                import csv
+                mode = "w" if self._col_rows_saved == 0 else "a"
+                with open(path, mode, newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=cols)
+                    if self._col_rows_saved == 0:
+                        w.writeheader()
+                    w.writerow(row)
+            else:  # .xlsx
+                from datetime import datetime
+
+                from openpyxl import Workbook, load_workbook
+                from openpyxl.styles import Alignment, Font
+                from openpyxl.utils import get_column_letter
+                if self._col_rows_saved == 0:
+                    if os.path.exists(path):
+                        wb = load_workbook(path)
+                        ws = wb.create_sheet()
+                    else:
+                        wb = Workbook()
+                        ws = wb.active
+                    stamp = datetime.now().strftime("%Y-%m-%d %H.%M.%S")
+                    run_no = sum(1 for s in wb.sheetnames if s.startswith("Run ")) + 1
+                    ws.title = f"Run {run_no} {stamp}"[:31]
+                    self._col_run_sheet = ws.title
+                    ws.append(cols)
+                    for cell in ws[1]:
+                        cell.font = Font(bold=True)
+                    ws.column_dimensions["A"].width = 40
+                    for i in range(2, len(cols) + 1):
+                        ws.column_dimensions[get_column_letter(i)].width = 50
+                else:
+                    wb = load_workbook(path)
+                    ws = wb[self._col_run_sheet]
+                ws.append([str(row.get(c, "")) for c in cols])
+                wrap = Alignment(wrap_text=True, vertical="top")
+                for cell in ws[ws.max_row]:
+                    cell.alignment = wrap
+                wb.save(path)
+                self._col_update_uniques(path)
+            self._col_rows_saved += 1
+            self.status_var.set(f"Saved row {self._col_rows_saved} "
+                                f"({row.get('Section', '')}) → {os.path.basename(path)}")
+        except Exception as exc:  # noqa: BLE001
+            if not self._col_save_error_shown:
+                self._col_save_error_shown = True
+                messagebox.showerror(
+                    "Row save failed",
+                    f"{path}\n\n{exc}\n\nThe analysis continues; further save "
+                    f"errors only go to the status bar.")
+            self.status_var.set(f"Row save failed: {exc}")
+
+    def _col_update_uniques(self, path):
+        """Refresh the run's unique-elements sheet (element + count) via
+        scripts/excel_file_utils after each saved row — but only for the
+        columns whose ✓ checkbox was ticked when the run started."""
+        data_cols = [c for c in self._col_run_uniq_cols if c != "Section"]
+        if not data_cols or not self._col_run_sheet:
+            return
+        uniq_sheet = f"Uniq {self._col_run_sheet}"[:31]
+        _excel_utils().save_unique_elements_to_new_sheet(
+            path, data_cols, new_sheet_name=uniq_sheet,
+            source_sheet=self._col_run_sheet)
+
     def _col_export(self):
         if not self._col_results:
             messagebox.showinfo("No table", "Run a column analysis first, then export.")
@@ -1461,47 +1713,19 @@ class EASAJsonReviewApp:
         path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("JSON", "*.json")],
-            initialfile=self._default_export_name("ai_columns", "xlsx"))
+            initialfile=self._default_export_name("ai_columns", "xlsx"),
+            confirmoverwrite=False)
         if not path:
             return
-        ext = os.path.splitext(path)[1].lower()
-        cols = self._col_table_cols
         try:
-            if ext == ".json":
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self._col_results, f, indent=2, ensure_ascii=False)
-            elif ext == ".csv":
-                import csv
-                with open(path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=cols)
-                    w.writeheader()
-                    w.writerows(self._col_results)
-            else:  # Excel
-                from openpyxl import Workbook
-                from openpyxl.styles import Alignment, Font
-                from openpyxl.utils import get_column_letter
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "AI Column Analysis"
-                ws.append(cols)
-                for cell in ws[1]:
-                    cell.font = Font(bold=True)
-                for r in self._col_results:
-                    ws.append([str(r.get(c, "")) for c in cols])
-                ws.column_dimensions["A"].width = 40
-                for i in range(2, len(cols) + 1):
-                    ws.column_dimensions[get_column_letter(i)].width = 50
-                wrap = Alignment(wrap_text=True, vertical="top")
-                for row in ws.iter_rows(min_row=2):
-                    for cell in row:
-                        cell.alignment = wrap
-                wb.save(path)
+            sheet = self._col_write_store(path, self._col_table_cols, self._col_results)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Export failed", str(exc))
             return
-        self.status_var.set(f"Exported {len(self._col_results)} analysis row(s) → {path}")
+        where = path + (f" (sheet '{sheet}')" if sheet else "")
+        self.status_var.set(f"Exported {len(self._col_results)} analysis row(s) → {where}")
         messagebox.showinfo("Export complete",
-                            f"Wrote {len(self._col_results)} row(s) to:\n{path}")
+                            f"Wrote {len(self._col_results)} row(s) to:\n{where}")
 
 
 def main():

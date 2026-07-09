@@ -28,75 +28,91 @@ def get_unique_elements(file_path, column_name, separator=";"):
 
 def save_unique_elements_to_new_sheet(
     file_path,
-    column_name,
-    new_sheet_name="Unique Elements"
+    column_names,
+    new_sheet_name="Unique Elements",
+    source_sheet=0,
 ):
+    """Collect the unique elements of one or more columns and write them to
+    ``new_sheet_name`` as `Unique_<col> | Count_<col>` pairs (each element with
+    how often it occurs next to it).
+
+    ``column_names`` may be a single column name or a list of them;
+    ``source_sheet`` picks the sheet to read (index or name). The target sheet
+    is rebuilt from scratch on every call, so the function is safe to re-run
+    after each new data row (idempotent).  Returns True on success.
+    """
     try:
-        # 1. Read the source Excel file to extract data
-        df = pd.read_excel(file_path)
+        from collections import Counter
 
-        # Check if the column exists in the source data
-        if column_name not in df.columns:
-            print(f"Error: Column '{column_name}' not found in the Excel file.")
-            return
+        # 1. Read the source sheet to extract data
+        df = pd.read_excel(file_path, sheet_name=source_sheet)
 
-        unique_elements = set()
-        
+        if isinstance(column_names, str):
+            column_names = [column_names]
+
         # Define the list of candidate separators to check
         candidate_separators = [',',  ';']
 
-        # 2. Extract unique elements with dynamic separator detection
-        for row in df[column_name].dropna():
-            text = str(row)
-            
-            # Count how many times each separator appears in the current text
-            sep_counts = {sep: text.count(sep) for sep in candidate_separators}
-            
-            # Find the separator that has the highest count
-            best_sep = max(sep_counts, key=sep_counts.get)
-            
-            # If the most frequent separator actually exists in the string (count > 0)
-            if sep_counts[best_sep] > 0:
-                # Split by the best separator and remove empty strings/whitespace
-                elements = [el.strip() for el in text.split(best_sep) if el.strip()]
-            else:
-                # If none of the separators are in the string, treat it as a single element
-                elements = [text.strip()] if text.strip() else []
-                
-            unique_elements.update(elements)
+        blocks = []
+        for column_name in column_names:
+            if column_name not in df.columns:
+                print(f"Error: Column '{column_name}' not found in the Excel file.")
+                continue
 
-        # Convert the sorted unique elements into a DataFrame
-        new_col_name = f"Unique_{column_name}"
-        unique_df = pd.DataFrame(
-            sorted(list(unique_elements)), columns=[new_col_name]
-        )
+            counts = Counter()
 
-        # 3. Check if the target sheet already exists
-        existing_sheets = pd.ExcelFile(file_path).sheet_names
-        
-        if new_sheet_name in existing_sheets:
-            # Read the existing data in the target sheet
-            existing_df = pd.read_excel(file_path, sheet_name=new_sheet_name)
-            
-            # Combine the existing columns with the new column
-            target_df = pd.concat([existing_df, unique_df], axis=1)
-        else:
-            # If the sheet doesn't exist yet, our new dataframe is the target
-            target_df = unique_df
+            # 2. Extract elements with dynamic separator detection, counting
+            # every occurrence so the sheet can show element + count.
+            for row in df[column_name].dropna():
+                text = str(row)
 
-        # 4. Write the combined data back to the Excel file
+                # Count how many times each separator appears in the current text
+                sep_counts = {sep: text.count(sep) for sep in candidate_separators}
+
+                # Find the separator that has the highest count
+                best_sep = max(sep_counts, key=sep_counts.get)
+
+                # If the most frequent separator actually exists in the string (count > 0)
+                if sep_counts[best_sep] > 0:
+                    # Split by the best separator and remove empty strings/whitespace
+                    elements = [el.strip() for el in text.split(best_sep) if el.strip()]
+                else:
+                    # If none of the separators are in the string, treat it as a single element
+                    elements = [text.strip()] if text.strip() else []
+
+                counts.update(elements)
+
+            blocks.append(pd.DataFrame(
+                sorted(counts.items()),
+                columns=[f"Unique_{column_name}", f"Count_{column_name}"],
+            ))
+
+        if not blocks:
+            return False
+
+        # 3. Columns of different lengths sit side by side, padded with blanks;
+        # keep the counts as (nullable) integers.
+        target_df = pd.concat(blocks, axis=1)
+        for col in target_df.columns:
+            if col.startswith("Count_"):
+                target_df[col] = target_df[col].astype("Int64")
+
+        # 4. Replace the target sheet with the fresh unique-element table
         with pd.ExcelWriter(
             file_path, mode="a", engine="openpyxl", if_sheet_exists="replace"
         ) as writer:
             target_df.to_excel(writer, sheet_name=new_sheet_name, index=False)
 
         print(
-            f"Success! Added '{new_col_name}' ({len(unique_elements)} elements) "
+            f"Success! Wrote unique elements (+counts) for "
+            f"{[c for c in target_df.columns if c.startswith('Unique_')]} "
             f"into the sheet '{new_sheet_name}'."
         )
+        return True
 
     except Exception as e:
         print(f"An error occurred: {e}")
+        return False
 
 
 import os
@@ -171,11 +187,12 @@ if __name__ == "__main__":
                         "References"
                          ]
     NEW_SHEET = "Unique Categories"
+    # One call with all columns: the sheet is rebuilt per call, so per-column
+    # looping would leave only the last column in it.
+    save_unique_elements_to_new_sheet(
+        EXCEL_FILE, COLUMNS_TO_PROCESS, new_sheet_name=NEW_SHEET
+    )
     for col in COLUMNS_TO_PROCESS:
-        save_unique_elements_to_new_sheet(
-            EXCEL_FILE, col, new_sheet_name=NEW_SHEET
-        )
-        
         unique_results = get_unique_elements(EXCEL_FILE, col)
 
         print(f"\nFound {len(unique_results)} unique elements:\n")
