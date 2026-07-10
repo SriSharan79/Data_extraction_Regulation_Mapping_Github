@@ -1,7 +1,7 @@
 """
 Data Extraction Studio — main launcher (non-EASA tools).
 
-Hosts the PDF extraction & review, cache review, section review, and
+Hosts the PDF extraction & review, section review, AI review, and
 PDF -> Markdown tabs. The EASA tabs live in ``data_extraction.studio.easa``.
 
 Run from the repo root:
@@ -21,8 +21,8 @@ class DataExtractionStudio(_BaseStudio):
     HEADER = "Data Extraction Studio — pick a tab to begin."
     TAB_SPECS = [
         ("PDF Extraction & Review", "_build_extraction_tab"),
-        ("Cache Review Launcher", "_build_cache_tab"),
         ("Section Review", "_build_section_review_tab"),
+        ("AI Review", "_build_chunk_ai_tab"),
         ("PDF -> Markdown", "_build_markdown_tab"),
     ]
 

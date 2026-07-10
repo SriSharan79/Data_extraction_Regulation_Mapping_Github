@@ -17,8 +17,8 @@ Design goals (intentional):
 
 How the hosting works
 ---------------------
-The existing UIs (`ExtractionLauncherUI`, `CacheReviewLauncher`,
-`SectionReviewApp`) were written to own a top-level
+The existing UIs (`ExtractionLauncherUI`, `SectionReviewApp`,
+`ChunkAIReviewApp`) were written to own a top-level
 window: they call ``root.title(...)``, ``root.geometry(...)``,
 ``root.destroy()`` etc. A notebook tab is a ``Frame``, not a window, so we
 hand each tool an ``_EmbeddedRoot`` -- a Frame that quietly no-ops the
@@ -627,7 +627,8 @@ class _BaseStudio:
         1. Opens chunk review in a Toplevel modal window.
         2. When chunk review completes, auto-launches Section Review in a
            second Toplevel modal window.
-        Used by both the PDF Extraction tab and the Cache Review tab.
+        Used by the PDF Extraction tab (both its pipeline and its
+        review-from-cache flow).
         """
         studio_root = self.root
 
@@ -676,11 +677,10 @@ class _BaseStudio:
         host = _make_embedded_host(frame)
         chunk_logic.ExtractionLauncherUI(host)
 
-    def _build_cache_tab(self, frame):
-        from data_extraction.chunking import cache_launcher
-        cache_launcher.launch_review_app = self._review_launcher  # patch module hook
+    def _build_chunk_ai_tab(self, frame):
+        from data_extraction.chunking.ai_review_ui import ChunkAIReviewApp
         host = _make_embedded_host(frame)
-        cache_launcher.CacheReviewLauncher(host)
+        ChunkAIReviewApp(host)
 
     def _build_section_review_tab(self, frame):
         _SectionReviewTab(frame)

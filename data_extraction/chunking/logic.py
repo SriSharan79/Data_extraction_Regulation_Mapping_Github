@@ -5,7 +5,7 @@ import logging
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox, filedialog, scrolledtext
+from tkinter import messagebox, filedialog, scrolledtext, ttk
 from colorama import Fore, Style, init
 # NOTE: docling is heavyweight and only needed when an extraction actually runs.
 # It is imported lazily inside generate_and_cache_document() so this module (and
@@ -26,61 +26,74 @@ class ExtractionLauncherUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Docling Automation & Curation Setup Launcher")
-        self.root.geometry("680x420")
-        self.root.configure(bg="#f4f4f6")
-        
+        self.root.geometry("760x460")
+
         # Section A: Fresh Document Processing
-        frame_pdf = tk.LabelFrame(root, text=" Pipeline Run: Process PDF Document ", bg="white", font=("Arial", 10, "bold"), padx=10, pady=10)
-        frame_pdf.pack(fill="x", padx=15, pady=10)
-        
-        tk.Label(frame_pdf, text="PDF File Path:", bg="white").grid(row=0, column=0, sticky="w")
-        self.entry_pdf = tk.Entry(frame_pdf, width=50)
-        self.entry_pdf.grid(row=0, column=1, padx=5, pady=2)
-        tk.Button(frame_pdf, text="Browse...", command=self.browse_pdf).grid(row=0, column=2, padx=2)
-        
-        tk.Label(frame_pdf, text="Storage Destination:", bg="white").grid(row=1, column=0, sticky="w")
-        self.entry_store_pdf = tk.Entry(frame_pdf, width=50)
-        self.entry_store_pdf.grid(row=1, column=1, padx=5, pady=2)
-        tk.Button(frame_pdf, text="Browse...", command=self.browse_storage_pdf).grid(row=1, column=2, padx=2)
-        
-        btn_box = tk.Frame(frame_pdf, bg="white")
+        frame_pdf = ttk.LabelFrame(
+            root, text=" Pipeline Run: Process PDF Document ", padding=10)
+        frame_pdf.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(frame_pdf, text="PDF file:").grid(row=0, column=0, sticky="w")
+        self.entry_pdf = ttk.Entry(frame_pdf, width=78)
+        self.entry_pdf.grid(row=0, column=1, padx=5, pady=3, sticky="we")
+        ttk.Button(frame_pdf, text="Browse...", command=self.browse_pdf).grid(row=0, column=2)
+
+        ttk.Label(frame_pdf, text="Storage destination:").grid(row=1, column=0, sticky="w")
+        self.entry_store_pdf = ttk.Entry(frame_pdf, width=78)
+        self.entry_store_pdf.grid(row=1, column=1, padx=5, pady=3, sticky="we")
+        ttk.Button(frame_pdf, text="Browse...", command=self.browse_storage_pdf).grid(row=1, column=2)
+
+        btn_box = ttk.Frame(frame_pdf)
         btn_box.grid(row=2, column=1, pady=8, sticky="w")
-        self.btn_cache_only = tk.Button(btn_box, text="Generate Cache Only", bg="#3498db", fg="white", font=("Arial", 9, "bold"), command=self.run_cache_only)
-        self.btn_cache_only.pack(side="left", padx=5)
-        self.btn_full_pipeline = tk.Button(btn_box, text="Run Extraction + Review Process", bg="#2ecc71", fg="white", font=("Arial", 9, "bold"), command=self.run_full_pipeline)
+        self.btn_cache_only = ttk.Button(btn_box, text="Generate Cache Only",
+                                         command=self.run_cache_only)
+        self.btn_cache_only.pack(side="left")
+        self.btn_full_pipeline = ttk.Button(btn_box, text="Run Extraction + Review Process",
+                                            command=self.run_full_pipeline)
         self.btn_full_pipeline.pack(side="left", padx=5)
+        frame_pdf.columnconfigure(1, weight=1)
 
         # Section B: Independent Review Process from Pre-existing Cache
-        frame_cache = tk.LabelFrame(root, text=" Curation of the chunks extracted", bg="white", font=("Arial", 10, "bold"), padx=10, pady=10)
-        frame_cache.pack(fill="x", padx=15, pady=10)
-        
-        tk.Label(frame_cache, text="Cache JSON File:", bg="white").grid(row=0, column=0, sticky="w")
-        self.entry_cache = tk.Entry(frame_cache, width=50)
-        self.entry_cache.grid(row=0, column=1, padx=5, pady=2)
-        tk.Button(frame_cache, text="Browse...", command=self.browse_cache).grid(row=0, column=2, padx=2)
-        
-        tk.Label(frame_cache, text="Storage Destination:", bg="white").grid(row=1, column=0, sticky="w")
-        self.entry_store_cache = tk.Entry(frame_cache, width=50)
-        self.entry_store_cache.grid(row=1, column=1, padx=5, pady=2)
-        tk.Button(frame_cache, text="Browse...", command=self.browse_storage_cache).grid(row=1, column=2, padx=2)
-        note="""
-        Note: 1. Raw chucks are stored in cache JSON file are processed into a structured output
-              2. Only the processed chunks are stored in the output file Processed_chunks.json of the particular date folder
-        """
-        tk.Label(frame_cache, text="Please always choose a storage folder that was used to generate the cache file", bg="#d1421e").grid(row=2, column=1, sticky="w")
-        
-        tk.Label(frame_cache, text=note, bg="#d1841e").grid(row=3, column=1, sticky="w")
-        
-        self.btn_review_cache = tk.Button(frame_cache, text="Launch Chunk Curation Review", bg="#9b59b6", fg="white", font=("Arial", 9, "bold"), command=self.run_review_from_cache)
-        self.btn_review_cache.grid(row=4, column=1, pady=8, sticky="w", padx=5)
+        frame_cache = ttk.LabelFrame(
+            root, text=" Curation of the Extracted Chunks (from an existing cache) ", padding=10)
+        frame_cache.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(frame_cache, text="Cache JSON file:").grid(row=0, column=0, sticky="w")
+        self.entry_cache = ttk.Entry(frame_cache, width=78)
+        self.entry_cache.grid(row=0, column=1, padx=5, pady=3, sticky="we")
+        ttk.Button(frame_cache, text="Browse...", command=self.browse_cache).grid(row=0, column=2)
+
+        ttk.Label(frame_cache, text="Storage destination:").grid(row=1, column=0, sticky="w")
+        self.entry_store_cache = ttk.Entry(frame_cache, width=78)
+        self.entry_store_cache.grid(row=1, column=1, padx=5, pady=3, sticky="we")
+        ttk.Button(frame_cache, text="Browse...", command=self.browse_storage_cache).grid(row=1, column=2)
+
+        ttk.Label(
+            frame_cache,
+            text="Always choose the storage folder that was used to generate the cache file.",
+            foreground="#b3541e",
+        ).grid(row=2, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(
+            frame_cache,
+            text=("Note: raw chunks in the cache JSON are processed into a structured "
+                  "output;\nonly the processed chunks land in Processed_chunks.json "
+                  "inside the dated folder."),
+            foreground="#666666",
+            justify="left",
+        ).grid(row=3, column=1, sticky="w", pady=(2, 0))
+
+        self.btn_review_cache = ttk.Button(frame_cache, text="Launch Chunk Curation Review",
+                                           command=self.run_review_from_cache)
+        self.btn_review_cache.grid(row=4, column=1, pady=8, sticky="w")
+        frame_cache.columnconfigure(1, weight=1)
 
         # Buttons disabled while a background conversion is running.
         self.action_buttons = [self.btn_cache_only, self.btn_full_pipeline, self.btn_review_cache]
         self._busy = False
 
         # Status line for background-task feedback.
-        self.status_label = tk.Label(root, text="", bg="#f4f4f6", fg="#2c3e50", font=("Arial", 9, "italic"), anchor="w")
-        self.status_label.pack(fill="x", padx=15, pady=(0, 8))
+        self.status_label = ttk.Label(root, text="", foreground="#2c3e50", anchor="w")
+        self.status_label.pack(fill="x", padx=12, pady=(0, 8))
 
     # --- Background-task helpers ------------------------------------------- #
     def _set_busy(self, busy, message=""):
@@ -183,16 +196,41 @@ class ExtractionLauncherUI:
             "images_path": os.path.join(dated_subfolder, "images")
         }
 
+    def validate_and_confirm_storage(self, storage_path, reference_path):
+        """Warn when the chosen storage already holds a processing footprint
+        for this reference and offer to pick a different base folder; then
+        remember the mapping in the registry (adopted from the former
+        CacheReviewLauncher so its behaviour lives on here)."""
+        paths = self.resolve_directory_structure(storage_path, reference_path)
+
+        if os.path.exists(paths["output_file"]) or os.path.exists(paths["cache_file"]):
+            use_older = messagebox.askyesno(
+                "Existing Storage Footprint",
+                f"Processing footprints already exist for this reference inside:\n{paths['root']}\n\n"
+                "Do you want to continue using this previous destination folder?\n"
+                "(Selecting 'No' redirects you to choose a new base location entirely.)"
+            )
+            if not use_older:
+                chosen_dir = filedialog.askdirectory(title="Select New Base Storage Destination Folder")
+                if chosen_dir:
+                    self.entry_store_cache.delete(0, tk.END)
+                    self.entry_store_cache.insert(0, chosen_dir)
+                    storage_path = chosen_dir
+
+        self.save_to_registry(reference_path, storage_path)
+        return storage_path
+
     def run_cache_only(self):
         pdf_path = self.entry_pdf.get().strip()
         storage_path = self.entry_store_pdf.get().strip()
-        
+
         if not pdf_path or not storage_path:
             messagebox.showerror("Missing input", "Please provide a PDF file and storage destination.")
             return
         if not os.path.exists(pdf_path):
             messagebox.showerror("File not found", f"PDF file does not exist:\n{pdf_path}")
             return
+        self.save_to_registry(pdf_path, storage_path)
 
         def job():
             paths = self.resolve_directory_structure(storage_path, pdf_path)
@@ -226,11 +264,12 @@ class ExtractionLauncherUI:
         if not os.path.exists(pdf_path):
             messagebox.showerror("File not found", f"PDF file does not exist:\n{pdf_path}")
             return
+        self.save_to_registry(pdf_path, storage_path)
 
         def job():
             paths = self.resolve_directory_structure(storage_path, pdf_path)
             os.makedirs(paths["dated_folder"], exist_ok=True)
-            
+
             logger = logging.getLogger("ExtractionLauncher")
             logger.setLevel(logging.INFO)
             if not logger.handlers:
@@ -261,6 +300,7 @@ class ExtractionLauncherUI:
             messagebox.showerror("Error", "Please provide a valid cache file path and base storage folder.")
             return
 
+        storage_path = self.validate_and_confirm_storage(storage_path, cache_path)
         paths = self.resolve_directory_structure(storage_path, cache_path)
         os.makedirs(paths["dated_folder"], exist_ok=True)
 

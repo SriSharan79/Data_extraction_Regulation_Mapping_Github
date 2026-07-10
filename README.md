@@ -11,8 +11,8 @@ two notebook launchers.
 
 ```bash
 # from the repository root
-python run_studio.py        # PDF/chunk tools: extraction & review, cache review,
-                            # section review, PDF -> Markdown
+python run_studio.py        # PDF/chunk tools: extraction & review (incl. cache),
+                            # section review, AI review, PDF -> Markdown
 python run_easa_studio.py   # EASA tools: XML extraction, structured-JSON review
 ```
 
@@ -25,7 +25,7 @@ failure surfaces when you actually run it) — the other tabs keep working.
 ```
 data_extraction/
   chunking/    logic.py, chunk_review_ui.py, section_review_ui.py,
-               cache_launcher.py, table_image_extractor.py, workspace_config.py
+               ai_review_ui.py, table_image_extractor.py, workspace_config.py
   easa/        parser.py, graph_builder.py, run_main.py,
                extraction_ui.py, json_review_ui.py
   markdown/    converter.py
@@ -51,16 +51,16 @@ they are only needed when an extraction actually runs.
 
   | Tool | Needs |
   |---|---|
-  | PDF Extraction & Review, Cache Review | `docling`, `docling-core`, `pymupdf`, `pandas`, `openpyxl`, `tqdm`, `colorama` |
+  | PDF Extraction & Review | `docling`, `docling-core`, `pymupdf`, `pandas`, `openpyxl`, `tqdm`, `colorama` |
   | Section Review | (stdlib only) |
   | EASA XML Extraction | `xmltodict`, `openpyxl` |
   | PDF → Markdown | `markitdown` |
 
 ## What each tab does
 
-### PDF Extraction & Review / Cache Review Launcher
+### PDF Extraction & Review
 `data_extraction/chunking/` — `logic.py`, `table_image_extractor.py`,
-`chunk_review_ui.py`, `cache_launcher.py`
+`chunk_review_ui.py`
 
 - Converts a PDF with **Docling** and splits it into token-aware chunks
   (**HybridChunker**), each tagged with headings, page numbers, doc-item types.
@@ -70,6 +70,23 @@ they are only needed when an extraction actually runs.
 - Interactive review: step through each chunk, edit text/headings, **Log / Skip /
   Use-previous-heading**; logged chunks auto-merge under common headings, then
   chain into **Section Review**. **Resume** or **Reset** prior progress.
+- The "Curation of the chunks extracted" panel is also the cache launcher (the
+  former separate Cache Review tab was folded in here): pick an existing cache
+  JSON + storage, get warned about existing processing footprints (with the
+  option to switch to a fresh base folder), and file↔storage mappings are
+  remembered in the workspace registry so browsing a known file auto-fills its
+  storage destination.
+
+### AI Review (chunks)
+`data_extraction/chunking/ai_review_ui.py`
+
+Loads a chunks cache (`*_docling_chunks_cache.json`) **or** a review output
+(`Processed_chunks.json` with `merged_headings`) and lists the sections with
+✓ checkboxes (Select all / Clear checks, heading toggle, search filter). The
+right side is the same AI Review workbench as the EASA studio — shared
+sections queue, free-form review and column analysis with all their features
+(see the EASA *AI Review* bullet below) — implemented once in
+`data_extraction/ai_utils/review_panel.py` and reused by both studios.
 
 ### Section Review
 `data_extraction/chunking/section_review_ui.py`
@@ -159,6 +176,7 @@ Individual tools also run on their own via `-m` from the repo root:
 ```bash
 python -m data_extraction.easa.extraction_ui         # EASA extraction window
 python -m data_extraction.easa.json_review_ui [file.json]   # EASA JSON review
+python -m data_extraction.chunking.ai_review_ui [chunks.json]  # chunk AI review
 python -m data_extraction.studio.main                # same as run_studio.py
 ```
 
