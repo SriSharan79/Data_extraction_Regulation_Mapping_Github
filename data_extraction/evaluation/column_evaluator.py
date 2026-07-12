@@ -308,11 +308,18 @@ def write_eval_sheet(file_path, run_sheet, entries, out_path=None):
     return eval_sheet
 
 
+def _preview(text, limit=180):
+    text = " ".join(str(text if text is not None else "").split())
+    return text if len(text) <= limit else text[:limit] + " …"
+
+
 def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
-                 uniq_columns=None, out_path=None):
+                 uniq_columns=None, out_path=None, log=None):
     """
     Evaluate one column-analysis snapshot sheet against its reference
-    sections.
+    sections. ``log`` is an optional ``log(message)`` callback that receives
+    a progress line per step (which row is evaluated, its reference, the
+    evaluated texts and the results).
 
     ``references`` is ``{section title: section text}`` (the text the LLM
     analyzed). ``metrics`` selects the evaluations (see :data:`ALL_METRICS`).
@@ -344,9 +351,29 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
         # Separate evaluation workbook: carry the analyzed data along.
         _write_sheet(target, run_sheet, df)
 
-    entries = [evaluate_row(rec, references, data_cols, metrics)
-               for rec in df.to_dict("records")]
+    if log:
+        log(f"⚖ Evaluating sheet '{run_sheet}': {len(df)} row(s), "
+            f"columns [{', '.join(data_cols)}], metrics [{', '.join(metrics)}]")
+    entries = []
+    for i, rec in enumerate(df.to_dict("records"), 1):
+        if log:
+            title = str(rec.get("Section", ""))
+            reference = _lookup_reference(references, title)
+            log(f"▶ [{i}/{len(df)}] '{title}' — reference "
+                f"({len(reference)} chars): {_preview(reference)}"
+                if reference else
+                f"▶ [{i}/{len(df)}] '{title}' — no matching reference section!")
+            for col in data_cols:
+                log(f"   evaluated text [{col}]: {_preview(rec.get(col))}")
+        entry = evaluate_row(rec, references, data_cols, metrics)
+        entries.append(entry)
+        if log:
+            log("   result: " + _preview(
+                "; ".join(f"{k}={v}" for k, v in entry.items()
+                          if k != "Section"), 300))
     eval_sheet = write_eval_sheet(target, run_sheet, entries)
+    if log:
+        log(f"→ wrote '{eval_sheet}'")
 
     total_true = sum(e.get("Row True") or 0 for e in entries)
     total_false = sum(e.get("Row False") or 0 for e in entries)
@@ -362,9 +389,15 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
                      if grounding and grand else None),
     }
     if uniq_columns:
-        summary.update(evaluate_uniques(
+        uniq_summary = evaluate_uniques(
             target, run_sheet, references,
-            [c for c in uniq_columns if c in data_cols]))
+            [c for c in uniq_columns if c in data_cols])
+        summary.update(uniq_summary)
+        if log and uniq_summary.get("uniq_eval_sheet"):
+            cov = uniq_summary.get("uniq_coverage") or {}
+            log(f"→ unique values evaluated → '{uniq_summary['uniq_eval_sheet']}'"
+                + (" (" + ", ".join(f"{c}: {p}%" for c, p in cov.items()
+                                    if p is not None) + ")" if cov else ""))
     return summary
 
 
@@ -412,12 +445,14 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
 
 
 def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
-                      run_sheets=None, uniq_columns="all", out_path=None):
+                      run_sheets=None, uniq_columns="all", out_path=None,
+                      log=None):
     """
     Evaluate every ``Run N …`` snapshot sheet of a column-analysis workbook
     (or just ``run_sheets``). ``uniq_columns="all"`` evaluates the uniques of
     every extracted column; pass a list to restrict, or None to skip.
-    ``out_path`` redirects all result sheets into a separate workbook.
+    ``out_path`` redirects all result sheets into a separate workbook;
+    ``log`` is forwarded to :func:`evaluate_run` for per-row progress lines.
     Returns ``{run sheet: summary dict}``.
     """
     import pandas as pd
@@ -435,18 +470,45 @@ def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
             cols = [c for c in head.columns if c != "Section"]
         results[sheet] = evaluate_run(file_path, sheet, references,
                                       metrics=metrics, uniq_columns=cols,
-                                      out_path=out_path)
+                                      out_path=out_path, log=log)
     return results
 
 
-def references_from_json(path):
-    """{section title: text} from a chunks cache or Processed_chunks.json —
-    the same normalization the chunk AI Review UI uses, so the titles match
-    the Section column of the run sheets."""
-    from data_extraction.chunking.ai_review_ui import sections_from_payload
+def _easa_sections(nodes, out):
+    """Walk an EASA rules hierarchy: title/text per node, depth first (same
+    title rule as the EASA JSON review UI, so run-sheet Sections match)."""
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attributes", {}) or {}
+        title = (attrs.get("source-title") or attrs.get("title")
+                 or node.get("element_type", "node"))
+        out.setdefault(str(title), node.get("text_content", "") or "")
+        _easa_sections(node.get("children") or [], out)
 
+
+def references_from_json(path):
+    """{section title: text} from the sections JSON an analysis was made
+    from, auto-detecting the shape: a chunks cache / Processed_chunks.json
+    (normalized exactly like the chunk AI Review UI) or an EASA structured
+    extraction JSON (rules hierarchy). The titles match the 'Section' column
+    the run sheets carry, so each row finds its reference automatically."""
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    # EASA structured JSON: {rules_hierarchy: [...]} or a bare node list.
+    hierarchy = None
+    if isinstance(data, dict) and data.get("rules_hierarchy"):
+        hierarchy = data["rules_hierarchy"]
+    elif isinstance(data, list) and data and isinstance(data[0], dict) \
+            and ("text_content" in data[0] or "children" in data[0]):
+        hierarchy = data
+    if hierarchy:
+        out = {}
+        _easa_sections(hierarchy, out)
+        return out
+
+    from data_extraction.chunking.ai_review_ui import sections_from_payload
     return dict(sections_from_payload(data))
 
 

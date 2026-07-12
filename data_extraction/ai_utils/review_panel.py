@@ -114,6 +114,7 @@ class AIReviewMixin:
         self._col_save_error_shown = False
         self._col_run_refs = {}       # {section title: text} of the current run
         self._col_run_auto_eval = False  # evaluate each row as it is saved
+        self._col_eval_choices = {}   # picker state (label -> bool, "__uniq__")
         self._col_run_eval_metrics = []  # evaluations chosen for this run
         self._col_run_eval_uniq = False  # also evaluate unique values per row
         self._col_eval_entries = []   # per-section evaluations of this run
@@ -172,6 +173,51 @@ class AIReviewMixin:
         self._build_ai_freeform_tab()
         self._build_ai_columns_tab()
         self._build_ai_eval_tab()
+
+        # Bottom: progress bar + console logging every step of the runs
+        # (what is analyzed / sent to the LLM / answered / evaluated).
+        prog_wrap = ttk.LabelFrame(ai, text=" Progress ", padding=4)
+        prog_wrap.pack(fill="x", pady=(6, 0))
+        self.ai_progress = ttk.Progressbar(prog_wrap, mode="determinate")
+        self.ai_progress.pack(fill="x")
+        self.ai_console = scrolledtext.ScrolledText(
+            prog_wrap, height=8, wrap="word", state="disabled")
+        self.ai_console.pack(fill="x", pady=(4, 0))
+
+    # -------------------------------------------------- progress & console -- #
+    def _ai_log(self, msg):
+        """Append one line to the progress console (main thread only)."""
+        from datetime import datetime
+        self.ai_console.configure(state="normal")
+        self.ai_console.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        # keep the console bounded
+        if int(self.ai_console.index("end-1c").split(".")[0]) > 2000:
+            self.ai_console.delete("1.0", "500.0")
+        self.ai_console.see("end")
+        self.ai_console.configure(state="disabled")
+
+    def _ai_log_bg(self, msg):
+        """Thread-safe console logging for the worker threads."""
+        self.root.after(0, self._ai_log, msg)
+
+    @staticmethod
+    def _ai_preview(text, limit=220):
+        text = " ".join(str(text if text is not None else "").split())
+        return text if len(text) <= limit else text[:limit] + " …"
+
+    def _ai_progress_start(self, total):
+        self.ai_progress.stop()
+        self.ai_progress.configure(mode="determinate", maximum=max(total, 1), value=0)
+
+    def _ai_progress_step(self):
+        self.ai_progress.configure(
+            value=min(float(self.ai_progress["value"]) + 1,
+                      float(self.ai_progress["maximum"])))
+
+    def _ai_progress_done(self):
+        self.ai_progress.stop()
+        self.ai_progress.configure(mode="determinate",
+                                   value=self.ai_progress["maximum"])
 
     def _build_ai_freeform_tab(self):
         ff = ttk.Frame(self.ai_nb, padding=6)
@@ -416,6 +462,10 @@ class AIReviewMixin:
         self._ai_busy = True
         self._ai_set_busy_buttons("disabled")
         self._ai_q = queue.Queue()
+        self._ai_progress_start(len(jobs))
+        self._ai_log(f"=== Free-form review: {len(jobs)} section(s) via {service_label} "
+                     f"({model or 'default'}), answer as {fmt}, "
+                     f"store: {os.path.basename(path)} ===")
         self._ai_append(f"\n=== Running on {len(jobs)} section(s) via {service_label}"
                         f" ({model or 'default'}) — answer as {fmt} ===\n")
         threading.Thread(target=self._ai_worker,
@@ -433,12 +483,18 @@ class AIReviewMixin:
             self._ai_q.put(None)
             return
         full_instruction = f"{instruction}\n{directive}" if directive else instruction
-        for title, text in jobs:
+        for i, (title, text) in enumerate(jobs, 1):
             prompt = f"{full_instruction}\n\n---\nSECTION: {title}\n\n{text}"
+            self._ai_log_bg(f"▶ [{i}/{len(jobs)}] Analyzing '{title}' "
+                            f"({len(text or '')} chars): {self._ai_preview(text)}")
+            self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
+                            f"{self._ai_preview(prompt)}")
             try:
                 resp = llm_call(prompt, None, service, model)
             except Exception as exc:  # noqa: BLE001
                 resp = f"[ERROR] {exc}"
+            self._ai_log_bg(f"← Response ({len(str(resp or ''))} chars): "
+                            f"{self._ai_preview(resp)}")
             self._ai_q.put(("result", {
                 "title": title, "instruction": instruction, "response": resp,
                 "service": service_label, "model": model or "", "format": fmt,
@@ -452,19 +508,23 @@ class AIReviewMixin:
                 if item is None:
                     self._ai_busy = False
                     self._ai_set_busy_buttons("normal")
+                    self._ai_progress_done()
                     done = f"AI review complete — {len(self._ai_results)} result(s) total"
                     saved = len(self._ai_results) - self._ai_run_start
                     if self._ai_autosave_path and saved:
                         done += f", {saved} saved to {os.path.basename(self._ai_autosave_path)}"
                     self.status_var.set(done + ".")
+                    self._ai_log(done + ".")
                     return
                 kind, payload = item
                 if kind == "error":
                     self._ai_append(f"[ERROR] {payload}\n")
+                    self._ai_log(f"[ERROR] {payload}")
                 else:
                     self._ai_results.append(payload)
                     self._ai_append(f"\n## {payload['title']}\n{payload['response']}\n")
                     self._ai_autosave()  # keep the file current after every result
+                    self._ai_progress_step()
         except queue.Empty:
             pass
         self.root.after(150, self._ai_poll)
@@ -737,9 +797,12 @@ class AIReviewMixin:
         if self.eval_auto_var.get() and store.lower().endswith(".xlsx"):
             auto_eval = self._col_ask_auto_eval()
         self._col_run_auto_eval = auto_eval
-        # Snapshot the choices so mid-run changes don't affect this batch.
-        self._col_run_eval_metrics = self._eval_selected_metrics() if auto_eval else []
-        self._col_run_eval_uniq = auto_eval and self.eval_uniq_var.get()
+        # Snapshot the picker's choices so mid-run changes don't affect this batch.
+        self._col_run_eval_metrics = [
+            n for label, names in _EVAL_METRIC_OPTIONS
+            if self._col_eval_choices.get(label, True) for n in names
+        ] if auto_eval else []
+        self._col_run_eval_uniq = auto_eval and self._col_eval_choices.get("__uniq__", True)
         self._col_eval_entries = []     # per-section evaluations of this run
         self._col_rows_saved = 0        # file/sheet is created with the 1st row
         self._col_run_sheet = None
@@ -767,6 +830,14 @@ class AIReviewMixin:
         self._ai_busy = True
         self._ai_set_busy_buttons("disabled")
         self._col_q = queue.Queue()
+        self._ai_progress_start(len(jobs))
+        self._ai_log(f"=== Column analysis: {len(jobs)} section(s) → "
+                     f"columns [{', '.join(columns)}] via {service_label} "
+                     f"({model or 'default'}), store: {os.path.basename(store)} ===")
+        self._ai_log("Auto-evaluation: "
+                     + (f"[{', '.join(self._col_run_eval_metrics)}]"
+                        + (" + unique values" if self._col_run_eval_uniq else "")
+                        if auto_eval else "off"))
         self.status_var.set(f"Analyzing {len(jobs)} section(s) into {len(columns)} column(s)…")
         threading.Thread(target=self._col_worker,
                          args=(jobs, columns, prompt_head, service, model),
@@ -780,17 +851,25 @@ class AIReviewMixin:
             self._col_q.put(("error", f"Could not load LLM utilities: {exc}"))
             self._col_q.put(None)
             return
-        for title, text in jobs:
+        for i, (title, text) in enumerate(jobs, 1):
             prompt = f"{prompt_head}\n\n---\nSECTION: {title}\n\n{text}"
+            self._ai_log_bg(f"▶ [{i}/{len(jobs)}] Analyzing '{title}' "
+                            f"({len(text or '')} chars): {self._ai_preview(text)}")
+            self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
+                            f"{self._ai_preview(prompt)}")
             try:
                 resp = llm_call(prompt, None, service, model)
             except Exception as exc:  # noqa: BLE001
                 resp = None
                 parsed = {columns[0]: f"[ERROR] {exc}"}
+                self._ai_log_bg(f"← LLM call failed: {exc}")
             else:
+                self._ai_log_bg(f"← Response ({len(str(resp or ''))} chars): "
+                                f"{self._ai_preview(resp)}")
                 parsed = self._parse_llm_json(resp)
                 if parsed is None:
                     parsed = {columns[0]: f"[unparsed] {resp}"}
+                    self._ai_log_bg("   response was not valid JSON — kept as [unparsed]")
             row = {"Section": title}
             for c in columns:
                 v = parsed.get(c, "")
@@ -823,23 +902,27 @@ class AIReviewMixin:
                 if item is None:
                     self._ai_busy = False
                     self._ai_set_busy_buttons("normal")
+                    self._ai_progress_done()
                     done = f"Column analysis complete — {len(self._col_results)} row(s)"
                     if self._col_store_path and self._col_rows_saved:
                         done += f", saved to {os.path.basename(self._col_store_path)}"
                         if self._col_run_sheet:
                             done += f" (sheet '{self._col_run_sheet}')"
                     self.status_var.set(done + ".")
+                    self._ai_log(done + ".")
                     # Rows were evaluated as they were saved; finish up.
                     self._col_eval_finish()
                     return
                 kind, payload = item
                 if kind == "error":
                     messagebox.showerror("Column analysis", payload)
+                    self._ai_log(f"[ERROR] {payload}")
                 else:
                     self._col_results.append(payload)
                     self.col_table.insert("", "end", values=[
                         payload.get(c, "") for c in self._col_table_cols])
                     self._col_save_row(payload)
+                    self._ai_progress_step()
         except queue.Empty:
             pass
         self.root.after(150, self._col_poll)
@@ -962,6 +1045,10 @@ class AIReviewMixin:
             self._col_rows_saved += 1
             self.status_var.set(f"Saved row {self._col_rows_saved} "
                                 f"({row.get('Section', '')}) → {os.path.basename(path)}")
+            self._ai_log(f"💾 Row {self._col_rows_saved} saved → "
+                         f"{os.path.basename(path)}"
+                         + (f" (sheet '{self._col_run_sheet}')"
+                            if self._col_run_sheet else ""))
         except Exception as exc:  # noqa: BLE001
             if not self._col_save_error_shown:
                 self._col_save_error_shown = True
@@ -1011,19 +1098,18 @@ class AIReviewMixin:
         ref_wrap = ttk.LabelFrame(ev, text=" Reference data (the section content the "
                                            "columns were generated from) ", padding=4)
         ref_wrap.pack(fill="x", pady=(6, 0))
-        self.eval_ref_choice = tk.StringVar(value="run")
-        ttk.Radiobutton(ref_wrap, text="Sections of the last column-analysis run",
-                        variable=self.eval_ref_choice, value="run").pack(anchor="w")
-        ttk.Radiobutton(ref_wrap, text="Currently queued sections",
-                        variable=self.eval_ref_choice, value="queue").pack(anchor="w")
         jrow = ttk.Frame(ref_wrap)
         jrow.pack(fill="x")
-        ttk.Radiobutton(jrow, text="Sections JSON file:",
-                        variable=self.eval_ref_choice, value="json").pack(side="left")
+        ttk.Label(jrow, text="Sections JSON:").pack(side="left")
         self.eval_ref_json = ttk.Entry(jrow)
         self.eval_ref_json.pack(side="left", fill="x", expand=True, padx=4)
         ttk.Button(jrow, text="Browse…",
                    command=self._eval_browse_ref_json).pack(side="left")
+        ttk.Label(ref_wrap, foreground="#666666", justify="left",
+                  text="Each run-sheet row is matched automatically: its 'Section' "
+                       "value is looked up\namong this JSON's section titles and "
+                       "evaluated against that section's text.").pack(
+            anchor="w", pady=(2, 0))
 
         met_wrap = ttk.LabelFrame(ev, text=" Evaluations to run (each cell / item vs. "
                                            "its reference text) ", padding=4)
@@ -1057,9 +1143,6 @@ class AIReviewMixin:
         self.eval_run_btn = ttk.Button(brow, text="Run evaluation",
                                        command=self._ai_eval_run)
         self.eval_run_btn.pack(side="left")
-        ttk.Label(brow, foreground="#666666",
-                  text="Auto-evaluation is toggled next to “Analyze queued” "
-                       "on the Column analysis tab.").pack(side="left", padx=12)
 
     def _eval_browse_wb(self):
         path = filedialog.askopenfilename(
@@ -1095,7 +1178,6 @@ class AIReviewMixin:
         if path:
             self.eval_ref_json.delete(0, tk.END)
             self.eval_ref_json.insert(0, path)
-            self.eval_ref_choice.set("json")
 
     def _eval_selected_metrics(self):
         metrics = []
@@ -1104,68 +1186,57 @@ class AIReviewMixin:
                 metrics.extend(names)
         return metrics
 
-    def _eval_references(self, auto=False):
-        """Resolve the reference map for the chosen source, or None on error."""
-        choice = self.eval_ref_choice.get()
-        if choice == "queue":
-            refs = dict(self._ai_batch)
-            src = "queued sections"
-        elif choice == "json":
-            path = self.eval_ref_json.get().strip()
-            if not path or not os.path.exists(path):
-                if not auto:
-                    messagebox.showinfo("Reference JSON",
-                                        "Pick the sections JSON file first.")
-                return None
-            try:
-                from data_extraction.evaluation.column_evaluator import references_from_json
-                refs = references_from_json(path)
-            except Exception as exc:  # noqa: BLE001
-                if not auto:
-                    messagebox.showerror("Reference JSON",
-                                         f"Could not load sections:\n{exc}")
-                return None
-            src = os.path.basename(path)
-        else:
-            refs = dict(self._col_run_refs)
-            src = "last analysis run"
+    def _eval_references(self):
+        """Load {section title: text} from the chosen sections JSON — the
+        run-sheet 'Section' values are matched against these titles
+        automatically. Returns None (after telling the user) on error."""
+        path = self.eval_ref_json.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showinfo(
+                "Sections JSON needed",
+                "Pick the sections JSON the analysis was made from — the "
+                "'Section' column of the run sheet is matched against its "
+                "section titles to find each reference text.")
+            return None
+        try:
+            from data_extraction.evaluation.column_evaluator import references_from_json
+            refs = references_from_json(path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Sections JSON",
+                                 f"Could not load sections:\n{exc}")
+            return None
         if not refs:
-            if not auto:
-                messagebox.showinfo(
-                    "No reference sections",
-                    f"No sections available from the {src}. Run a column "
-                    "analysis, queue sections, or pick a sections JSON file.")
+            messagebox.showinfo("Sections JSON",
+                                f"No sections found in {os.path.basename(path)}.")
             return None
         return refs
 
-    def _ai_eval_run(self, auto=False):
-        """Run the selected evaluations on the chosen workbook/run sheet(s)."""
-        if self._eval_busy or (self._ai_busy and not auto):
-            if not auto:
-                messagebox.showinfo("Busy", "Another run is already in progress.")
+    def _ai_eval_run(self):
+        """Run the selected evaluations on the chosen workbook/run sheet(s),
+        against the sections JSON. Standalone: works on any workbook that
+        already holds analyzed data, independent of the Column analysis tab."""
+        if self._eval_busy or self._ai_busy:
+            messagebox.showinfo("Busy", "Another run is already in progress.")
             return
         path = self.eval_wb.get().strip()
         if not path or os.path.splitext(path)[1].lower() != ".xlsx" \
                 or not os.path.exists(path):
-            if not auto:
-                messagebox.showinfo("No workbook",
-                                    "Pick a stored column-analysis .xlsx first "
-                                    "(run an analysis, or Browse… to an "
-                                    "existing workbook).")
+            messagebox.showinfo("No workbook",
+                                "Pick a stored column-analysis .xlsx first "
+                                "(Browse… to an existing workbook).")
             return
         sheet = self.eval_sheet.get().strip()
         run_sheets = None if (not sheet or sheet == "All runs") else [sheet]
         metrics = self._eval_selected_metrics()
         if not metrics:
-            if not auto:
-                messagebox.showinfo("No evaluations",
-                                    "Tick at least one evaluation to run.")
+            messagebox.showinfo("No evaluations",
+                                "Tick at least one evaluation to run.")
             return
-        references = self._eval_references(auto)
+        references = self._eval_references()
         if references is None:
             return
         out_path = None
-        if self.eval_out_choice.get() == "new" and not auto:
+        if self.eval_out_choice.get() == "new":
             out_path = filedialog.asksaveasfilename(
                 title="Write the evaluation workbook to…",
                 defaultextension=".xlsx",
@@ -1179,6 +1250,15 @@ class AIReviewMixin:
 
         self._eval_busy = True
         self.eval_run_btn.configure(state="disabled")
+        self.ai_progress.configure(mode="indeterminate")
+        self.ai_progress.start(80)
+        self._ai_log(f"=== Evaluation: {os.path.basename(path)} "
+                     f"[{sheet or 'all runs'}], {len(references)} reference "
+                     f"section(s) from {os.path.basename(self.eval_ref_json.get().strip())}, "
+                     f"metrics [{', '.join(metrics)}]"
+                     + (", uniques on" if uniq else "")
+                     + (f", output → {os.path.basename(out_path)}" if out_path else "")
+                     + " ===")
         self.status_var.set(f"Evaluating {sheet or 'all runs'} against "
                             f"{len(references)} reference section(s)…")
 
@@ -1187,27 +1267,28 @@ class AIReviewMixin:
                 from data_extraction.evaluation.column_evaluator import evaluate_workbook
                 results = evaluate_workbook(path, references, metrics=metrics,
                                             run_sheets=run_sheets,
-                                            uniq_columns=uniq, out_path=out_path)
+                                            uniq_columns=uniq, out_path=out_path,
+                                            log=self._ai_log_bg)
             except Exception as exc:  # noqa: BLE001
-                self.root.after(0, lambda e=exc: self._ai_eval_done(None, e, auto))
+                self.root.after(0, lambda e=exc: self._ai_eval_done(None, e))
             else:
-                self.root.after(0, lambda r=results: self._ai_eval_done(r, None, auto))
+                self.root.after(0, lambda r=results: self._ai_eval_done(r, None))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _ai_eval_done(self, results, exc, auto):
+    def _ai_eval_done(self, results, exc):
         self._eval_busy = False
         self.eval_run_btn.configure(state="normal")
+        self._ai_progress_done()
         if exc is not None:
             self.status_var.set(f"Evaluation failed: {exc}")
-            if not auto:
-                messagebox.showerror("Evaluation failed", str(exc))
+            self._ai_log(f"[ERROR] evaluation failed: {exc}")
+            messagebox.showerror("Evaluation failed", str(exc))
             return
         if not results:
             self.status_var.set("Evaluation found no 'Run …' sheets to evaluate.")
-            if not auto:
-                messagebox.showinfo("Evaluation", "The workbook has no "
-                                                  "'Run …' snapshot sheets.")
+            messagebox.showinfo("Evaluation", "The workbook has no "
+                                              "'Run …' snapshot sheets.")
             return
         lines = []
         for sheet, s in results.items():
@@ -1222,9 +1303,11 @@ class AIReviewMixin:
         first = next(iter(results.values()))
         where = os.path.basename(first["out_path"])
         self.status_var.set(f"Evaluation complete → {where}: " + " | ".join(lines))
-        if not auto:
-            messagebox.showinfo("Evaluation complete",
-                                f"Written to {first['out_path']}\n\n" + "\n".join(lines))
+        self._ai_log(f"=== Evaluation complete → {first['out_path']} ===")
+        for line in lines:
+            self._ai_log("   " + line)
+        messagebox.showinfo("Evaluation complete",
+                            f"Written to {first['out_path']}\n\n" + "\n".join(lines))
 
     def _col_ask_auto_eval(self):
         """Modal picker shown when 'Analyze queued' starts with the
@@ -1238,26 +1321,32 @@ class AIReviewMixin:
         frm = ttk.Frame(dlg, padding=12)
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, justify="left",
-                  text="Choose the evaluations to run automatically once the "
-                       "batch finishes\n(each cell / item is compared with the "
-                       "section text it was generated from):").pack(anchor="w")
+                  text="Choose the evaluations to run on each section result "
+                       "as soon as it is saved\n(each cell / item is compared "
+                       "with the section text it was generated from):").pack(anchor="w")
+        # The picker keeps its own choices (self._col_eval_choices) — fully
+        # independent of the Evaluation tab.
+        dlg_vars = {}
         for label, _names in _EVAL_METRIC_OPTIONS:
-            ttk.Checkbutton(frm, text=label,
-                            variable=self.eval_metric_vars[label]).pack(
-                anchor="w", padx=10)
-        ttk.Checkbutton(frm, variable=self.eval_uniq_var,
+            var = tk.BooleanVar(value=self._col_eval_choices.get(label, True))
+            dlg_vars[label] = var
+            ttk.Checkbutton(frm, text=label, variable=var).pack(anchor="w", padx=10)
+        uniq_var = tk.BooleanVar(value=self._col_eval_choices.get("__uniq__", True))
+        ttk.Checkbutton(frm, variable=uniq_var,
                         text="Also evaluate the unique generated values "
                              "(element + count, grounded in the references)").pack(
             anchor="w", pady=(8, 0))
         choice = {"ok": False}
 
         def _ok():
-            if not self._eval_selected_metrics():
+            if not any(v.get() for v in dlg_vars.values()):
                 messagebox.showinfo(
                     "No evaluations",
                     "Tick at least one evaluation — or press Skip evaluation.",
                     parent=dlg)
                 return
+            self._col_eval_choices = {label: v.get() for label, v in dlg_vars.items()}
+            self._col_eval_choices["__uniq__"] = uniq_var.get()
             choice["ok"] = True
             dlg.destroy()
 
@@ -1281,34 +1370,42 @@ class AIReviewMixin:
             return
         try:
             from data_extraction.evaluation.column_evaluator import (
-                evaluate_row, evaluate_uniques, write_eval_sheet)
+                _lookup_reference, evaluate_row, evaluate_uniques, write_eval_sheet)
             data_cols = [c for c in self._col_table_cols if c != "Section"]
+            title = str(row.get("Section", ""))
+            reference = _lookup_reference(self._col_run_refs, title)
+            self._ai_log(f"⚖ Evaluating '{title}' with "
+                         f"[{', '.join(self._col_run_eval_metrics)}]")
+            self._ai_log(f"   reference ({len(reference)} chars): "
+                         f"{self._ai_preview(reference)}")
+            for col in data_cols:
+                self._ai_log(f"   evaluated text [{col}]: "
+                             f"{self._ai_preview(row.get(col))}")
             entry = evaluate_row(row, self._col_run_refs, data_cols,
                                  self._col_run_eval_metrics)
             self._col_eval_entries.append(entry)
+            self._ai_log("   result: " + self._ai_preview(
+                "; ".join(f"{k}={v}" for k, v in entry.items()
+                          if k not in ("Section",)), 300))
             write_eval_sheet(self._col_store_path, self._col_run_sheet,
                              self._col_eval_entries)
+            self._ai_log(f"   → 'Eval {self._col_run_sheet}' refreshed"[:120])
             if self._col_run_eval_uniq:
                 uniq_cols = [c for c in self._col_run_uniq_cols if c != "Section"]
                 if uniq_cols:
                     evaluate_uniques(self._col_store_path, self._col_run_sheet,
                                      self._col_run_refs, uniq_cols)
+                    self._ai_log(f"   → 'Uniq Eval {self._col_run_sheet}' "
+                                 f"refreshed ({', '.join(uniq_cols)})"[:150])
         except Exception as exc:  # noqa: BLE001 - never interrupt the analysis
             self.status_var.set(f"Row evaluation failed: {exc}")
+            self._ai_log(f"[ERROR] row evaluation failed: {exc}")
 
     def _col_eval_finish(self):
-        """After the batch: prefill the Evaluation tab with this run and, when
-        rows were evaluated along the way, show the overall result."""
-        path, sheet = self._col_store_path, self._col_run_sheet
-        if not (path and sheet and os.path.splitext(path)[1].lower() == ".xlsx"
-                and os.path.exists(path)):
-            return
-        self.eval_wb.delete(0, tk.END)
-        self.eval_wb.insert(0, path)
-        self._eval_refresh_sheets()
-        self.eval_sheet.set(sheet)
-        self.eval_ref_choice.set("run")
-        if not (self._col_run_auto_eval and self._col_eval_entries):
+        """After the batch: when rows were evaluated along the way, show the
+        overall result in the status bar."""
+        sheet = self._col_run_sheet
+        if not (sheet and self._col_run_auto_eval and self._col_eval_entries):
             return
         parts = [f"{self.status_var.get()} Evaluated row by row → "
                  f"'Eval {sheet}'"[:200]]
@@ -1319,6 +1416,9 @@ class AIReviewMixin:
                 parts.append(f"grounded {t}/{t + f} "
                              f"({round(100.0 * t / (t + f), 1)}%)")
         self.status_var.set(", ".join(parts) + ".")
+        self._ai_log(f"=== Evaluation of the run finished: "
+                     f"{len(self._col_eval_entries)} section(s) evaluated"
+                     + (f", {parts[-1]}" if len(parts) > 1 else "") + " ===")
 
     def _col_export(self):
         if not self._col_results:

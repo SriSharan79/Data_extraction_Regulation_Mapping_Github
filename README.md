@@ -154,12 +154,14 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     each unique element with its occurrence **count** in the adjacent cell. Double-click a row for full
     values; **Export table…** appends the same kind of snapshot.
   - *Evaluation* (`data_extraction/evaluation/column_evaluator.py`) — its own
-    page next to *Column analysis*, comparing a stored analysis workbook with
-    the **section texts the columns were generated from**. Pick the workbook
-    (any existing one, or the last run is pre-filled), one `Run N …` sheet or
-    *All runs*, and the **reference data**: last run's sections, currently
-    queued sections, or a sections JSON file. Every evaluation is an
-    individual checkbox — **substring check** (each cell item grounded in its
+    page next to *Column analysis*, fully independent of it: it evaluates
+    **files that already hold analyzed data**. Pick any analysis workbook,
+    one `Run N …` sheet or *All runs*, and the **sections JSON the analysis
+    was made from** (always asked; chunks cache, `Processed_chunks.json` or
+    an EASA structured JSON — the shape is auto-detected). Each run-sheet
+    row is matched automatically: its `Section` value is looked up among the
+    JSON's section titles and evaluated against that section's text. Every
+    evaluation is an individual checkbox — **substring check** (each cell item grounded in its
     reference, adapted from the alr `data_evaluator`), **Jaccard**,
     **ROUGE-1/2/L**, **BLEU**, **Levenshtein distance**, **similarity ratio**
     and **word error rate** per cell vs. reference (adapted from the alr
@@ -176,8 +178,9 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     next to *Analyze queued* on the Column analysis tab (on by default): when
     it is ticked, starting an analysis first pops up a picker with all the
     possible evaluations so you choose what gets evaluated for that batch —
-    *Skip evaluation* opts out for that run, and the choices are shared with
-    the Evaluation tab. The chosen evaluations then run **section by
+    *Skip evaluation* opts out for that run; the picker remembers its own
+    choices, independent of the Evaluation tab. The chosen evaluations then
+    run **section by
     section**: right after each section's result row is saved it is evaluated
     against its reference text and the `Eval Run N …` (and `Uniq Eval Run N
     …`) sheets are refreshed before the next section is analyzed, so an
@@ -186,6 +189,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     `python -m data_extraction.evaluation.column_evaluator results.xlsx
     sections.json [--metrics …] [--out eval.xlsx]` (sections JSON = chunks
     cache or `Processed_chunks.json`).
+
+  A **progress bar with a console** sits at the bottom of the AI Review page
+  and logs every step of all three modes: which section is being analyzed,
+  the prompt sent to the LLM, its response, and — during evaluations — the
+  reference text, the evaluated cell texts and the computed results
+  (previews are truncated; the console keeps the last ~2000 lines).
 
   LLM calls run on a background thread. Manage keys with
   the **API keys…** button on the tab (add / edit / clear, persisted to
