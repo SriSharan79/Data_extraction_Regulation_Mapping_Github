@@ -190,8 +190,9 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     sections.json [--metrics …] [--out eval.xlsx]` (sections JSON = chunks
     cache or `Processed_chunks.json`).
 
-  A **progress bar with a console** sits at the bottom of the AI Review page
-  and logs every step of all three modes: which section is being analyzed,
+  A **progress bar with a console** sits in its own pane at the bottom of the
+  AI Review page (~20 % of the window; drag the divider to resize) and logs
+  every step of all three modes: which section is being analyzed,
   the prompt sent to the LLM, its response, and — during evaluations — the
   reference text, the evaluated cell texts and the computed results
   (previews are truncated; the console keeps the last ~2000 lines).

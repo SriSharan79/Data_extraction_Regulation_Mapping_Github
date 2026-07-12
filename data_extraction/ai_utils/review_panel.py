@@ -152,13 +152,18 @@ class AIReviewMixin:
         
         ttk.Button(llm_frame, text="API keys…", command=self._ai_manage_keys).pack(side="right", padx=5)
 
-        body = ttk.PanedWindow(ai, orient="horizontal")
-        body.pack(fill="both", expand=True, pady=(6, 0))
+        # Vertical split: analysis area on top (~80%), console pane below
+        # (~20% of the window) so the log stays visible; drag to adjust.
+        vsplit = ttk.PanedWindow(ai, orient="vertical")
+        vsplit.pack(fill="both", expand=True, pady=(6, 0))
+
+        body = ttk.PanedWindow(vsplit, orient="horizontal")
+        vsplit.add(body, weight=4)
 
         # Left: the shared sections queue both run modes consume
         batch_wrap = ttk.LabelFrame(body, text=" Sections queue ", padding=4)
         body.add(batch_wrap, weight=1)
-        self.ai_batch_list = tk.Listbox(batch_wrap, height=6, selectmode="extended")
+        self.ai_batch_list = tk.Listbox(batch_wrap, height=4, selectmode="extended")
         self.ai_batch_list.pack(fill="both", expand=True)
         qbtns = ttk.Frame(batch_wrap)
         qbtns.pack(fill="x", pady=(4, 0))
@@ -174,15 +179,27 @@ class AIReviewMixin:
         self._build_ai_columns_tab()
         self._build_ai_eval_tab()
 
-        # Bottom: progress bar + console logging every step of the runs
+        # Bottom pane: progress bar + console logging every step of the runs
         # (what is analyzed / sent to the LLM / answered / evaluated).
-        prog_wrap = ttk.LabelFrame(ai, text=" Progress ", padding=4)
-        prog_wrap.pack(fill="x", pady=(6, 0))
+        prog_wrap = ttk.LabelFrame(vsplit, text=" Progress ", padding=4)
+        vsplit.add(prog_wrap, weight=1)
         self.ai_progress = ttk.Progressbar(prog_wrap, mode="determinate")
         self.ai_progress.pack(fill="x")
         self.ai_console = scrolledtext.ScrolledText(
-            prog_wrap, height=8, wrap="word", state="disabled")
-        self.ai_console.pack(fill="x", pady=(4, 0))
+            prog_wrap, height=6, wrap="word", state="disabled")
+        self.ai_console.pack(fill="both", expand=True, pady=(4, 0))
+
+        # Place the sash once at ~80/20 so the console gets a fifth of the
+        # window from the start (weights only govern later resizes).
+        def _place_sash(_event=None):
+            height = vsplit.winfo_height()
+            if height > 120 and not getattr(vsplit, "_sash_placed", False):
+                vsplit._sash_placed = True
+                try:
+                    vsplit.sashpos(0, int(height * 0.8))
+                except tk.TclError:
+                    pass
+        vsplit.bind("<Configure>", _place_sash)
 
     # -------------------------------------------------- progress & console -- #
     def _ai_log(self, msg):
@@ -238,7 +255,7 @@ class AIReviewMixin:
 
         ttk.Label(ff, text="Instruction (the section's text is appended automatically):").pack(
             anchor="w", pady=(6, 0))
-        self.ai_prompt = scrolledtext.ScrolledText(ff, height=3, wrap="word")
+        self.ai_prompt = scrolledtext.ScrolledText(ff, height=2, wrap="word")
         self.ai_prompt.pack(fill="x")
         self.ai_prompt.insert("1.0", _AI_PRESETS["Summarize this section"])
         self.ai_preset.set("Summarize this section")
@@ -268,7 +285,7 @@ class AIReviewMixin:
                                    padding=4)
         top.add(cols_wrap, weight=1)
         self.col_defs = ttk.Treeview(cols_wrap, columns=("uniq", "what"),
-                                     show="tree headings", height=5)
+                                     show="tree headings", height=3)
         self.col_defs.heading("#0", text="Column")
         self.col_defs.heading("uniq", text="✓", command=self._col_toggle_uniq_all)
         self.col_defs.heading("what", text="What should the LLM extract?")
@@ -293,7 +310,7 @@ class AIReviewMixin:
 
         prev_wrap = ttk.LabelFrame(top, text=" Prompt preview (sent per section) ", padding=4)
         top.add(prev_wrap, weight=1)
-        self.col_preview = scrolledtext.ScrolledText(prev_wrap, height=8, wrap="word",
+        self.col_preview = scrolledtext.ScrolledText(prev_wrap, height=5, wrap="word",
                                                      state="disabled")
         self.col_preview.pack(fill="both", expand=True)
 
@@ -310,7 +327,7 @@ class AIReviewMixin:
 
         table_wrap = ttk.LabelFrame(ca, text=" Analysis table (one row per section) ", padding=4)
         table_wrap.pack(fill="both", expand=True)
-        self.col_table = ttk.Treeview(table_wrap, show="headings")
+        self.col_table = ttk.Treeview(table_wrap, show="headings", height=6)
         ct_y = ttk.Scrollbar(table_wrap, orient="vertical", command=self.col_table.yview)
         ct_x = ttk.Scrollbar(table_wrap, orient="horizontal", command=self.col_table.xview)
         self.col_table.configure(yscrollcommand=ct_y.set, xscrollcommand=ct_x.set)
