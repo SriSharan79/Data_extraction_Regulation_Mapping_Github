@@ -117,6 +117,57 @@ def save_unique_elements_to_new_sheet(
         print(f"An error occurred: {e}")
         return False
 
+import os
+import pandas as pd
+
+def find_files_and_export(folder_path, file_extension, search_string, output_excel_path):
+    """
+    Searches for specific files in a directory and exports the results to Excel.
+    """
+    # Ensure the file extension starts with a dot (e.g., 'xlsx' becomes '.xlsx')
+    if not file_extension.startswith('.'):
+        file_extension = f".{file_extension}"
+        
+    matched_files = []
+
+    # Verify the folder path exists
+    if not os.path.exists(folder_path):
+        print(f"Error: The folder path '{folder_path}' does not exist.")
+        return
+
+    print(f"Searching in: {folder_path}...")
+    
+    # Walk through the directory and all subdirectories
+    for root, directories, files in os.walk(folder_path):
+        for file in files:
+            # Check if the file matches both the extension and the search string
+            if file.endswith(file_extension) and search_string in file:
+                full_path = os.path.join(root, file)
+                
+                # Append the matched file's data as a dictionary
+                matched_files.append({
+                    'File Name': file,
+                    'File Path': full_path
+                })
+
+    # Check if we found any files
+    if matched_files:
+        # Convert the list of dictionaries into a pandas DataFrame
+        df = pd.DataFrame(matched_files)
+        
+        # Export the DataFrame to an Excel file
+        try:
+            df.to_excel(output_excel_path, index=False)
+            print(f"\nSuccess! Found {len(matched_files)} matching files.")
+            print(f"Results successfully saved to: {output_excel_path}")
+        except Exception as e:
+            print(f"An error occurred while saving the Excel file: {e}")
+    else:
+        print(f"\nNo files found matching extension '{file_extension}' and containing '{search_string}'.")
+
+# ==========================================
+# User Input Section
+# ==============================
 
 import os
 import shutil
