@@ -7,8 +7,13 @@ pre-run storage dialog with per-result auto-save, export) and the
 column-analysis mode (column definitions with unique-element checkboxes,
 live prompt preview, row-by-row saving into an accumulating Excel
 workbook with per-run snapshot sheets and Uniq sheets via
-scripts/excel_file_utils, table export), plus the LLM service/model
-picker and the API-key manager button.
+scripts/excel_file_utils, table export), the evaluation tab (run the
+selected checks — substring grounding, Jaccard, ROUGE, BLEU, Levenshtein,
+similarity ratio, WER — on a stored analysis workbook against the section
+texts that generated it, into the same or a new workbook; with the
+auto-evaluate box ticked each section row is evaluated right after it is
+saved, via data_extraction.evaluation.column_evaluator),
+plus the LLM service/model picker and the API-key manager button.
 
 Host contract — a class mixing this in must provide:
   * ``self.root``          — the Tk root/host widget (for after()/dialogs)
@@ -58,6 +63,17 @@ _AI_OUTPUT_FORMATS = {
 }
 
 
+# Evaluation tab options: UI label -> column_evaluator metric name(s).
+_EVAL_METRIC_OPTIONS = [
+    ("Substring check (item grounded in reference)", ("grounding",)),
+    ("Jaccard similarity", ("jaccard",)),
+    ("ROUGE-1/2/L", ("rouge1", "rouge2", "rougeL")),
+    ("BLEU", ("bleu",)),
+    ("Levenshtein distance", ("levenshtein_distance",)),
+    ("Similarity ratio", ("similarity_ratio",)),
+    ("Word error rate (WER)", ("word_error_rate",)),
+]
+
 _EXCEL_UTILS = None
 
 
@@ -96,6 +112,12 @@ class AIReviewMixin:
         self._col_rows_saved = 0      # rows of the current run already on disk
         self._col_run_sheet = None    # snapshot sheet of the current run (.xlsx)
         self._col_save_error_shown = False
+        self._col_run_refs = {}       # {section title: text} of the current run
+        self._col_run_auto_eval = False  # evaluate each row as it is saved
+        self._col_run_eval_metrics = []  # evaluations chosen for this run
+        self._col_run_eval_uniq = False  # also evaluate unique values per row
+        self._col_eval_entries = []   # per-section evaluations of this run
+        self._eval_busy = False       # an evaluation is running
 
     # -- host hooks --------------------------------------------------------- #
     def _ai_current_section(self):
@@ -149,6 +171,7 @@ class AIReviewMixin:
         body.add(self.ai_nb, weight=3)
         self._build_ai_freeform_tab()
         self._build_ai_columns_tab()
+        self._build_ai_eval_tab()
 
     def _build_ai_freeform_tab(self):
         ff = ttk.Frame(self.ai_nb, padding=6)
@@ -232,6 +255,11 @@ class AIReviewMixin:
         run_row.pack(fill="x", pady=6)
         self.col_run_btn = ttk.Button(run_row, text="Analyze queued (0)", command=self._col_run)
         self.col_run_btn.pack(side="left")
+        # When on, Analyze queued first asks which evaluations to run
+        # automatically once the batch finishes (see the Evaluation tab).
+        self.eval_auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(run_row, variable=self.eval_auto_var,
+                        text="Auto-evaluate after the analysis").pack(side="left", padx=10)
         ttk.Button(run_row, text="Export table…", command=self._col_export).pack(side="right")
 
         table_wrap = ttk.LabelFrame(ca, text=" Analysis table (one row per section) ", padding=4)
@@ -576,6 +604,7 @@ class AIReviewMixin:
         self.ai_run_btn.configure(state=state)
         self.ai_batch_btn.configure(state=state)
         self.col_run_btn.configure(state=state)
+        self.eval_run_btn.configure(state=state)
 
     # ------------------------------------------------- AI column analysis -- #
     def _col_refresh_defs(self):
@@ -701,11 +730,24 @@ class AIReviewMixin:
             self.status_var.set("Column analysis cancelled — no storage file chosen.")
             return
         self._col_store_path = store
+        # With the auto-evaluate box ticked, ask which evaluations should run
+        # on each section result as soon as it is saved ("Skip evaluation"
+        # opts out for this batch).
+        auto_eval = False
+        if self.eval_auto_var.get() and store.lower().endswith(".xlsx"):
+            auto_eval = self._col_ask_auto_eval()
+        self._col_run_auto_eval = auto_eval
+        # Snapshot the choices so mid-run changes don't affect this batch.
+        self._col_run_eval_metrics = self._eval_selected_metrics() if auto_eval else []
+        self._col_run_eval_uniq = auto_eval and self.eval_uniq_var.get()
+        self._col_eval_entries = []     # per-section evaluations of this run
         self._col_rows_saved = 0        # file/sheet is created with the 1st row
         self._col_run_sheet = None
         self._col_save_error_shown = False
         # Only ✓-checked columns get unique-element collection this run.
         self._col_run_uniq_cols = [c for c in columns if c in self._col_uniq_checked]
+        # Reference texts of this run's sections, for the evaluation afterwards.
+        self._col_run_refs = dict(jobs)
 
         # Dynamically map modern engine panel values to active session configurations
         provider_code = self.llm_choice_an.get().upper()
@@ -787,6 +829,8 @@ class AIReviewMixin:
                         if self._col_run_sheet:
                             done += f" (sheet '{self._col_run_sheet}')"
                     self.status_var.set(done + ".")
+                    # Rows were evaluated as they were saved; finish up.
+                    self._col_eval_finish()
                     return
                 kind, payload = item
                 if kind == "error":
@@ -914,6 +958,7 @@ class AIReviewMixin:
                     cell.alignment = wrap
                 wb.save(path)
                 self._col_update_uniques(path)
+                self._col_eval_saved_row(row)
             self._col_rows_saved += 1
             self.status_var.set(f"Saved row {self._col_rows_saved} "
                                 f"({row.get('Section', '')}) → {os.path.basename(path)}")
@@ -937,6 +982,343 @@ class AIReviewMixin:
         _excel_utils().save_unique_elements_to_new_sheet(
             path, data_cols, new_sheet_name=uniq_sheet,
             source_sheet=self._col_run_sheet)
+
+    # ----------------------------------------------------- Evaluation tab -- #
+    def _build_ai_eval_tab(self):
+        """Evaluation page: pick a stored analysis workbook + run sheet, the
+        reference sections, the evaluations to compute and where to write
+        them (data_extraction.evaluation.column_evaluator)."""
+        ev = ttk.Frame(self.ai_nb, padding=6)
+        self.ai_nb.add(ev, text="Evaluation")
+
+        wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx with 'Run N …' sheets) ",
+                                 padding=4)
+        wb_wrap.pack(fill="x")
+        row = ttk.Frame(wb_wrap)
+        row.pack(fill="x")
+        ttk.Label(row, text="Workbook:").pack(side="left")
+        self.eval_wb = ttk.Entry(row)
+        self.eval_wb.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row, text="Browse…", command=self._eval_browse_wb).pack(side="left")
+        row2 = ttk.Frame(wb_wrap)
+        row2.pack(fill="x", pady=(4, 0))
+        ttk.Label(row2, text="Run sheet:").pack(side="left")
+        self.eval_sheet = ttk.Combobox(row2, state="readonly", width=34, values=[])
+        self.eval_sheet.pack(side="left", padx=4)
+        ttk.Button(row2, text="Refresh sheets",
+                   command=self._eval_refresh_sheets).pack(side="left")
+
+        ref_wrap = ttk.LabelFrame(ev, text=" Reference data (the section content the "
+                                           "columns were generated from) ", padding=4)
+        ref_wrap.pack(fill="x", pady=(6, 0))
+        self.eval_ref_choice = tk.StringVar(value="run")
+        ttk.Radiobutton(ref_wrap, text="Sections of the last column-analysis run",
+                        variable=self.eval_ref_choice, value="run").pack(anchor="w")
+        ttk.Radiobutton(ref_wrap, text="Currently queued sections",
+                        variable=self.eval_ref_choice, value="queue").pack(anchor="w")
+        jrow = ttk.Frame(ref_wrap)
+        jrow.pack(fill="x")
+        ttk.Radiobutton(jrow, text="Sections JSON file:",
+                        variable=self.eval_ref_choice, value="json").pack(side="left")
+        self.eval_ref_json = ttk.Entry(jrow)
+        self.eval_ref_json.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(jrow, text="Browse…",
+                   command=self._eval_browse_ref_json).pack(side="left")
+
+        met_wrap = ttk.LabelFrame(ev, text=" Evaluations to run (each cell / item vs. "
+                                           "its reference text) ", padding=4)
+        met_wrap.pack(fill="x", pady=(6, 0))
+        self.eval_metric_vars = {}
+        grid = ttk.Frame(met_wrap)
+        grid.pack(fill="x")
+        for i, (label, _names) in enumerate(_EVAL_METRIC_OPTIONS):
+            var = tk.BooleanVar(value=True)
+            self.eval_metric_vars[label] = var
+            ttk.Checkbutton(grid, text=label, variable=var).grid(
+                row=i % 4, column=i // 4, sticky="w", padx=(0, 18))
+        self.eval_uniq_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(met_wrap, variable=self.eval_uniq_var,
+                        text="Also evaluate the unique generated values "
+                             "(via save_unique_elements_to_new_sheet)").pack(
+            anchor="w", pady=(4, 0))
+
+        out_wrap = ttk.LabelFrame(ev, text=" Write results to ", padding=4)
+        out_wrap.pack(fill="x", pady=(6, 0))
+        self.eval_out_choice = tk.StringVar(value="same")
+        ttk.Radiobutton(out_wrap, text="New sheets in the same workbook "
+                                       "(Eval / Uniq Eval next to the run)",
+                        variable=self.eval_out_choice, value="same").pack(anchor="w")
+        ttk.Radiobutton(out_wrap, text="A new evaluation workbook (asks where; also "
+                                       "gets a copy of the run sheet)",
+                        variable=self.eval_out_choice, value="new").pack(anchor="w")
+
+        brow = ttk.Frame(ev)
+        brow.pack(fill="x", pady=6)
+        self.eval_run_btn = ttk.Button(brow, text="Run evaluation",
+                                       command=self._ai_eval_run)
+        self.eval_run_btn.pack(side="left")
+        ttk.Label(brow, foreground="#666666",
+                  text="Auto-evaluation is toggled next to “Analyze queued” "
+                       "on the Column analysis tab.").pack(side="left", padx=12)
+
+    def _eval_browse_wb(self):
+        path = filedialog.askopenfilename(
+            title="Select a column-analysis workbook",
+            filetypes=[("Excel workbook", "*.xlsx")])
+        if path:
+            self.eval_wb.delete(0, tk.END)
+            self.eval_wb.insert(0, path)
+            self._eval_refresh_sheets()
+
+    def _eval_refresh_sheets(self):
+        """List the workbook's 'Run N …' snapshot sheets; preselect the last."""
+        path = self.eval_wb.get().strip()
+        runs = []
+        if path and os.path.exists(path):
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(path, read_only=True)
+                runs = [s for s in wb.sheetnames if s.startswith("Run ")]
+                wb.close()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Workbook", f"Could not read sheets:\n{exc}")
+        values = (["All runs"] + runs) if runs else []
+        self.eval_sheet.configure(values=values)
+        self.eval_sheet.set(runs[-1] if runs else "")
+        if path and not runs:
+            self.status_var.set("No 'Run …' sheets found in the selected workbook.")
+
+    def _eval_browse_ref_json(self):
+        path = filedialog.askopenfilename(
+            title="Select the sections JSON the analysis was made from",
+            filetypes=[("JSON files", "*.json")])
+        if path:
+            self.eval_ref_json.delete(0, tk.END)
+            self.eval_ref_json.insert(0, path)
+            self.eval_ref_choice.set("json")
+
+    def _eval_selected_metrics(self):
+        metrics = []
+        for label, names in _EVAL_METRIC_OPTIONS:
+            if self.eval_metric_vars[label].get():
+                metrics.extend(names)
+        return metrics
+
+    def _eval_references(self, auto=False):
+        """Resolve the reference map for the chosen source, or None on error."""
+        choice = self.eval_ref_choice.get()
+        if choice == "queue":
+            refs = dict(self._ai_batch)
+            src = "queued sections"
+        elif choice == "json":
+            path = self.eval_ref_json.get().strip()
+            if not path or not os.path.exists(path):
+                if not auto:
+                    messagebox.showinfo("Reference JSON",
+                                        "Pick the sections JSON file first.")
+                return None
+            try:
+                from data_extraction.evaluation.column_evaluator import references_from_json
+                refs = references_from_json(path)
+            except Exception as exc:  # noqa: BLE001
+                if not auto:
+                    messagebox.showerror("Reference JSON",
+                                         f"Could not load sections:\n{exc}")
+                return None
+            src = os.path.basename(path)
+        else:
+            refs = dict(self._col_run_refs)
+            src = "last analysis run"
+        if not refs:
+            if not auto:
+                messagebox.showinfo(
+                    "No reference sections",
+                    f"No sections available from the {src}. Run a column "
+                    "analysis, queue sections, or pick a sections JSON file.")
+            return None
+        return refs
+
+    def _ai_eval_run(self, auto=False):
+        """Run the selected evaluations on the chosen workbook/run sheet(s)."""
+        if self._eval_busy or (self._ai_busy and not auto):
+            if not auto:
+                messagebox.showinfo("Busy", "Another run is already in progress.")
+            return
+        path = self.eval_wb.get().strip()
+        if not path or os.path.splitext(path)[1].lower() != ".xlsx" \
+                or not os.path.exists(path):
+            if not auto:
+                messagebox.showinfo("No workbook",
+                                    "Pick a stored column-analysis .xlsx first "
+                                    "(run an analysis, or Browse… to an "
+                                    "existing workbook).")
+            return
+        sheet = self.eval_sheet.get().strip()
+        run_sheets = None if (not sheet or sheet == "All runs") else [sheet]
+        metrics = self._eval_selected_metrics()
+        if not metrics:
+            if not auto:
+                messagebox.showinfo("No evaluations",
+                                    "Tick at least one evaluation to run.")
+            return
+        references = self._eval_references(auto)
+        if references is None:
+            return
+        out_path = None
+        if self.eval_out_choice.get() == "new" and not auto:
+            out_path = filedialog.asksaveasfilename(
+                title="Write the evaluation workbook to…",
+                defaultextension=".xlsx",
+                filetypes=[("Excel workbook", "*.xlsx")],
+                initialfile=Path(path).stem + "_evaluation.xlsx",
+                confirmoverwrite=False)
+            if not out_path:
+                self.status_var.set("Evaluation cancelled — no output file chosen.")
+                return
+        uniq = "all" if self.eval_uniq_var.get() else None
+
+        self._eval_busy = True
+        self.eval_run_btn.configure(state="disabled")
+        self.status_var.set(f"Evaluating {sheet or 'all runs'} against "
+                            f"{len(references)} reference section(s)…")
+
+        def work():
+            try:
+                from data_extraction.evaluation.column_evaluator import evaluate_workbook
+                results = evaluate_workbook(path, references, metrics=metrics,
+                                            run_sheets=run_sheets,
+                                            uniq_columns=uniq, out_path=out_path)
+            except Exception as exc:  # noqa: BLE001
+                self.root.after(0, lambda e=exc: self._ai_eval_done(None, e, auto))
+            else:
+                self.root.after(0, lambda r=results: self._ai_eval_done(r, None, auto))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ai_eval_done(self, results, exc, auto):
+        self._eval_busy = False
+        self.eval_run_btn.configure(state="normal")
+        if exc is not None:
+            self.status_var.set(f"Evaluation failed: {exc}")
+            if not auto:
+                messagebox.showerror("Evaluation failed", str(exc))
+            return
+        if not results:
+            self.status_var.set("Evaluation found no 'Run …' sheets to evaluate.")
+            if not auto:
+                messagebox.showinfo("Evaluation", "The workbook has no "
+                                                  "'Run …' snapshot sheets.")
+            return
+        lines = []
+        for sheet, s in results.items():
+            line = f"{sheet}: {s['rows']} row(s)"
+            if s.get("coverage") is not None:
+                line += (f", grounded {s['true']}/{s['true'] + s['false']}"
+                         f" ({s['coverage']}%)")
+            line += f" → '{s['eval_sheet']}'"
+            if s.get("uniq_eval_sheet"):
+                line += f", uniques → '{s['uniq_eval_sheet']}'"
+            lines.append(line)
+        first = next(iter(results.values()))
+        where = os.path.basename(first["out_path"])
+        self.status_var.set(f"Evaluation complete → {where}: " + " | ".join(lines))
+        if not auto:
+            messagebox.showinfo("Evaluation complete",
+                                f"Written to {first['out_path']}\n\n" + "\n".join(lines))
+
+    def _col_ask_auto_eval(self):
+        """Modal picker shown when 'Analyze queued' starts with the
+        auto-evaluate box ticked: choose which of the possible evaluations
+        run automatically on this batch once the analysis finishes. The
+        checkboxes are shared with the Evaluation tab. Returns True to
+        evaluate afterwards, False for 'Skip evaluation'."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Auto-evaluation of this analysis")
+        dlg.transient(self.root.winfo_toplevel())
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, justify="left",
+                  text="Choose the evaluations to run automatically once the "
+                       "batch finishes\n(each cell / item is compared with the "
+                       "section text it was generated from):").pack(anchor="w")
+        for label, _names in _EVAL_METRIC_OPTIONS:
+            ttk.Checkbutton(frm, text=label,
+                            variable=self.eval_metric_vars[label]).pack(
+                anchor="w", padx=10)
+        ttk.Checkbutton(frm, variable=self.eval_uniq_var,
+                        text="Also evaluate the unique generated values "
+                             "(element + count, grounded in the references)").pack(
+            anchor="w", pady=(8, 0))
+        choice = {"ok": False}
+
+        def _ok():
+            if not self._eval_selected_metrics():
+                messagebox.showinfo(
+                    "No evaluations",
+                    "Tick at least one evaluation — or press Skip evaluation.",
+                    parent=dlg)
+                return
+            choice["ok"] = True
+            dlg.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="OK — evaluate after the analysis",
+                   command=_ok).pack(side="left")
+        ttk.Button(btns, text="Skip evaluation",
+                   command=dlg.destroy).pack(side="right")
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return choice["ok"]
+
+    def _col_eval_saved_row(self, row):
+        """Evaluate one just-saved section result (the chosen evaluations vs.
+        its reference text) and refresh the 'Eval <run sheet>' — and, when
+        chosen, the 'Uniq Eval <run sheet>' — before the next section is
+        analyzed. Failures only reach the status bar; the analysis goes on."""
+        if not (self._col_run_auto_eval and self._col_run_eval_metrics
+                and self._col_run_sheet):
+            return
+        try:
+            from data_extraction.evaluation.column_evaluator import (
+                evaluate_row, evaluate_uniques, write_eval_sheet)
+            data_cols = [c for c in self._col_table_cols if c != "Section"]
+            entry = evaluate_row(row, self._col_run_refs, data_cols,
+                                 self._col_run_eval_metrics)
+            self._col_eval_entries.append(entry)
+            write_eval_sheet(self._col_store_path, self._col_run_sheet,
+                             self._col_eval_entries)
+            if self._col_run_eval_uniq:
+                uniq_cols = [c for c in self._col_run_uniq_cols if c != "Section"]
+                if uniq_cols:
+                    evaluate_uniques(self._col_store_path, self._col_run_sheet,
+                                     self._col_run_refs, uniq_cols)
+        except Exception as exc:  # noqa: BLE001 - never interrupt the analysis
+            self.status_var.set(f"Row evaluation failed: {exc}")
+
+    def _col_eval_finish(self):
+        """After the batch: prefill the Evaluation tab with this run and, when
+        rows were evaluated along the way, show the overall result."""
+        path, sheet = self._col_store_path, self._col_run_sheet
+        if not (path and sheet and os.path.splitext(path)[1].lower() == ".xlsx"
+                and os.path.exists(path)):
+            return
+        self.eval_wb.delete(0, tk.END)
+        self.eval_wb.insert(0, path)
+        self._eval_refresh_sheets()
+        self.eval_sheet.set(sheet)
+        self.eval_ref_choice.set("run")
+        if not (self._col_run_auto_eval and self._col_eval_entries):
+            return
+        parts = [f"{self.status_var.get()} Evaluated row by row → "
+                 f"'Eval {sheet}'"[:200]]
+        if "grounding" in self._col_run_eval_metrics:
+            t = sum(e.get("Row True") or 0 for e in self._col_eval_entries)
+            f = sum(e.get("Row False") or 0 for e in self._col_eval_entries)
+            if t + f:
+                parts.append(f"grounded {t}/{t + f} "
+                             f"({round(100.0 * t / (t + f), 1)}%)")
+        self.status_var.set(", ".join(parts) + ".")
 
     def _col_export(self):
         if not self._col_results:

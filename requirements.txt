@@ -30,6 +30,14 @@ requests           # HTTP calls to the OpenAI-compatible endpoints
 tiktoken           # token counting for the interaction log
 # (colorama and pandas, listed above, are also used by the AI utilities)
 
+# --- Evaluation metrics (column-analysis evaluation) ---
+# Optional at runtime: without them the evaluator still computes the
+# grounding check, Jaccard and a difflib similarity ratio.
+nltk               # BLEU (Lexical_Overlap_Metrics)
+rouge-score        # ROUGE-1/2/L (Lexical_Overlap_Metrics)
+Levenshtein        # edit distance (Distance_w_Structural _Alignment)
+jiwer              # word error rate (Distance_w_Structural _Alignment)
+
 # --- Optional ---
 # imagehash        # enables perceptual de-duplication of extracted images
 # Pillow           # broadens EASA JSON Review image preview to JPG/BMP/TIFF/…

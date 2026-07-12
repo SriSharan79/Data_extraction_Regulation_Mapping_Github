@@ -28,6 +28,9 @@ data_extraction/
                ai_review_ui.py, table_image_extractor.py, workspace_config.py
   easa/        parser.py, graph_builder.py, run_main.py,
                extraction_ui.py, json_review_ui.py
+  evaluation/  column_evaluator.py (AI-review output evaluation) +
+               Lexical_Overlap_Metrics.py, Distance_w_Structural _Alignment.py,
+               data_evaluator.py / metric_evaluator.py (alr reference sources)
   markdown/    converter.py
   studio/      base.py (shared _BaseStudio + tab classes),
                main.py (DataExtractionStudio), easa.py (EASAStudio)
@@ -55,6 +58,7 @@ they are only needed when an extraction actually runs.
   | Section Review | (stdlib only) |
   | EASA XML Extraction | `xmltodict`, `openpyxl` |
   | PDF → Markdown | `markitdown` |
+  | AI Review evaluation | `nltk`, `rouge-score`, `Levenshtein`, `jiwer` (all optional — grounding, Jaccard and a difflib similarity ratio work without them) |
 
 ## What each tab does
 
@@ -149,6 +153,39 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     columns start checked) and only the **checked** columns are collected,
     each unique element with its occurrence **count** in the adjacent cell. Double-click a row for full
     values; **Export table…** appends the same kind of snapshot.
+  - *Evaluation* (`data_extraction/evaluation/column_evaluator.py`) — its own
+    page next to *Column analysis*, comparing a stored analysis workbook with
+    the **section texts the columns were generated from**. Pick the workbook
+    (any existing one, or the last run is pre-filled), one `Run N …` sheet or
+    *All runs*, and the **reference data**: last run's sections, currently
+    queued sections, or a sections JSON file. Every evaluation is an
+    individual checkbox — **substring check** (each cell item grounded in its
+    reference, adapted from the alr `data_evaluator`), **Jaccard**,
+    **ROUGE-1/2/L**, **BLEU**, **Levenshtein distance**, **similarity ratio**
+    and **word error rate** per cell vs. reference (adapted from the alr
+    `metric_evaluator`; each guarded, so a missing library just leaves that
+    metric empty). Results go into an `Eval Run N …` sheet (per-column
+    True/False counts, metric columns, per-section **Coverage %**, an average
+    row) — written **into the same workbook or into a new evaluation
+    workbook** (your choice; the new file also gets a copy of the run sheet).
+    Optionally the unique generated values are identified via
+    `scripts/excel_file_utils.save_unique_elements_to_new_sheet` (the
+    `Uniq Run N …` sheet) and every unique element is grounded against the
+    combined reference text into a `Uniq Eval Run N …` sheet with per-column
+    coverage summaries. An **Auto-evaluate after the analysis** checkbox sits
+    next to *Analyze queued* on the Column analysis tab (on by default): when
+    it is ticked, starting an analysis first pops up a picker with all the
+    possible evaluations so you choose what gets evaluated for that batch —
+    *Skip evaluation* opts out for that run, and the choices are shared with
+    the Evaluation tab. The chosen evaluations then run **section by
+    section**: right after each section's result row is saved it is evaluated
+    against its reference text and the `Eval Run N …` (and `Uniq Eval Run N
+    …`) sheets are refreshed before the next section is analyzed, so an
+    interrupted batch already has every finished section evaluated.
+    Standalone:
+    `python -m data_extraction.evaluation.column_evaluator results.xlsx
+    sections.json [--metrics …] [--out eval.xlsx]` (sections JSON = chunks
+    cache or `Processed_chunks.json`).
 
   LLM calls run on a background thread. Manage keys with
   the **API keys…** button on the tab (add / edit / clear, persisted to
@@ -177,6 +214,8 @@ Individual tools also run on their own via `-m` from the repo root:
 python -m data_extraction.easa.extraction_ui         # EASA extraction window
 python -m data_extraction.easa.json_review_ui [file.json]   # EASA JSON review
 python -m data_extraction.chunking.ai_review_ui [chunks.json]  # chunk AI review
+python -m data_extraction.evaluation.column_evaluator results.xlsx sections.json
+                                                      # evaluate a stored analysis
 python -m data_extraction.studio.main                # same as run_studio.py
 ```
 
