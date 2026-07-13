@@ -26,6 +26,15 @@ Every evaluation is individually selectable via ``metrics``:
   ``Distance_w_Structural _Alignment`` when Levenshtein/jiwer are installed
   (a stdlib ``difflib`` ratio fills ``similarity_ratio`` otherwise).
 
+For the **per-item** metric sheets both sides are split: each cell into its
+items (``; ``) and each reference section into sentences (sentence-aware,
+protecting decimals / abbreviations / citations). Every item is scored
+against every reference sentence and only the **most relevant** sentence's
+value is kept — the highest for the similarity-style metrics, the lowest for
+the edit-distance / error-rate metrics — alongside the sentence that produced
+it. The **overview** (``Eval <run sheet>``) is unchanged: it still scores each
+whole cell against the whole reference.
+
 Each metric is guarded: a missing library or failure records ``None``
 instead of aborting. The **overview** (``Eval <run sheet>``) keeps the
 established shape: grounding counts per column plus every other metric
@@ -64,6 +73,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -96,6 +106,33 @@ _SEPARATORS = (
     ";", 
     # ","
     )
+
+# Reference text is split into sentences so each candidate item can be scored
+# against the single most relevant sentence rather than the whole section.
+# A naive ". " split mangles decimals ("2.5"), abbreviations ("e.g.", "No.",
+# "para.") and numbered citations; the splitter below protects those.
+#
+# A boundary candidate is sentence punctuation (with an optional closing
+# quote/bracket) followed by whitespace; :func:`_is_sentence_end` then vetoes
+# false boundaries.
+_SENT_BOUNDARY = re.compile(r'([.!?]["\'”’)\]]?)(\s+)')
+
+# Lowercased tokens (dotted forms kept) that should NOT end a sentence when
+# followed by whitespace. Tuned for regulatory / technical text.
+_ABBREVIATIONS = frozenset({
+    "e.g", "i.e", "eg", "ie", "etc", "vs", "viz", "cf", "al",
+    "no", "nos", "fig", "figs", "eq", "eqs", "ref", "refs",
+    "sec", "secs", "art", "arts", "para", "paras", "reg", "regs",
+    "ch", "chap", "pt", "pts", "pp", "vol", "vols", "ed", "eds",
+    "approx", "ca", "incl", "excl", "min", "max", "avg", "std", "est",
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "rev",
+    "inc", "ltd", "co", "corp", "dept", "univ", "govt", "assn",
+    "u.s", "u.k", "e.u", "u.n", "no.s",
+})
+
+# When picking the most relevant sentence per metric: similarity-style scores
+# are best when high; edit-distance / error-rate scores are best when low.
+_LOWER_IS_BETTER = ("levenshtein_distance", "word_error_rate")
 
 _EXCEL_UTILS = None
 
@@ -134,6 +171,70 @@ def is_grounded(item, reference):
     """data_evaluator's Is_Subset check: the extracted item is contained in
     the reference text (case-insensitive substring)."""
     return bool(reference) and str(item).lower() in str(reference).lower()
+
+
+def _is_sentence_end(text, dot, after):
+    """Decide whether the punctuation at index ``dot`` (with the next token
+    starting at ``after``) is a real sentence boundary. Vetoes the common
+    false positives: a digit right before the dot (decimals like ``2.5`` and
+    numbered citations like ``para. 3.``), a known abbreviation or a
+    single-uppercase-letter initial right before it, and a next token that
+    starts lowercase (so an unlisted abbreviation followed by a lowercase word
+    is not split). The trade-off is conservative — when unsure it keeps the
+    text together rather than splitting mid-sentence."""
+    # Decimal / numbered marker: a digit immediately precedes the dot.
+    if dot > 0 and text[dot - 1].isdigit():
+        return False
+    # Abbreviation or single-letter initial immediately before the dot
+    # (dotted acronyms like "e.g"/"U.S" are captured whole).
+    m = re.search(r'([A-Za-z]+(?:\.[A-Za-z]+)*)$', text[:dot])
+    if m:
+        tok = m.group(1)
+        if tok.lower() in _ABBREVIATIONS:
+            return False
+        if len(tok) == 1 and tok.isupper():
+            return False
+    # The next token should look like a sentence start, not a lowercase
+    # continuation of an unlisted abbreviation.
+    nxt = text[after] if after < len(text) else ""
+    if nxt and nxt.islower():
+        return False
+    return True
+
+
+def split_reference(reference):
+    """Split a section's reference text into sentences so each candidate item
+    can be scored against the single most relevant sentence instead of the
+    whole section. Splits on sentence punctuation (``.``/``!``/``?``) followed
+    by whitespace, but protects decimals (``2.5``), abbreviations (``e.g.``,
+    ``No.``, ``para.``, ``Fig.``), numbered citations and single-letter
+    initials via :func:`_is_sentence_end`. Returns the whole text as one
+    sentence when no genuine boundary is found."""
+    text = str(reference or "").strip()
+    if not text:
+        return []
+    sentences, start = [], 0
+    for m in _SENT_BOUNDARY.finditer(text):
+        if not _is_sentence_end(text, m.start(1), m.end()):
+            continue
+        chunk = text[start:m.end(1)].strip()
+        if chunk:
+            sentences.append(chunk)
+        start = m.end()
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences or [text]
+
+
+def _better(metric, new, current):
+    """True if ``new`` is the more relevant score than ``current`` for
+    ``metric``: lower for the edit-distance / error-rate metrics
+    (``_LOWER_IS_BETTER``), higher for every similarity-style metric.
+    ``current is None`` (nothing chosen yet) always accepts ``new``."""
+    if current is None:
+        return True
+    return new < current if metric in _LOWER_IS_BETTER else new > current
 
 
 def _lookup_reference(references, title):
@@ -313,25 +414,37 @@ def evaluate_row(row, references, data_cols, metrics=ALL_METRICS):
 
 def evaluate_row_items(row, references, data_cols, metrics=ALL_METRICS):
     """Per-item counterpart of :func:`evaluate_row`: split every extracted
-    cell into its items (:func:`split_items`) and evaluate **each selected
-    metric on each item individually** against the row's reference section.
+    cell into its items (:func:`split_items`) **and** split the row's
+    reference section into sentences (:func:`split_reference`, sentence-aware:
+    decimals, abbreviations and citations are protected).
+    Each item is scored with every selected metric against **each** reference
+    sentence, and only the **most relevant** sentence's value is kept — the
+    highest for the similarity-style metrics and the lowest for the
+    edit-distance / error-rate metrics (``_LOWER_IS_BETTER``), per
+    :func:`_better`. Scoring against the best-matching single sentence,
+    rather than the whole section, gives each item a sharper, more meaningful
+    number (a two-word item is not drowned out by a 40-sentence reference).
 
     Returns a list of records, one per item::
 
         {"Section": …, "Reference found": …, "Column": …, "Item #": …,
-         "Item": …, "grounding": True/False, "jaccard": …, "rouge1": …, …}
+         "Item": …,
+         "grounding": True/False, "grounding__sentence": "<best sentence>",
+         "jaccard": …, "jaccard__sentence": …, …}
 
-    Only the selected metrics appear as keys. Guarded exactly like the cell
-    metrics: a missing library or an empty reference records ``None``
-    (grounding stays a real True/False — an empty reference grounds
-    nothing). These records feed :func:`write_metric_sheets`, which fans
-    them out into one sheet per metric.
+    Each metric carries a ``<metric>__sentence`` companion naming the
+    reference sentence that produced its kept value. Only the selected metrics
+    appear. Guarded exactly like the cell metrics: a missing library or an
+    empty reference records ``None`` (grounding stays a real True/False — an
+    empty reference grounds nothing). These records feed
+    :func:`write_metric_sheets`, which fans them out into one sheet per metric.
     """
     metrics = [m for m in ALL_METRICS if m in set(metrics)]
     item_metrics = [m for m in metrics if m != "grounding"]
     grounding = "grounding" in metrics
     title = str(row.get("Section", ""))
     reference = _lookup_reference(references, title)
+    sentences = split_reference(reference)
     records = []
     for col in data_cols:
         items = split_items(row.get(col))
@@ -339,14 +452,27 @@ def evaluate_row_items(row, references, data_cols, metrics=ALL_METRICS):
             rec = {"Section": title, "Reference found": bool(reference),
                    "Column": col, "Item #": idx, "Item": item}
             if grounding:
-                rec["grounding"] = is_grounded(item, reference)
+                # Grounded if the item is a substring of ANY sentence; keep
+                # the first sentence that contains it as the witness.
+                hit = next((s for s in sentences if is_grounded(item, s)), "")
+                rec["grounding"] = bool(hit)
+                rec["grounding__sentence"] = hit
             if item_metrics:
-                vals = {}
-                if item and reference:
-                    vals.update(_lexical_metrics(reference, item, item_metrics))
-                    vals.update(_distance_metrics(reference, item, item_metrics))
-                for mc in item_metrics:
-                    rec[mc] = vals.get(mc)
+                best = {m: None for m in item_metrics}
+                best_sent = {m: "" for m in item_metrics}
+                if item and sentences:
+                    for sent in sentences:
+                        vals = {}
+                        vals.update(_lexical_metrics(sent, item, item_metrics))
+                        vals.update(_distance_metrics(sent, item, item_metrics))
+                        for m in item_metrics:
+                            v = vals.get(m)
+                            if v is not None and _better(m, v, best[m]):
+                                best[m] = v
+                                best_sent[m] = sent
+                for m in item_metrics:
+                    rec[m] = best[m]
+                    rec[f"{m}__sentence"] = best_sent[m]
             records.append(rec)
     return records
 
@@ -385,10 +511,12 @@ def write_metric_sheets(file_path, run_sheet, item_records, metrics,
 
     Each sheet (named via :func:`metric_sheet_name`) carries one row per
     extracted item: ``Section | Reference found | Column | Item # | Item``
-    plus that metric's value for the item, closed by an average row —
-    ``n_true/n (pct%)`` coverage for grounding, the numeric mean for every
-    other metric. Rebuilt on every call (idempotent, mirroring
-    :func:`write_eval_sheet`). Returns ``{metric: sheet name}``.
+    plus that metric's value for the item and the ``Best Ref Sentence`` that
+    produced it (the most relevant reference sentence for that item under
+    that metric), closed by an average row — ``n_true/n (pct%)`` coverage for
+    grounding, the numeric mean for every other metric. Rebuilt on every call
+    (idempotent, mirroring :func:`write_eval_sheet`). Returns
+    ``{metric: sheet name}``.
     """
     import pandas as pd
 
@@ -398,13 +526,15 @@ def write_metric_sheets(file_path, run_sheet, item_records, metrics,
     written = {}
     for metric in metrics:
         rows = [{**{c: rec.get(c) for c in base_cols},
-                 metric: rec.get(metric)}
+                 metric: rec.get(metric),
+                 "Best Ref Sentence": rec.get(f"{metric}__sentence", "")}
                 for rec in item_records if metric in rec]
-        df = pd.DataFrame(rows, columns=base_cols + [metric])
+        df = pd.DataFrame(rows, columns=base_cols + [metric, "Best Ref Sentence"])
         # Average row — grounding gets a coverage summary, the numeric
         # metrics the plain mean (None-safe on both paths).
         avg = {c: pd.NA for c in base_cols}
         avg["Section"] = "— AVERAGE —"
+        avg["Best Ref Sentence"] = pd.NA
         if metric == "grounding":
             flags = [bool(r[metric]) for r in rows if r.get(metric) is not None]
             n_true, n = sum(flags), len(flags)
