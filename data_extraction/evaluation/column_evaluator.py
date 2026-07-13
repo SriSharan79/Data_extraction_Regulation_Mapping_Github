@@ -27,11 +27,18 @@ Every evaluation is individually selectable via ``metrics``:
   (a stdlib ``difflib`` ratio fills ``similarity_ratio`` otherwise).
 
 Each metric is guarded: a missing library or failure records ``None``
-instead of aborting. Cell metrics compare the whole cell text against the
-reference. Results go to an ``Eval <run sheet>`` sheet (rebuilt on every
-call) with an average row at the bottom — either in the **same workbook** or,
-via ``out_path``, in a **new evaluation workbook** (which then also gets a
-copy of the run sheet so it is self-contained).
+instead of aborting. The **overview** (``Eval <run sheet>``) keeps the
+established shape: grounding counts per column plus every other metric
+computed on the whole cell text, closed by an average row. In addition,
+every cell is split into its items (:func:`split_items`) and **every
+selected metric is evaluated per item**; each metric gets its **own sheet**
+(``<code> <run sheet>``, e.g. ``Grd …``, ``Jac …`` — see
+:data:`METRIC_SHEET_CODES`) with one row per item carrying the section
+name, the source column, the item content and the item's metric value,
+closed by an average row (coverage for grounding). All sheets are rebuilt
+on every call — either in the **same workbook** or, via ``out_path``, in a
+**new evaluation workbook** (which then also gets a copy of the run sheet
+so it is self-contained).
 
 The unique-value evaluation reuses
 ``scripts/excel_file_utils.save_unique_elements_to_new_sheet``: the
@@ -69,9 +76,26 @@ ALL_METRICS = (
 _LEXICAL = ("jaccard", "rouge1", "rouge2", "rougeL", "bleu")
 _DISTANCE = ("levenshtein_distance", "similarity_ratio", "word_error_rate")
 
+# Short prefixes for the per-metric item sheets (Excel's 31-char sheet-name
+# limit leaves no room for the full metric name next to the run-sheet name).
+METRIC_SHEET_CODES = {
+    "grounding": "Grd",
+    "jaccard": "Jac",
+    "rouge1": "R1",
+    "rouge2": "R2",
+    "rougeL": "RL",
+    "bleu": "Bleu",
+    "levenshtein_distance": "Lev",
+    "similarity_ratio": "Sim",
+    "word_error_rate": "WER",
+}
+
 # Candidate item separators inside one extracted cell (the AI Review tab
 # joins list answers with "; "), mirroring excel_file_utils' detection.
-_SEPARATORS = (";", ",")
+_SEPARATORS = (
+    ";", 
+    # ","
+    )
 
 _EXCEL_UTILS = None
 
@@ -287,6 +311,46 @@ def evaluate_row(row, references, data_cols, metrics=ALL_METRICS):
     return entry
 
 
+def evaluate_row_items(row, references, data_cols, metrics=ALL_METRICS):
+    """Per-item counterpart of :func:`evaluate_row`: split every extracted
+    cell into its items (:func:`split_items`) and evaluate **each selected
+    metric on each item individually** against the row's reference section.
+
+    Returns a list of records, one per item::
+
+        {"Section": …, "Reference found": …, "Column": …, "Item #": …,
+         "Item": …, "grounding": True/False, "jaccard": …, "rouge1": …, …}
+
+    Only the selected metrics appear as keys. Guarded exactly like the cell
+    metrics: a missing library or an empty reference records ``None``
+    (grounding stays a real True/False — an empty reference grounds
+    nothing). These records feed :func:`write_metric_sheets`, which fans
+    them out into one sheet per metric.
+    """
+    metrics = [m for m in ALL_METRICS if m in set(metrics)]
+    item_metrics = [m for m in metrics if m != "grounding"]
+    grounding = "grounding" in metrics
+    title = str(row.get("Section", ""))
+    reference = _lookup_reference(references, title)
+    records = []
+    for col in data_cols:
+        items = split_items(row.get(col))
+        for idx, item in enumerate(items, 1):
+            rec = {"Section": title, "Reference found": bool(reference),
+                   "Column": col, "Item #": idx, "Item": item}
+            if grounding:
+                rec["grounding"] = is_grounded(item, reference)
+            if item_metrics:
+                vals = {}
+                if item and reference:
+                    vals.update(_lexical_metrics(reference, item, item_metrics))
+                    vals.update(_distance_metrics(reference, item, item_metrics))
+                for mc in item_metrics:
+                    rec[mc] = vals.get(mc)
+            records.append(rec)
+    return records
+
+
 def write_eval_sheet(file_path, run_sheet, entries, out_path=None):
     """(Re)write 'Eval <run sheet>' from evaluated entries, closed by an
     average row. Rebuilt on every call, so it is safe to call after each
@@ -308,6 +372,56 @@ def write_eval_sheet(file_path, run_sheet, entries, out_path=None):
     return eval_sheet
 
 
+def metric_sheet_name(metric, run_sheet):
+    """Sheet name for one metric's per-item sheet (31-char Excel limit)."""
+    code = METRIC_SHEET_CODES.get(metric, metric[:4].title())
+    return f"{code} {run_sheet}"[:31]
+
+
+def write_metric_sheets(file_path, run_sheet, item_records, metrics,
+                        out_path=None):
+    """(Re)write one per-item sheet **per metric** from the records
+    :func:`evaluate_row_items` produced for a whole run sheet.
+
+    Each sheet (named via :func:`metric_sheet_name`) carries one row per
+    extracted item: ``Section | Reference found | Column | Item # | Item``
+    plus that metric's value for the item, closed by an average row —
+    ``n_true/n (pct%)`` coverage for grounding, the numeric mean for every
+    other metric. Rebuilt on every call (idempotent, mirroring
+    :func:`write_eval_sheet`). Returns ``{metric: sheet name}``.
+    """
+    import pandas as pd
+
+    target = str(out_path) if out_path else str(file_path)
+    metrics = [m for m in ALL_METRICS if m in set(metrics)]
+    base_cols = ["Section", "Reference found", "Column", "Item #", "Item"]
+    written = {}
+    for metric in metrics:
+        rows = [{**{c: rec.get(c) for c in base_cols},
+                 metric: rec.get(metric)}
+                for rec in item_records if metric in rec]
+        df = pd.DataFrame(rows, columns=base_cols + [metric])
+        # Average row — grounding gets a coverage summary, the numeric
+        # metrics the plain mean (None-safe on both paths).
+        avg = {c: pd.NA for c in base_cols}
+        avg["Section"] = "— AVERAGE —"
+        if metric == "grounding":
+            flags = [bool(r[metric]) for r in rows if r.get(metric) is not None]
+            n_true, n = sum(flags), len(flags)
+            pct = round(100.0 * n_true / n, 1) if n else None
+            avg[metric] = f"{n_true}/{n} ({pct}%)" if n else "0/0"
+            df[metric] = df[metric].map(
+                lambda v: str(bool(v)) if v is not None and v == v else None)
+        else:
+            vals = pd.to_numeric(df[metric], errors="coerce").dropna()
+            avg[metric] = round(float(vals.mean()), 4) if len(vals) else None
+        df = pd.concat([df, pd.DataFrame([avg])], ignore_index=True)
+        sheet = metric_sheet_name(metric, run_sheet)
+        _write_sheet(target, sheet, df)
+        written[metric] = sheet
+    return written
+
+
 def _preview(text, limit=180):
     text = " ".join(str(text if text is not None else "").split())
     return text if len(text) <= limit else text[:limit] + " …"
@@ -323,7 +437,10 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
 
     ``references`` is ``{section title: section text}`` (the text the LLM
     analyzed). ``metrics`` selects the evaluations (see :data:`ALL_METRICS`).
-    Results are written as ``Eval <run sheet>`` — into the analysis workbook
+    The overview is written as ``Eval <run sheet>`` (unchanged shape), and
+    every selected metric additionally gets its own per-item sheet via
+    :func:`write_metric_sheets` (one row per extracted item: section,
+    column, item content, metric value) — into the analysis workbook
     itself, or into ``out_path`` when given (a new/separate workbook, which
     then also receives a copy of the run sheet so the unique-element pass and
     the reader have the data next to the evaluation). When ``uniq_columns``
@@ -354,7 +471,7 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
     if log:
         log(f"⚖ Evaluating sheet '{run_sheet}': {len(df)} row(s), "
             f"columns [{', '.join(data_cols)}], metrics [{', '.join(metrics)}]")
-    entries = []
+    entries, item_records = [], []
     for i, rec in enumerate(df.to_dict("records"), 1):
         if log:
             title = str(rec.get("Section", ""))
@@ -367,6 +484,8 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
                 log(f"   evaluated text [{col}]: {_preview(rec.get(col))}")
         entry = evaluate_row(rec, references, data_cols, metrics)
         entries.append(entry)
+        item_records.extend(
+            evaluate_row_items(rec, references, data_cols, metrics))
         if log:
             log("   result: " + _preview(
                 "; ".join(f"{k}={v}" for k, v in entry.items()
@@ -374,6 +493,11 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
     eval_sheet = write_eval_sheet(target, run_sheet, entries)
     if log:
         log(f"→ wrote '{eval_sheet}'")
+    metric_sheets = write_metric_sheets(target, run_sheet, item_records,
+                                        metrics)
+    if log and metric_sheets:
+        log(f"→ per-item metric sheets ({len(item_records)} item(s)): "
+            + ", ".join(f"{m} → '{s}'" for m, s in metric_sheets.items()))
 
     total_true = sum(e.get("Row True") or 0 for e in entries)
     total_false = sum(e.get("Row False") or 0 for e in entries)
@@ -381,6 +505,8 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
     summary = {
         "out_path": target,
         "eval_sheet": eval_sheet,
+        "metric_sheets": metric_sheets,
+        "items": len(item_records),
         "rows": len(entries),
         "metrics": metrics,
         "true": total_true if grounding else None,
@@ -545,6 +671,9 @@ def main(argv=None):
         if s.get("coverage") is not None:
             line += f", grounded {s['true']}/{s['true'] + s['false']} ({s['coverage']}%)"
         line += f" → '{s['eval_sheet']}' in {s['out_path']}"
+        if s.get("metric_sheets"):
+            line += (f", {s.get('items', 0)} item(s) → "
+                     + ", ".join(f"'{v}'" for v in s["metric_sheets"].values()))
         if s.get("uniq_eval_sheet"):
             line += f", uniques → '{s['uniq_eval_sheet']}'"
         print(line)
