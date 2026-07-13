@@ -74,6 +74,21 @@ _EVAL_METRIC_OPTIONS = [
     ("Word error rate (WER)", ("word_error_rate",)),
 ]
 
+# Uniques tab: UI label -> item separator inside one cell. ``None`` auto-detects
+# the most frequent among the common candidates; ``"custom"`` reads the free
+# text field so the user can type any separator (e.g. " / ", " and ").
+_UNIQ_SEPARATORS = [
+    ("Auto-detect (most frequent)", None),
+    ("Semicolon   ;", ";"),
+    ("Comma   ,", ","),
+    ("Pipe   |", "|"),
+    ("Newline", "\n"),
+    ("Tab", "\t"),
+    ("Custom…", "custom"),
+]
+# Candidates tried when auto-detecting a cell's separator.
+_UNIQ_AUTO_CANDIDATES = (";", "|", "\n", "\t", ",")
+
 _EXCEL_UTILS = None
 
 
@@ -119,6 +134,8 @@ class AIReviewMixin:
         self._col_run_eval_uniq = False  # also evaluate unique values per row
         self._col_eval_entries = []   # per-section evaluations of this run
         self._eval_busy = False       # an evaluation is running
+        self._uniq_busy = False       # a manual unique-elements run is in progress
+        self._uniq_col_vars = {}      # {column name: BooleanVar} for the Uniques tab
 
     # -- host hooks --------------------------------------------------------- #
     def _ai_current_section(self):
@@ -178,6 +195,7 @@ class AIReviewMixin:
         self._build_ai_freeform_tab()
         self._build_ai_columns_tab()
         self._build_ai_eval_tab()
+        self._build_ai_uniques_tab()
 
         # Bottom pane: progress bar + console logging every step of the runs
         # (what is analyzed / sent to the LLM / answered / evaluated).
@@ -1087,6 +1105,297 @@ class AIReviewMixin:
             path, data_cols, new_sheet_name=uniq_sheet,
             source_sheet=self._col_run_sheet)
 
+    # ------------------------------------------------- Unique elements tab -- #
+    def _build_ai_uniques_tab(self):
+        """Standalone unique-element extractor: for any workbook + sheet, split
+        the chosen columns on a chosen separator and write the unique values
+        (element + count) into a new sheet of the *same* file. Independent of a
+        Column-analysis run — it works on any existing Excel file."""
+        uq = ttk.Frame(self.ai_nb, padding=6)
+        self.ai_nb.add(uq, text="Unique elements")
+
+        wb_wrap = ttk.LabelFrame(uq, text=" Excel file ", padding=4)
+        wb_wrap.pack(fill="x")
+        row = ttk.Frame(wb_wrap)
+        row.pack(fill="x")
+        ttk.Label(row, text="Workbook:").pack(side="left")
+        self.uniq_wb = ttk.Entry(row)
+        self.uniq_wb.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row, text="Browse…", command=self._uniq_browse_wb).pack(side="left")
+        row2 = ttk.Frame(wb_wrap)
+        row2.pack(fill="x", pady=(4, 0))
+        ttk.Label(row2, text="Sheet:").pack(side="left")
+        self.uniq_sheet = ttk.Combobox(row2, state="readonly", width=34, values=[])
+        self.uniq_sheet.pack(side="left", padx=4)
+        self.uniq_sheet.bind("<<ComboboxSelected>>", self._uniq_refresh_columns)
+        ttk.Button(row2, text="Refresh sheets",
+                   command=self._uniq_refresh_sheets).pack(side="left")
+
+        col_wrap = ttk.LabelFrame(uq, text=" Columns to extract unique values from ",
+                                  padding=4)
+        col_wrap.pack(fill="x", pady=(6, 0))
+        cbtns = ttk.Frame(col_wrap)
+        cbtns.pack(fill="x")
+        ttk.Button(cbtns, text="Select all",
+                   command=lambda: self._uniq_set_all_cols(True)).pack(side="left")
+        ttk.Button(cbtns, text="Clear",
+                   command=lambda: self._uniq_set_all_cols(False)).pack(side="left", padx=4)
+        # Checkboxes are (re)built here whenever a sheet is chosen.
+        self.uniq_cols_frame = ttk.Frame(col_wrap)
+        self.uniq_cols_frame.pack(fill="x", pady=(4, 0))
+        self._uniq_cols_hint = ttk.Label(
+            self.uniq_cols_frame, foreground="#666666",
+            text="Pick a workbook and sheet, then Refresh sheets to list its columns.")
+        self._uniq_cols_hint.pack(anchor="w")
+
+        sep_wrap = ttk.LabelFrame(uq, text=" Item separator inside each cell ", padding=4)
+        sep_wrap.pack(fill="x", pady=(6, 0))
+        srow = ttk.Frame(sep_wrap)
+        srow.pack(fill="x")
+        ttk.Label(srow, text="Separator:").pack(side="left")
+        self.uniq_sep = ttk.Combobox(srow, state="readonly", width=28,
+                                     values=[lbl for lbl, _ in _UNIQ_SEPARATORS])
+        self.uniq_sep.current(0)
+        self.uniq_sep.pack(side="left", padx=4)
+        self.uniq_sep.bind("<<ComboboxSelected>>", self._uniq_sep_changed)
+        ttk.Label(srow, text="Custom:").pack(side="left", padx=(12, 0))
+        self.uniq_sep_custom = ttk.Entry(srow, width=12)
+        self.uniq_sep_custom.pack(side="left", padx=4)
+        self.uniq_sep_custom.configure(state="disabled")
+        orow = ttk.Frame(sep_wrap)
+        orow.pack(fill="x", pady=(4, 0))
+        self.uniq_case_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(orow, variable=self.uniq_case_var,
+                        text="Case-insensitive (treat 'Foo' and 'foo' as one)").pack(
+            side="left")
+        ttk.Label(orow, text="Sort by:").pack(side="left", padx=(16, 0))
+        self.uniq_sort = ttk.Combobox(orow, state="readonly", width=18,
+                                      values=["Element (A→Z)", "Count (high→low)"])
+        self.uniq_sort.current(0)
+        self.uniq_sort.pack(side="left", padx=4)
+
+        out_wrap = ttk.LabelFrame(uq, text=" New sheet (written into the same file) ",
+                                  padding=4)
+        out_wrap.pack(fill="x", pady=(6, 0))
+        nrow = ttk.Frame(out_wrap)
+        nrow.pack(fill="x")
+        ttk.Label(nrow, text="Sheet name:").pack(side="left")
+        self.uniq_out_name = ttk.Entry(nrow)
+        self.uniq_out_name.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Label(out_wrap, foreground="#666666", justify="left",
+                  text="Columns are written as Unique_<col> / Count_<col> via "
+                       "save_unique_elements_to_new_sheet (matching the run 'Uniq' "
+                       "sheets).\nAn existing sheet of the same name is replaced. "
+                       "Blank = 'Uniq <sheet>'.").pack(anchor="w", pady=(2, 0))
+
+        brow = ttk.Frame(uq)
+        brow.pack(fill="x", pady=6)
+        self.uniq_run_btn = ttk.Button(brow, text="Generate unique elements",
+                                       command=self._uniq_generate)
+        self.uniq_run_btn.pack(side="left")
+
+    def _uniq_browse_wb(self):
+        path = filedialog.askopenfilename(
+            title="Select an Excel workbook",
+            filetypes=[("Excel workbook", "*.xlsx *.xlsm")])
+        if path:
+            self.uniq_wb.delete(0, tk.END)
+            self.uniq_wb.insert(0, path)
+            self._uniq_refresh_sheets()
+
+    def _uniq_refresh_sheets(self):
+        """List every sheet in the chosen workbook (not just 'Run …' sheets)."""
+        path = self.uniq_wb.get().strip()
+        sheets = []
+        if path and os.path.exists(path):
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(path, read_only=True)
+                sheets = list(wb.sheetnames)
+                wb.close()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Workbook", f"Could not read sheets:\n{exc}")
+        self.uniq_sheet.configure(values=sheets)
+        self.uniq_sheet.set(sheets[0] if sheets else "")
+        self._uniq_refresh_columns()
+
+    def _uniq_refresh_columns(self, event=None):
+        """Rebuild the column checkboxes from the selected sheet's header row."""
+        for child in self.uniq_cols_frame.winfo_children():
+            child.destroy()
+        self._uniq_col_vars = {}
+        path = self.uniq_wb.get().strip()
+        sheet = self.uniq_sheet.get().strip()
+        if not (path and os.path.exists(path) and sheet):
+            ttk.Label(self.uniq_cols_frame, foreground="#666666",
+                      text="Pick a workbook and sheet to list its columns.").pack(
+                anchor="w")
+            return
+        try:
+            import pandas as pd
+            head = pd.read_excel(path, sheet_name=sheet, nrows=0, engine="openpyxl")
+            columns = [str(c) for c in head.columns]
+        except Exception as exc:  # noqa: BLE001
+            ttk.Label(self.uniq_cols_frame, foreground="#a00000",
+                      text=f"Could not read columns: {exc}").pack(anchor="w")
+            return
+        if not columns:
+            ttk.Label(self.uniq_cols_frame, foreground="#666666",
+                      text="This sheet has no columns.").pack(anchor="w")
+            return
+        # Default the new-sheet name to 'Uniq <sheet>'. Follow the selected
+        # sheet unless the user has typed their own name.
+        current = self.uniq_out_name.get().strip()
+        if not current or current == getattr(self, "_uniq_out_auto", None):
+            self._uniq_out_auto = f"Uniq {sheet}"[:31]
+            self.uniq_out_name.delete(0, tk.END)
+            self.uniq_out_name.insert(0, self._uniq_out_auto)
+        for i, col in enumerate(columns):
+            var = tk.BooleanVar(value=(col != "Section"))
+            self._uniq_col_vars[col] = var
+            ttk.Checkbutton(self.uniq_cols_frame, text=col, variable=var).grid(
+                row=i % 6, column=i // 6, sticky="w", padx=(0, 18))
+
+    def _uniq_set_all_cols(self, value):
+        for var in self._uniq_col_vars.values():
+            var.set(value)
+
+    def _uniq_sep_changed(self, event=None):
+        """Enable the custom-separator field only when 'Custom…' is chosen."""
+        _, sep = _UNIQ_SEPARATORS[self.uniq_sep.current()]
+        self.uniq_sep_custom.configure(state="normal" if sep == "custom" else "disabled")
+
+    def _uniq_selected_separator(self):
+        """Resolve the separator choice to a value for
+        save_unique_elements_to_new_sheet's ``separators`` argument: a list of
+        candidates for auto-detect, or a single string for a fixed / custom
+        separator. Returns ``False`` (a sentinel distinct from valid values)
+        after warning when 'Custom…' is chosen but left empty."""
+        idx = self.uniq_sep.current()
+        _, sep = _UNIQ_SEPARATORS[idx if idx >= 0 else 0]
+        if sep is None:
+            return list(_UNIQ_AUTO_CANDIDATES)      # auto-detect among these
+        if sep == "custom":
+            text = self.uniq_sep_custom.get()
+            if not text:
+                messagebox.showinfo("Separator",
+                                    "Type the custom separator, or pick another option.")
+                return False
+            return text
+        return sep                                   # a single fixed separator
+
+    def _uniq_generate(self):
+        """Read the chosen sheet, split the chosen columns on the chosen
+        separator and write Unique_/Count_ columns into a new sheet of the same
+        file — delegating to scripts/excel_file_utils'
+        save_unique_elements_to_new_sheet, in a worker thread so the UI stays
+        responsive."""
+        if self._uniq_busy or self._ai_busy or self._eval_busy:
+            messagebox.showinfo("Busy", "Another run is already in progress.")
+            return
+        path = self.uniq_wb.get().strip()
+        if not path or os.path.splitext(path)[1].lower() not in (".xlsx", ".xlsm") \
+                or not os.path.exists(path):
+            messagebox.showinfo("No workbook", "Pick an existing .xlsx/.xlsm file first.")
+            return
+        sheet = self.uniq_sheet.get().strip()
+        if not sheet:
+            messagebox.showinfo("No sheet", "Pick a sheet to read.")
+            return
+        columns = [c for c, v in self._uniq_col_vars.items() if v.get()]
+        if not columns:
+            messagebox.showinfo("No columns", "Tick at least one column.")
+            return
+        separators = self._uniq_selected_separator()
+        if separators is False:      # empty custom separator (already warned)
+            return
+        case_insensitive = self.uniq_case_var.get()
+        sort_by = "count" if self.uniq_sort.current() == 1 else "element"
+        out_name = self._uniq_sanitize_sheet(
+            self.uniq_out_name.get().strip() or f"Uniq {sheet}")
+        if out_name == sheet:
+            messagebox.showinfo("Sheet name",
+                                "The new sheet name must differ from the source sheet.")
+            return
+
+        self._uniq_busy = True
+        self.uniq_run_btn.configure(state="disabled")
+        self.ai_progress.configure(mode="indeterminate")
+        self.ai_progress.start(80)
+        sep_desc = ("auto-detect" if isinstance(separators, list)
+                    else f"{separators!r}")
+        self._ai_log(f"=== Unique elements: {os.path.basename(path)} [{sheet}], "
+                     f"columns [{', '.join(columns)}], separator {sep_desc}"
+                     f"{', case-insensitive' if case_insensitive else ''}, "
+                     f"sort by {sort_by} → sheet '{out_name}' ===")
+        self.status_var.set(f"Extracting unique values from {sheet}…")
+
+        def work():
+            try:
+                summary = self._uniq_build_sheet(
+                    path, sheet, columns, separators, case_insensitive,
+                    sort_by, out_name)
+            except Exception as exc:  # noqa: BLE001
+                self.root.after(0, lambda e=exc: self._uniq_done(None, e))
+            else:
+                self.root.after(0, lambda s=summary: self._uniq_done(s, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _uniq_build_sheet(self, path, sheet, columns, separators,
+                          case_insensitive, sort_by, out_name):
+        """Worker: delegate to save_unique_elements_to_new_sheet, then read the
+        written sheet back for the per-column unique counts. Runs off the main
+        thread — no widget access here."""
+        import pandas as pd
+
+        ok = _excel_utils().save_unique_elements_to_new_sheet(
+            path, columns, new_sheet_name=out_name, source_sheet=sheet,
+            separators=separators, case_insensitive=case_insensitive,
+            sort_by=sort_by)
+        if not ok:
+            raise RuntimeError(
+                "save_unique_elements_to_new_sheet reported failure — none of "
+                "the chosen columns were found, or the file could not be "
+                "written (see the progress console for the printed reason).")
+        # Count the unique values actually written, per column, for the summary.
+        written = pd.read_excel(path, sheet_name=out_name, engine="openpyxl")
+        per_col = {c[len("Unique_"):]: int(written[c].notna().sum())
+                   for c in written.columns if c.startswith("Unique_")}
+        return {"sheet": out_name, "rows": int(written.shape[0]),
+                "per_col": per_col, "path": path}
+
+    @staticmethod
+    def _uniq_sanitize_sheet(name):
+        """Excel sheet-name rules: <=31 chars, none of : \\ / ? * [ ]."""
+        for ch in ':\\/?*[]':
+            name = name.replace(ch, " ")
+        return name.strip()[:31] or "Uniq"
+
+    def _uniq_done(self, summary, exc):
+        self._uniq_busy = False
+        self.uniq_run_btn.configure(state="normal")
+        self._ai_progress_done()
+        if exc is not None:
+            self.status_var.set(f"Unique-elements extraction failed: {exc}")
+            self._ai_log(f"[ERROR] unique elements failed: {exc}")
+            messagebox.showerror("Unique elements failed", str(exc))
+            return
+        detail = ", ".join(f"{col}: {n}" for col, n in summary["per_col"].items())
+        self.status_var.set(
+            f"Unique elements written → sheet '{summary['sheet']}' "
+            f"({detail}) in {os.path.basename(summary['path'])}")
+        self._ai_log(f"=== Unique elements complete → '{summary['sheet']}' "
+                     f"({detail}) ===")
+        # Refresh the sheet list so the new sheet shows up immediately.
+        self._uniq_refresh_sheets()
+        messagebox.showinfo(
+            "Unique elements",
+            f"Written to sheet '{summary['sheet']}' in "
+            f"{os.path.basename(summary['path'])}.\n\n"
+            + "\n".join(f"{col}: {n} unique value(s)"
+                        for col, n in summary["per_col"].items()))
+
     # ----------------------------------------------------- Evaluation tab -- #
     def _build_ai_eval_tab(self):
         """Evaluation page: pick a stored analysis workbook + run sheet, the
@@ -1457,4 +1766,3 @@ class AIReviewMixin:
         self.status_var.set(f"Exported {len(self._col_results)} analysis row(s) → {where}")
         messagebox.showinfo("Export complete",
                             f"Wrote {len(self._col_results)} row(s) to:\n{where}")
-

@@ -26,7 +26,7 @@ def get_unique_elements(file_path, column_name, separator=";"):
         print(f"An error occurred: {e}")
         return set()
 
-def save_unique_elements_to_new_sheet(
+def save_unique_elements_to_new_sheet_Stdalone(
     file_path,
     column_names,
     new_sheet_name="Unique Elements",
@@ -52,8 +52,8 @@ def save_unique_elements_to_new_sheet(
 
         # Define the list of candidate separators to check
         candidate_separators = [
-            # ';',
-            ','
+            ';',
+            # ','
             ]
 
         blocks = []
@@ -87,6 +87,126 @@ def save_unique_elements_to_new_sheet(
 
             blocks.append(pd.DataFrame(
                 sorted(counts.items()),
+                columns=[f"Unique_{column_name}", f"Count_{column_name}"],
+            ))
+
+        if not blocks:
+            return False
+
+        # 3. Columns of different lengths sit side by side, padded with blanks;
+        # keep the counts as (nullable) integers.
+        target_df = pd.concat(blocks, axis=1)
+        for col in target_df.columns:
+            if col.startswith("Count_"):
+                target_df[col] = target_df[col].astype("Int64")
+
+        # 4. Replace the target sheet with the fresh unique-element table
+        with pd.ExcelWriter(
+            file_path, mode="a", engine="openpyxl", if_sheet_exists="replace"
+        ) as writer:
+            target_df.to_excel(writer, sheet_name=new_sheet_name, index=False)
+
+        print(
+            f"Success! Wrote unique elements (+counts) for "
+            f"{[c for c in target_df.columns if c.startswith('Unique_')]} "
+            f"into the sheet '{new_sheet_name}'."
+        )
+        return True
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return False
+    
+def save_unique_elements_to_new_sheet(
+    file_path,
+    column_names,
+    new_sheet_name="Unique Elements",
+    source_sheet=0,
+    separators=None,
+    case_insensitive=False,
+    sort_by="element",
+):
+    """Collect the unique elements of one or more columns and write them to
+    ``new_sheet_name`` as `Unique_<col> | Count_<col>` pairs (each element with
+    how often it occurs next to it).
+
+    ``column_names`` may be a single column name or a list of them;
+    ``source_sheet`` picks the sheet to read (index or name). The target sheet
+    is rebuilt from scratch on every call, so the function is safe to re-run
+    after each new data row (idempotent).  Returns True on success.
+
+    Extra options (all with backward-compatible defaults, so existing callers
+    are unaffected):
+
+    * ``separators`` — the item separator(s) inside one cell. ``None`` keeps the
+      original behaviour (auto-detect using ``';'`` only); a single string uses
+      that exact separator; a list/tuple gives several candidates and the one
+      most frequent in each cell is used. A cell containing none of the
+      candidates is kept as a single element.
+    * ``case_insensitive`` — when True, elements that differ only in case are
+      merged (their counts summed); the first-seen spelling is displayed.
+    * ``sort_by`` — ``"element"`` (default, alphabetical, the original order) or
+      ``"count"`` (most frequent first, ties broken alphabetically).
+    """
+    try:
+        import pandas as pd
+
+        # 1. Read the source sheet to extract data
+        df = pd.read_excel(file_path, sheet_name=source_sheet)
+
+        if isinstance(column_names, str):
+            column_names = [column_names]
+
+        # Candidate separators for the per-cell dynamic detection. ``None``
+        # reproduces the original single-candidate (';') behaviour; a string is
+        # treated as one fixed separator; a list/tuple is a candidate set.
+        if separators is None:
+            candidate_separators = [';']
+        elif isinstance(separators, str):
+            candidate_separators = [separators]
+        else:
+            candidate_separators = list(separators) or [';']
+
+        blocks = []
+        for column_name in column_names:
+            if column_name not in df.columns:
+                print(f"Error: Column '{column_name}' not found in the Excel file.")
+                continue
+
+            counts = {}    # key -> total occurrences
+            display = {}   # key -> first-seen spelling (for the output cell)
+
+            # 2. Extract elements with dynamic separator detection, counting
+            # every occurrence so the sheet can show element + count.
+            for row in df[column_name].dropna():
+                text = str(row)
+
+                # Count how many times each candidate separator appears here
+                sep_counts = {sep: text.count(sep) for sep in candidate_separators}
+
+                # Pick the separator that occurs most often in this cell
+                best_sep = max(sep_counts, key=sep_counts.get)
+
+                # If that separator is actually present, split on it; otherwise
+                # treat the whole (stripped) cell as a single element.
+                if sep_counts[best_sep] > 0:
+                    elements = [el.strip() for el in text.split(best_sep) if el.strip()]
+                else:
+                    elements = [text.strip()] if text.strip() else []
+
+                for el in elements:
+                    key = el.lower() if case_insensitive else el
+                    counts[key] = counts.get(key, 0) + 1
+                    display.setdefault(key, el)
+
+            items = [(display[k], c) for k, c in counts.items()]
+            if sort_by == "count":
+                items.sort(key=lambda ec: (-ec[1], ec[0].lower()))
+            else:  # "element" — alphabetical (the original ordering)
+                items.sort(key=lambda ec: ec[0].lower() if case_insensitive else ec[0])
+
+            blocks.append(pd.DataFrame(
+                items,
                 columns=[f"Unique_{column_name}", f"Count_{column_name}"],
             ))
 
@@ -234,18 +354,18 @@ def organize_pdf_files(
 if __name__ == "__main__":
     
         # Replace with your actual file path, column name, and desired new sheet name
-    EXCEL_FILE = r"U:\ALR DATA\Only_Required_cols_database_export.xlsx"
+    EXCEL_FILE = r"C:\Users\kata_du\Documents\Literature\EASA\XML _Data_extractions\Evaluation_Testing\20260713_CS23_ai_columns_Analysis.xlsx"
     COLUMNS_TO_PROCESS = [
-                        "research_areas",
-                        "key_concepts",
-                        "publication_year",
+                        "References",
+                        "System Info",
+                        "Process mentioned",
                         "publisher",
-                        "abstract_classification",
+                        "Personal Involved",
                          ]
     NEW_SHEET = "Unique Categories"
     # One call with all columns: the sheet is rebuilt per call, so per-column
     # looping would leave only the last column in it.
-    save_unique_elements_to_new_sheet(
+    save_unique_elements_to_new_sheet_Stdalone(
         EXCEL_FILE, COLUMNS_TO_PROCESS, new_sheet_name=NEW_SHEET
     )
     for col in COLUMNS_TO_PROCESS:
