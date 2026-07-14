@@ -34,7 +34,10 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from .llm_utils import get_selected_model, list_available_models, set_selected_model
+from . import llm_utils as _llm_utils_mod
+from .llm_utils import (get_selected_model, list_available_models,
+                        set_selected_model, list_embedding_models,
+                        get_default_embedding_model)
 
 # Preset review instructions (label -> prompt sent with the section text).
 # "Custom…" leaves the box for the user to write their own.
@@ -72,6 +75,9 @@ _EVAL_METRIC_OPTIONS = [
     ("Levenshtein distance", ("levenshtein_distance",)),
     ("Similarity ratio", ("similarity_ratio",)),
     ("Word error rate (WER)", ("word_error_rate",)),
+    ("Embedding cosine similarity (semantic)", ("embedding_cosine",)),
+    ("BERTScore (semantic P/R/F1)",
+     ("bertscore_p", "bertscore_r", "bertscore_f1")),
 ]
 
 # Uniques tab: UI label -> item separator inside one cell. ``None`` auto-detects
@@ -1454,6 +1460,47 @@ class AIReviewMixin:
                              "(via save_unique_elements_to_new_sheet)").pack(
             anchor="w", pady=(4, 0))
 
+        # Embedding backend/service/model — only used when an embedding metric
+        # (embedding cosine / BERTScore) is ticked above. Drives llm_utils'
+        # get_embedding (remote) or vectorize_strings_local (local).
+        emb_wrap = ttk.LabelFrame(
+            ev, text=" Semantic-embedding backend (used only when an embedding "
+                     "metric above is ticked) ", padding=4)
+        emb_wrap.pack(fill="x", pady=(6, 0))
+        emb_brow = ttk.Frame(emb_wrap)
+        emb_brow.pack(fill="x")
+        ttk.Label(emb_brow, text="Backend:").pack(side="left")
+        self.eval_embed_backend = tk.StringVar(value="api")
+        ttk.Radiobutton(emb_brow, text="Remote API", value="api",
+                        variable=self.eval_embed_backend,
+                        command=self._eval_refresh_embed_models).pack(
+            side="left", padx=(4, 8))
+        ttk.Radiobutton(emb_brow, text="Local model", value="local",
+                        variable=self.eval_embed_backend,
+                        command=self._eval_refresh_embed_models).pack(side="left")
+        srow = ttk.Frame(emb_wrap)
+        srow.pack(fill="x", pady=(4, 0))
+        ttk.Label(srow, text="Service:").pack(side="left")
+        self.eval_embed_service = ttk.Combobox(
+            srow, state="readonly", width=14, values=["DLR Ollama", "BlaBla"])
+        self.eval_embed_service.set("DLR Ollama")
+        self.eval_embed_service.pack(side="left", padx=4)
+        self.eval_embed_service.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._eval_refresh_embed_models())
+        ttk.Label(srow, text="Model:").pack(side="left", padx=(8, 0))
+        self.eval_embed_model = ttk.Combobox(srow, width=30, values=[])
+        self.eval_embed_model.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(srow, text="List models",
+                   command=self._eval_refresh_embed_models).pack(side="left")
+        ttk.Label(emb_wrap, foreground="#666666", justify="left",
+                  text="The divided reference sentences and candidate items are "
+                       "embedded in batches and compared by cosine similarity. "
+                       "Leave Model blank to use the service's default embedding "
+                       "model. BERTScore is token-level on the local backend and "
+                       "falls back to item-level on the API.").pack(
+            anchor="w", pady=(2, 0))
+
         out_wrap = ttk.LabelFrame(ev, text=" Write results to ", padding=4)
         out_wrap.pack(fill="x", pady=(6, 0))
         self.eval_out_choice = tk.StringVar(value="same")
@@ -1512,6 +1559,58 @@ class AIReviewMixin:
                 metrics.extend(names)
         return metrics
 
+    def _embedding_config_for(self, metrics):
+        """Embedding config dict for column_evaluator (backend/service/model +
+        the injected llm_utils module), or None when no embedding metric is in
+        ``metrics`` so non-embedding runs stay untouched."""
+        from data_extraction.evaluation.column_evaluator import _EMBEDDING as EMB
+        if not any(m in EMB for m in metrics):
+            return None
+        return {
+            "enabled": True,
+            "backend": self.eval_embed_backend.get(),
+            "service": (self.eval_embed_service.get().strip() or None),
+            "model": (self.eval_embed_model.get().strip() or None),
+            "llm_utils": _llm_utils_mod,
+        }
+
+    def _eval_embedding_config(self):
+        """Embedding config for the metrics currently ticked on the tab."""
+        return self._embedding_config_for(self._eval_selected_metrics())
+
+    def _eval_refresh_embed_models(self):
+        """List the chosen service's embedding models into the Model combobox
+        (API backend only; the local backend uses llm_utils' local model)."""
+        if self.eval_embed_backend.get() != "api":
+            self.eval_embed_model.configure(values=[])
+            self.status_var.set("Local backend: embeddings come from llm_utils' "
+                                "configured local model (Model field ignored).")
+            return
+        service = self.eval_embed_service.get().strip()
+        if not service:
+            return
+        self.status_var.set(f"Listing {service} embedding models…")
+
+        def work():
+            try:
+                models = list_embedding_models(service)
+                default = get_default_embedding_model(service) if models else ""
+            except Exception as exc:  # noqa: BLE001
+                self.root.after(0, lambda e=exc: self.status_var.set(
+                    f"Could not list embedding models: {e}"))
+                return
+
+            def apply():
+                self.eval_embed_model.configure(values=models)
+                if default and not self.eval_embed_model.get().strip():
+                    self.eval_embed_model.set(default)
+                self.status_var.set(
+                    f"{len(models)} {service} embedding model(s) available"
+                    if models else f"No embedding models found for {service}.")
+            self.root.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _eval_references(self):
         """Load {section title: text} from the chosen sections JSON — the
         run-sheet 'Section' values are matched against these titles
@@ -1558,6 +1657,7 @@ class AIReviewMixin:
             messagebox.showinfo("No evaluations",
                                 "Tick at least one evaluation to run.")
             return
+        embedding = self._eval_embedding_config()
         references = self._eval_references()
         if references is None:
             return
@@ -1587,6 +1687,13 @@ class AIReviewMixin:
                      + " ===")
         self.status_var.set(f"Evaluating {sheet or 'all runs'} against "
                             f"{len(references)} reference section(s)…")
+        if embedding:
+            self._ai_log(
+                f"   semantic embeddings: backend={embedding['backend']}"
+                + (f", service={embedding['service']}"
+                   if embedding.get('service') else "")
+                + (f", model={embedding['model']}"
+                   if embedding.get('model') else " (service default model)"))
 
         def work():
             try:
@@ -1594,7 +1701,8 @@ class AIReviewMixin:
                 results = evaluate_workbook(path, references, metrics=metrics,
                                             run_sheets=run_sheets,
                                             uniq_columns=uniq, out_path=out_path,
-                                            log=self._ai_log_bg)
+                                            log=self._ai_log_bg,
+                                            embedding=embedding)
             except Exception as exc:  # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._ai_eval_done(None, e))
             else:
@@ -1696,7 +1804,17 @@ class AIReviewMixin:
             return
         try:
             from data_extraction.evaluation.column_evaluator import (
-                _lookup_reference, evaluate_row, evaluate_uniques, write_eval_sheet)
+                _lookup_reference, evaluate_row, evaluate_uniques,
+                write_eval_sheet, configure_embeddings)
+            # If an embedding metric is part of this auto-eval run, configure the
+            # backend (from the Evaluation tab's widgets) so evaluate_row can
+            # compute it; harmless/no-op when none is selected.
+            try:
+                emb_cfg = self._embedding_config_for(self._col_run_eval_metrics)
+                if emb_cfg:
+                    configure_embeddings(**emb_cfg)
+            except Exception:  # noqa: BLE001 - never block the analysis
+                pass
             data_cols = [c for c in self._col_table_cols if c != "Section"]
             title = str(row.get("Section", ""))
             reference = _lookup_reference(self._col_run_refs, title)

@@ -82,9 +82,13 @@ ALL_METRICS = (
     "grounding",
     "jaccard", "rouge1", "rouge2", "rougeL", "bleu",
     "levenshtein_distance", "similarity_ratio", "word_error_rate",
+    # Semantic-embedding metrics (see the embedding section below): these need a
+    # backend + service and are configured once per run via configure_embeddings.
+    "embedding_cosine", "bertscore_p", "bertscore_r", "bertscore_f1",
 )
 _LEXICAL = ("jaccard", "rouge1", "rouge2", "rougeL", "bleu")
 _DISTANCE = ("levenshtein_distance", "similarity_ratio", "word_error_rate")
+_EMBEDDING = ("embedding_cosine", "bertscore_p", "bertscore_r", "bertscore_f1")
 
 # Short prefixes for the per-metric item sheets (Excel's 31-char sheet-name
 # limit leaves no room for the full metric name next to the run-sheet name).
@@ -98,6 +102,10 @@ METRIC_SHEET_CODES = {
     "levenshtein_distance": "Lev",
     "similarity_ratio": "Sim",
     "word_error_rate": "WER",
+    "embedding_cosine": "Cos",
+    "bertscore_p": "BsP",
+    "bertscore_r": "BsR",
+    "bertscore_f1": "BsF",
 }
 
 # Candidate item separators inside one extracted cell (the AI Review tab
@@ -360,6 +368,203 @@ def _distance_metrics(reference, candidate, wanted):
     return out
 
 
+# --------------------------------------------------- semantic embeddings -- #
+# embedding_cosine / bertscore_* measure *meaning* overlap instead of word
+# overlap. They are computed with the shared embedding backends via
+# data_extraction.evaluation.embedding_metrics, which drives llm_utils (remote
+# OpenAI-compatible /embeddings, or the local HuggingFace model). Unlike the
+# lexical/distance metrics they need a backend + a service/model, so they are
+# configured once per run (configure_embeddings, or the ``embedding`` argument
+# of evaluate_run / evaluate_workbook) and the vectors are cached per run — the
+# reference sentences and candidate items are embedded in batches (one request
+# per batch) so the API's rate limiter / pre-request delay never fires per pair.
+#
+# The per-pair contract matches _lexical_metrics / _distance_metrics exactly
+# (reference, candidate, wanted) -> {metric: value|None}, so _embedding_metrics
+# slots straight into evaluate_row (whole cell vs whole section) and
+# evaluate_row_items (each item vs each sentence, best kept). Both are guarded:
+# disabled or failed embeddings record None, never aborting the run.
+
+_EMB = "unchecked"           # embedding_metrics module, None if unusable
+_EMB_CFG = {
+    "enabled": False,
+    "backend": "api",         # "api" (remote /embeddings) or "local" (HF model)
+    "service": None,          # "BlaBla" / "DLR Ollama" for the api backend
+    "model": None,            # explicit embedding model id (optional)
+    "api_key": None,          # optional explicit key override
+    "bertscore_granularity": None,  # None -> token for local, item for api
+}
+_EMB_POOL_CACHE = {}         # text -> pooled unit vector (np.ndarray)
+_EMB_TOK_CACHE = {}          # text -> token matrix (np.ndarray), local only
+_EMB_CACHE_CAP = 5000        # drop the caches past this many texts (bound RAM)
+_EMB_WARNED = False          # warn about a backend failure only once per run
+
+
+def _embedding_metrics_mod():
+    """Load data_extraction.evaluation.embedding_metrics once; None if missing."""
+    global _EMB
+    if _EMB == "unchecked":
+        try:
+            from data_extraction.evaluation import embedding_metrics as mod
+            _EMB = mod
+        except Exception as e:  # noqa: BLE001 - numpy / module unavailable
+            print(f"⚠️ Semantic-embedding metrics disabled "
+                  f"(embedding_metrics unavailable: {e})")
+            _EMB = None
+    return _EMB
+
+
+def configure_embeddings(enabled=True, backend="api", service=None, model=None,
+                         api_key=None, bertscore_granularity=None,
+                         llm_utils=None):
+    """Configure the semantic-embedding metrics for the next evaluation and
+    clear the cached vectors (model/service may have changed). Call once before
+    evaluate_run / evaluate_workbook / evaluate_row — the AI Review *Evaluation*
+    tab does this from its embedding widgets.
+
+    ``llm_utils`` (the caller's already-imported module) is injected into
+    embedding_metrics so it need not guess the package path. Returns the
+    effective config."""
+    _EMB_CFG.update(enabled=bool(enabled), backend=(backend or "api"),
+                    service=service, model=model, api_key=api_key,
+                    bertscore_granularity=bertscore_granularity)
+    if llm_utils is not None:
+        mod = _embedding_metrics_mod()
+        if mod is not None and hasattr(mod, "set_llm_utils"):
+            mod.set_llm_utils(llm_utils)
+    _reset_embedding_cache()
+    return dict(_EMB_CFG)
+
+
+def _reset_embedding_cache():
+    global _EMB_WARNED
+    _EMB_POOL_CACHE.clear()
+    _EMB_TOK_CACHE.clear()
+    _EMB_WARNED = False
+
+
+def _emb_wanted(wanted):
+    """The embedding metrics among ``wanted`` (in output order)."""
+    return [m for m in _EMBEDDING if m in set(wanted)]
+
+
+def _need_tokens():
+    """True when bertscore should use true token-level embeddings (local
+    backend, token/auto granularity)."""
+    if str(_EMB_CFG["backend"]).lower() not in ("local", "l", "hf"):
+        return False
+    return _EMB_CFG["bertscore_granularity"] in (None, "token")
+
+
+def _warn_embeddings(msg):
+    global _EMB_WARNED
+    if not _EMB_WARNED:
+        print(f"⚠️ Embedding metric: {msg}")
+        _EMB_WARNED = True
+
+
+def _cap_cache(cache):
+    if len(cache) > _EMB_CACHE_CAP:
+        cache.clear()
+
+
+def _pre_embed(texts, tokens=False):
+    """Batch-embed any not-yet-cached texts into the per-run caches. One request
+    per batch (not per pair) keeps the rate limiter/pre-delay from firing
+    repeatedly. ``tokens=True`` also fills the token cache when it is needed."""
+    if not _EMB_CFG["enabled"]:
+        return
+    mod = _embedding_metrics_mod()
+    if mod is None:
+        return
+    seen = {str(t) for t in texts if str(t).strip()}
+    todo = [t for t in seen if t not in _EMB_POOL_CACHE]
+    if todo:
+        try:
+            vecs = mod.embed_texts(todo, backend=_EMB_CFG["backend"],
+                                   service=_EMB_CFG["service"],
+                                   model=_EMB_CFG["model"],
+                                   api_key=_EMB_CFG["api_key"])
+            for t, v in zip(todo, vecs):
+                _EMB_POOL_CACHE[t] = v
+        except Exception as e:  # noqa: BLE001 - guarded
+            _warn_embeddings(f"pooled embedding failed ({e})")
+    _cap_cache(_EMB_POOL_CACHE)
+    if tokens and _need_tokens():
+        todo_t = [t for t in seen if t not in _EMB_TOK_CACHE]
+        if todo_t:
+            try:
+                mats = mod.token_embed_local(todo_t)
+                for t, m in zip(todo_t, mats):
+                    _EMB_TOK_CACHE[t] = m
+            except Exception as e:  # noqa: BLE001 - guarded
+                _warn_embeddings(f"token embedding failed ({e})")
+        _cap_cache(_EMB_TOK_CACHE)
+
+
+def _pool_vec(text):
+    t = str(text)
+    v = _EMB_POOL_CACHE.get(t)
+    if v is None:
+        _pre_embed([t])                 # on-demand fallback (pre-embed avoids it)
+        v = _EMB_POOL_CACHE.get(t)
+    return v
+
+
+def _tok_mat(text):
+    t = str(text)
+    m = _EMB_TOK_CACHE.get(t)
+    if m is None:
+        _pre_embed([t], tokens=True)
+        m = _EMB_TOK_CACHE.get(t)
+    return m
+
+
+def _embedding_metrics(reference, candidate, wanted):
+    """Selected semantic-embedding metrics for one (reference, candidate) pair,
+    read from the per-run vector caches. Same contract/guarding as
+    _lexical_metrics / _distance_metrics.
+
+    * ``embedding_cosine`` — cosine of the two pooled unit vectors.
+    * ``bertscore_p/r/f1`` — greedy token-level BERTScore on the local backend;
+      on the remote backend (pooled vectors only) they fall back to the pooled
+      cosine, i.e. equal ``embedding_cosine``."""
+    ecols = _emb_wanted(wanted)
+    out = {c: None for c in ecols}
+    if not ecols or not _EMB_CFG["enabled"]:
+        return out
+    mod = _embedding_metrics_mod()
+    if mod is None:
+        return out
+    try:
+        want_cos = "embedding_cosine" in ecols
+        bert_cols = [c for c in ("bertscore_p", "bertscore_r", "bertscore_f1")
+                     if c in ecols]
+        rv = _pool_vec(reference)
+        cv = _pool_vec(candidate)
+        pooled_cos = (None if rv is None or cv is None
+                      else round(mod.cosine(cv, rv), 4))
+        if want_cos:
+            out["embedding_cosine"] = pooled_cos
+        if bert_cols:
+            p = r = f1 = None
+            if _need_tokens():
+                rm, cm = _tok_mat(reference), _tok_mat(candidate)
+                if rm is not None and cm is not None and rm.size and cm.size:
+                    p, r, f1 = mod.greedy_bertscore(cm, rm)
+            if p is None:               # api backend / token path unavailable
+                p = r = f1 = pooled_cos
+            if "bertscore_p" in ecols:
+                out["bertscore_p"] = None if p is None else round(p, 4)
+            if "bertscore_r" in ecols:
+                out["bertscore_r"] = None if r is None else round(r, 4)
+            if "bertscore_f1" in ecols:
+                out["bertscore_f1"] = None if f1 is None else round(f1, 4)
+    except Exception as e:  # noqa: BLE001 - guarded: one bad pair never aborts
+        _warn_embeddings(f"scoring failed ({e})")
+    return out
+
+
 # -------------------------------------------------------------- evaluate -- #
 
 def _write_sheet(path, sheet, df):
@@ -386,6 +591,14 @@ def evaluate_row(row, references, data_cols, metrics=ALL_METRICS):
     title = str(row.get("Section", ""))
     reference = _lookup_reference(references, title)
     entry = {"Section": title, "Reference found": bool(reference)}
+    # Batch-embed the section + this row's cells once, so the per-cell cosine
+    # below is a cache lookup instead of one embedding request per cell.
+    if reference and _emb_wanted(cell_metrics):
+        cells = [str(row.get(c)).strip() for c in data_cols
+                 if row.get(c) is not None and row.get(c) == row.get(c)
+                 and str(row.get(c)).strip()]
+        _pre_embed([reference] + cells,
+                   tokens=any(m.startswith("bertscore") for m in cell_metrics))
     row_true = row_false = 0
     for col in data_cols:
         raw = row.get(col)
@@ -402,6 +615,7 @@ def evaluate_row(row, references, data_cols, metrics=ALL_METRICS):
         if cell_metrics and candidate and reference:
             cellm.update(_lexical_metrics(reference, candidate, cell_metrics))
             cellm.update(_distance_metrics(reference, candidate, cell_metrics))
+            cellm.update(_embedding_metrics(reference, candidate, cell_metrics))
         for mc in cell_metrics:
             entry[f"{col} {mc}"] = cellm.get(mc)
     if grounding:
@@ -445,6 +659,16 @@ def evaluate_row_items(row, references, data_cols, metrics=ALL_METRICS):
     title = str(row.get("Section", ""))
     reference = _lookup_reference(references, title)
     sentences = split_reference(reference)
+    # Batch-embed every reference sentence and every candidate item of this row
+    # once (one request per batch). The per-(sentence, item) scoring below then
+    # reads unit vectors from the cache — the whole point of embedding the
+    # divided items/sentences as lists rather than pair by pair.
+    if sentences and _emb_wanted(item_metrics):
+        all_items = []
+        for col in data_cols:
+            all_items.extend(split_items(row.get(col)))
+        _pre_embed(list(sentences) + all_items,
+                   tokens=any(m.startswith("bertscore") for m in item_metrics))
     records = []
     for col in data_cols:
         items = split_items(row.get(col))
@@ -465,6 +689,7 @@ def evaluate_row_items(row, references, data_cols, metrics=ALL_METRICS):
                         vals = {}
                         vals.update(_lexical_metrics(sent, item, item_metrics))
                         vals.update(_distance_metrics(sent, item, item_metrics))
+                        vals.update(_embedding_metrics(sent, item, item_metrics))
                         for m in item_metrics:
                             v = vals.get(m)
                             if v is not None and _better(m, v, best[m]):
@@ -558,7 +783,7 @@ def _preview(text, limit=180):
 
 
 def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
-                 uniq_columns=None, out_path=None, log=None):
+                 uniq_columns=None, out_path=None, log=None, embedding=None):
     """
     Evaluate one column-analysis snapshot sheet against its reference
     sections. ``log`` is an optional ``log(message)`` callback that receives
@@ -586,6 +811,16 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
     if not metrics:
         raise ValueError("No evaluations selected.")
     grounding = "grounding" in metrics
+    # Apply per-run embedding config (if passed) and start with a fresh vector
+    # cache so this run re-embeds under the current backend/service/model.
+    if embedding is not None:
+        configure_embeddings(**embedding)
+    else:
+        _reset_embedding_cache()
+    if _emb_wanted(metrics) and not _EMB_CFG["enabled"]:
+        _warn_embeddings("an embedding metric is selected but embeddings are "
+                         "not configured/enabled — recording None for it "
+                         "(call configure_embeddings first).")
 
     df = pd.read_excel(file_path, sheet_name=run_sheet, engine="openpyxl")
     if "Section" not in df.columns:
@@ -702,17 +937,21 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
 
 def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
                       run_sheets=None, uniq_columns="all", out_path=None,
-                      log=None):
+                      log=None, embedding=None):
     """
     Evaluate every ``Run N …`` snapshot sheet of a column-analysis workbook
     (or just ``run_sheets``). ``uniq_columns="all"`` evaluates the uniques of
     every extracted column; pass a list to restrict, or None to skip.
     ``out_path`` redirects all result sheets into a separate workbook;
     ``log`` is forwarded to :func:`evaluate_run` for per-row progress lines.
-    Returns ``{run sheet: summary dict}``.
+    ``embedding`` is an optional config dict for the semantic-embedding metrics
+    (see :func:`configure_embeddings`); it is applied once here so each sheet
+    reuses the same backend/service. Returns ``{run sheet: summary dict}``.
     """
     import pandas as pd
 
+    if embedding is not None:
+        configure_embeddings(**embedding)
     file_path = str(file_path)
     with pd.ExcelFile(file_path, engine="openpyxl") as xls:
         all_runs = [s for s in xls.sheet_names if s.startswith("Run ")]
@@ -724,9 +963,12 @@ def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
             head = pd.read_excel(file_path, sheet_name=sheet, nrows=0,
                                  engine="openpyxl")
             cols = [c for c in head.columns if c != "Section"]
+        # embedding already applied above -> pass None so evaluate_run only
+        # refreshes its per-run cache (keeps the shared config in place).
         results[sheet] = evaluate_run(file_path, sheet, references,
                                       metrics=metrics, uniq_columns=cols,
-                                      out_path=out_path, log=log)
+                                      out_path=out_path, log=log,
+                                      embedding=None)
     return results
 
 
@@ -786,14 +1028,30 @@ def main(argv=None):
                                       "separate .xlsx instead of the workbook")
     parser.add_argument("--no-uniques", action="store_true",
                         help="skip the unique-element evaluation")
+    parser.add_argument("--embed-backend", choices=("api", "local"),
+                        default="api",
+                        help="backend for the embedding_cosine / bertscore "
+                             "metrics (default: api)")
+    parser.add_argument("--embed-service", choices=("BlaBla", "DLR Ollama"),
+                        default="DLR Ollama",
+                        help="remote service for --embed-backend api "
+                             "(default: DLR Ollama)")
+    parser.add_argument("--embed-model",
+                        help="explicit embedding model id (optional; otherwise "
+                             "the service's default embedding model)")
     args = parser.parse_args(argv)
 
     references = references_from_json(args.sections_json)
     if not references:
         sys.exit(f"No sections found in {args.sections_json}.")
+    embedding = None
+    if any(m in _EMBEDDING for m in args.metrics):
+        embedding = {"enabled": True, "backend": args.embed_backend,
+                     "service": args.embed_service, "model": args.embed_model}
     results = evaluate_workbook(
         args.workbook, references, metrics=args.metrics, run_sheets=args.sheet,
-        uniq_columns=None if args.no_uniques else "all", out_path=args.out)
+        uniq_columns=None if args.no_uniques else "all", out_path=args.out,
+        embedding=embedding)
     if not results:
         sys.exit(f"No 'Run …' sheets found in {args.workbook}.")
     for sheet, s in results.items():

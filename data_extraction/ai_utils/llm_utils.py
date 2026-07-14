@@ -26,6 +26,62 @@ REQUEST_TIMES = deque(maxlen=10)
 
 
 # ---------------------------------------------------------------------------
+# Embedding request throttling (independent of the chat REQUEST_TIMES above)
+# ---------------------------------------------------------------------------
+# Embeddings are cheaper than chat completions and are issued in tight batches
+# from the evaluation pipeline, so they get their OWN, independently tunable
+# HTTP timeout / rate limit / pre-request delay. Tune at runtime via
+# configure_embedding_limits() (e.g. from the desktop UI) without disturbing
+# the chat throttling. Defaults are looser than the old hard-coded 3 s sleep +
+# 10-per-60 s limit, because batched embedding calls are lighter.
+EMBEDDING_LIMITS = {
+    "timeout": 120,            # per-request HTTP timeout (seconds)
+    "max_requests": 20,        # requests allowed per `window` seconds
+    "window": 60,              # sliding window (seconds) for max_requests
+    "pre_request_delay": 0.0,  # fixed pause before each request (seconds)
+}
+EMBEDDING_REQUEST_TIMES = deque(maxlen=EMBEDDING_LIMITS["max_requests"])
+
+
+def configure_embedding_limits(timeout=None, max_requests=None, window=None,
+                               pre_request_delay=None):
+    """Tune the embedding throttling at runtime; only the given values change.
+    Resizing max_requests rebuilds the sliding-window deque (keeping the most
+    recent timestamps). Returns the effective settings."""
+    global EMBEDDING_REQUEST_TIMES
+    if timeout is not None:
+        EMBEDDING_LIMITS["timeout"] = float(timeout)
+    if window is not None:
+        EMBEDDING_LIMITS["window"] = float(window)
+    if pre_request_delay is not None:
+        EMBEDDING_LIMITS["pre_request_delay"] = max(0.0, float(pre_request_delay))
+    if max_requests is not None:
+        mr = max(1, int(max_requests))
+        EMBEDDING_LIMITS["max_requests"] = mr
+        EMBEDDING_REQUEST_TIMES = deque(EMBEDDING_REQUEST_TIMES, maxlen=mr)
+    return dict(EMBEDDING_LIMITS)
+
+
+def _embedding_throttle():
+    """Pre-request delay, then a sliding-window rate limit, then record this
+    request's timestamp. Shared by every embedding request so the limit is
+    honoured across the whole session."""
+    delay = EMBEDDING_LIMITS["pre_request_delay"]
+    if delay > 0:
+        time.sleep(delay)
+    max_requests = int(EMBEDDING_LIMITS["max_requests"])
+    window = float(EMBEDDING_LIMITS["window"])
+    if len(EMBEDDING_REQUEST_TIMES) >= max_requests:
+        elapsed = time.time() - EMBEDDING_REQUEST_TIMES[0]
+        if elapsed < window:
+            sleep_time = window - elapsed
+            print(Fore.YELLOW + f"⚠️ Embedding rate limit approaching. "
+                  f"Sleeping for {sleep_time:.2f}s..." + Style.RESET_ALL)
+            time.sleep(sleep_time)
+    EMBEDDING_REQUEST_TIMES.append(time.time())
+
+
+# ---------------------------------------------------------------------------
 # Runtime-configurable model selection
 # ---------------------------------------------------------------------------
 # The models used for each remote service. These start at the configured
@@ -214,7 +270,7 @@ def get_embedding(
     service: str,
     model: str = None,
     api_key: str = None,
-    timeout: int = 60,
+    timeout: int = None,
 ) -> dict:
     """
     Get embedding vector(s) for `text` from the given service's OpenAI-compatible
@@ -227,7 +283,8 @@ def get_embedding(
                embedding model for the service is used (qwen3-8b-embeddings
                if available).
         api_key: optional explicit API key override.
-        timeout: request timeout in seconds.
+        timeout: per-request HTTP timeout in seconds; None uses the
+                 runtime-tunable EMBEDDING_LIMITS['timeout'].
 
     Returns:
         {
@@ -238,25 +295,12 @@ def get_embedding(
         }
     """
     
-    time.sleep(3)
-        
-    # --- RATE LIMITER LOGIC ---
-    current_time = time.time()
-    
-    # If we have already hit our 20 request capacity, check the oldest request
-    if len(REQUEST_TIMES) == 10:
-        oldest_request_time = REQUEST_TIMES[0]
-        elapsed_since_oldest = current_time - oldest_request_time
-        
-        # If the oldest request happened less than 60 seconds ago, we must wait
-        if elapsed_since_oldest < 60:
-            sleep_time = 60 - elapsed_since_oldest
-            print(Fore.YELLOW + f"⚠️ Rate limit approaching. Sleeping for {sleep_time:.2f} seconds..." + Style.RESET_ALL)
-            time.sleep(sleep_time)
-            
-    # Record the current timestamp for this request execution
-    REQUEST_TIMES.append(time.time())
-    # --------------------------
+    # Resolve the effective timeout and apply the embedding-specific throttle
+    # (pre-request delay + sliding-window rate limit). Both are tunable at
+    # runtime via configure_embedding_limits(), independent of chat throttling.
+    if timeout is None:
+        timeout = EMBEDDING_LIMITS["timeout"]
+    _embedding_throttle()
 
     start_time = time.time()
     
