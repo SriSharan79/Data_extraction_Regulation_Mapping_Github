@@ -56,6 +56,15 @@ generated content (element + count), then every unique element is grounded
 against the combined reference text of the run's sections into a
 ``Uniq Eval <run sheet>`` sheet with a per-column coverage summary.
 
+Columns that hold cross-references (name contains ``reference`` — see
+``_REFERENCE_COLUMN_HINTS``) get one extra pass: each unique value is matched
+against the **section titles** by case-insensitive substring in either
+direction (``match_sections``). The ``Uniq <run sheet>`` sheet keeps its
+``Unique_<col>``/``Count_<col>`` pair as-is and gains ``Section_<col>``,
+``Section_Count_<col>`` and ``Section_Matches_<col>`` beside it — the section
+tally lives next to the unique elements, most-referenced first — while every
+individual match is written to a ``Ref Map <run sheet>`` audit sheet.
+
 Standalone (references come from the sections JSON the run was made from):
 
     python -m data_extraction.evaluation.column_evaluator results.xlsx sections.json
@@ -114,6 +123,18 @@ _SEPARATORS = (
     ";", 
     # ","
     )
+
+# Extracted columns whose NAME contains one of these hints hold cross-references
+# to other sections/rules, so their unique values are additionally matched
+# against the reference *section titles* (see :func:`evaluate_uniques`).
+# Matching is case-insensitive; extend this tuple to cover more column names.
+_REFERENCE_COLUMN_HINTS = ("reference",)
+
+# A substring match shorter than this many characters is ignored when matching a
+# unique reference value against a section title: one- or two-character needles
+# ("A", "3") hit almost every title and would only add noise. Raise it for
+# stricter matching, lower it if your section titles are genuinely that short.
+_REF_MATCH_MIN_CHARS = 3
 
 # Reference text is split into sentences so each candidate item can be scored
 # against the single most relevant sentence rather than the whole section.
@@ -889,13 +910,117 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
             log(f"→ unique values evaluated → '{uniq_summary['uniq_eval_sheet']}'"
                 + (" (" + ", ".join(f"{c}: {p}%" for c, p in cov.items()
                                     if p is not None) + ")" if cov else ""))
+        if log and uniq_summary.get("ref_map_sheet"):
+            secs = uniq_summary.get("ref_sections") or {}
+            log(f"→ reference values matched to section titles → "
+                f"'{uniq_summary['ref_map_sheet']}'"
+                + (" (" + ", ".join(f"{c}: {len(t)} section(s)"
+                                    for c, t in secs.items()) + ")"
+                   if secs else " (no section matched)"))
     return summary
+
+
+def is_reference_column(col):
+    """True when an extracted column's NAME marks it as holding cross-references
+    to other sections/rules (``_REFERENCE_COLUMN_HINTS``, case-insensitive), so
+    its unique values are also matched against the reference section titles."""
+    name = str(col).lower()
+    return any(hint in name for hint in _REFERENCE_COLUMN_HINTS)
+
+
+def _count_value(v):
+    """The ``Count_<col>`` cell as an int; 0 for blank/NaN/non-numeric."""
+    try:
+        if v is None or v != v:  # None or NaN
+            return 0
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def match_sections(element, references):
+    """Match one unique reference value against the reference **section titles**.
+
+    A hit is a case-insensitive substring match in either direction — the value
+    may name a section in short form (``"21.A.3"`` inside the title
+    ``"21.A.3 Failures, malfunctions and defects"``) or quote the title in full
+    inside a longer phrase (``"see 21.A.3 Failures …, point (b)"``). The needle
+    (the shorter, contained side) must be at least ``_REF_MATCH_MIN_CHARS``
+    characters, which vetoes trivial one/two-character hits.
+
+    Returns ``[(section title, how), ...]`` — possibly several, since one value
+    can legitimately name more than one section — where ``how`` is
+    ``"value in section title"`` or ``"section title in value"``. Returns ``[]``
+    for a blank value or when nothing matches.
+    """
+    el = str(element or "").strip().lower()
+    if not el:
+        return []
+    hits = []
+    for title in references:
+        tl = str(title or "").strip().lower()
+        if not tl:
+            continue
+        if len(el) >= _REF_MATCH_MIN_CHARS and el in tl:
+            hits.append((title, "value in section title"))
+        elif len(tl) >= _REF_MATCH_MIN_CHARS and tl in el:
+            hits.append((title, "section title in value"))
+    return hits
+
+
+def _reference_section_counts(df, col, references):
+    """Match every unique value of one reference column against the section
+    titles. Returns ``(counts, map_rows)`` where ``counts`` is
+    ``{section title: [occurrences, matched values]}`` — ``occurrences`` sums the
+    values' ``Count_<col>`` (how often the reference was actually generated),
+    ``matched values`` counts the distinct unique values that hit that section —
+    and ``map_rows`` are the per-match audit records for the Ref Map sheet."""
+    ucol, ccol = f"Unique_{col}", f"Count_{col}"
+    sub = df[[ucol, ccol]].dropna(subset=[ucol]) if ccol in df.columns \
+        else df[[ucol]].dropna(subset=[ucol]).assign(**{ccol: 0})
+    counts, map_rows = {}, []
+    for element, raw_count in zip(sub[ucol], sub[ccol]):
+        n = _count_value(raw_count)
+        hits = match_sections(element, references)
+        if not hits:
+            map_rows.append({
+                "Column": col, "Unique value": element, "Count": n,
+                "Matched section": "— no match —", "Match type": "",
+            })
+            continue
+        for title, how in hits:
+            acc = counts.setdefault(title, [0, 0])
+            acc[0] += n
+            acc[1] += 1
+            map_rows.append({
+                "Column": col, "Unique value": element, "Count": n,
+                "Matched section": title, "Match type": how,
+            })
+    return counts, map_rows
 
 
 def evaluate_uniques(file_path, run_sheet, references, columns):
     """Identify the unique generated values via save_unique_elements_to_new_sheet
     (refreshing ``Uniq <run sheet>``), then ground every unique element against
-    the combined reference text into ``Uniq Eval <run sheet>``."""
+    the combined reference text into ``Uniq Eval <run sheet>``.
+
+    **Reference columns** (name contains a ``_REFERENCE_COLUMN_HINTS`` hint,
+    e.g. ``References``) additionally get their unique values matched against the
+    reference **section titles** (:func:`match_sections`, substring match in
+    either direction). For those columns the ``Uniq <run sheet>`` sheet keeps its
+    existing ``Unique_<col>`` / ``Count_<col>`` pair untouched and simply gains
+    three more columns beside them:
+
+        ``Section_<col>``          the matched section title
+        ``Section_Count_<col>``    how often that section was referenced
+                                   (the sum of the matching values' counts)
+        ``Section_Matches_<col>``  how many distinct unique values matched it
+
+    so the section tally lives in the same sheet as the unique elements, sorted
+    most-referenced first. Every individual match is also written to a separate
+    ``Ref Map <run sheet>`` audit sheet (which value matched which section, and
+    in which direction), including the values that matched nothing.
+    """
     import pandas as pd
 
     if not columns:
@@ -908,6 +1033,41 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
 
     combined = "\n".join(str(v or "") for v in references.values()).lower()
     df = pd.read_excel(file_path, sheet_name=uniq_sheet, engine="openpyxl")
+
+    # -- reference columns: unique values -> section titles ------------------ #
+    # Rebuilt on every call, exactly like the sheets below: the Uniq sheet is
+    # regenerated first (above), so the Section_* columns are re-derived rather
+    # than accumulated.
+    ref_blocks, ref_map_rows, ref_sections = [], [], {}
+    for col in columns:
+        if not is_reference_column(col) or f"Unique_{col}" not in df.columns:
+            continue
+        counts, map_rows = _reference_section_counts(df, col, references)
+        ref_map_rows.extend(map_rows)
+        if not counts:
+            continue
+        # Most-referenced section first, ties alphabetical.
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1][0], str(kv[0])))
+        ref_blocks.append(pd.DataFrame({
+            f"Section_{col}": [t for t, _ in ordered],
+            f"Section_Count_{col}": [v[0] for _, v in ordered],
+            f"Section_Matches_{col}": [v[1] for _, v in ordered],
+        }))
+        ref_sections[col] = {t: v[0] for t, v in ordered}
+
+    ref_map_sheet = None
+    if ref_blocks:
+        # Side by side with the existing Unique_/Count_ columns (the sheet is
+        # already a ragged, column-per-block layout; concat pads with NaN).
+        df = pd.concat([df] + ref_blocks, axis=1)
+        _write_sheet(file_path, uniq_sheet, df)
+    if ref_map_rows:
+        ref_map_sheet = f"Ref Map {run_sheet}"[:31]
+        _write_sheet(file_path, ref_map_sheet, pd.DataFrame(
+            ref_map_rows,
+            columns=["Column", "Unique value", "Count", "Matched section",
+                     "Match type"]))
+
     blocks, uniq_coverage = [], {}
     for col in columns:
         ucol, ccol = f"Unique_{col}", f"Count_{col}"
@@ -926,13 +1086,15 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
         }))
         uniq_coverage[col] = pct
     if not blocks:
-        return {"uniq_sheet": uniq_sheet}
+        return {"uniq_sheet": uniq_sheet, "ref_map_sheet": ref_map_sheet,
+                "ref_sections": ref_sections}
 
     target_df = pd.concat(blocks, axis=1)
     uniq_eval_sheet = f"Uniq Eval {run_sheet}"[:31]
     _write_sheet(file_path, uniq_eval_sheet, target_df)
     return {"uniq_sheet": uniq_sheet, "uniq_eval_sheet": uniq_eval_sheet,
-            "uniq_coverage": uniq_coverage}
+            "uniq_coverage": uniq_coverage, "ref_map_sheet": ref_map_sheet,
+            "ref_sections": ref_sections}
 
 
 def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
