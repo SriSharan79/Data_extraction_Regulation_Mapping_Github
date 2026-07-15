@@ -1194,11 +1194,56 @@ class AIReviewMixin:
                        "sheets).\nAn existing sheet of the same name is replaced. "
                        "Blank = 'Uniq <sheet>'.").pack(anchor="w", pady=(2, 0))
 
+        # Optional extra pass: match the unique values of reference columns
+        # against the section titles (column_evaluator.add_reference_sections —
+        # the same function the run-sheet 'Uniq' pipeline uses).
+        ref_wrap = ttk.LabelFrame(
+            uq, text=" Reference columns → section titles (optional) ", padding=4)
+        ref_wrap.pack(fill="x", pady=(6, 0))
+        self.uniq_refmap_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ref_wrap, variable=self.uniq_refmap_var,
+            command=self._uniq_refmap_toggle,
+            text="Also match reference columns (name contains 'reference') "
+                 "against the section titles").pack(anchor="w")
+        rrow = ttk.Frame(ref_wrap)
+        rrow.pack(fill="x", pady=(4, 0))
+        ttk.Label(rrow, text="Sections JSON:").pack(side="left")
+        self.uniq_ref_json = ttk.Entry(rrow)
+        self.uniq_ref_json.pack(side="left", fill="x", expand=True, padx=4)
+        self.uniq_ref_browse = ttk.Button(rrow, text="Browse…",
+                                          command=self._uniq_browse_ref_json)
+        self.uniq_ref_browse.pack(side="left")
+        ttk.Label(ref_wrap, foreground="#666666", justify="left",
+                  text="Each unique value of those columns is matched against the "
+                       "JSON's section titles (substring, either direction). The "
+                       "new sheet keeps its Unique_/Count_ columns and gains "
+                       "Section_<col> / Section_Count_<col> /\nSection_Matches_<col> "
+                       "beside them (most-referenced first); every individual match "
+                       "also goes to a separate 'Ref Map …' sheet.").pack(
+            anchor="w", pady=(2, 0))
+        self._uniq_refmap_toggle()
+
         brow = ttk.Frame(uq)
         brow.pack(fill="x", pady=6)
         self.uniq_run_btn = ttk.Button(brow, text="Generate unique elements",
                                        command=self._uniq_generate)
         self.uniq_run_btn.pack(side="left")
+
+    def _uniq_refmap_toggle(self):
+        """Enable the sections-JSON picker only while section matching is on."""
+        state = "normal" if self.uniq_refmap_var.get() else "disabled"
+        self.uniq_ref_json.configure(state=state)
+        self.uniq_ref_browse.configure(state=state)
+
+    def _uniq_browse_ref_json(self):
+        path = filedialog.askopenfilename(
+            title="Select the sections JSON holding the section titles",
+            filetypes=[("JSON files", "*.json")])
+        if path:
+            self.uniq_ref_json.configure(state="normal")
+            self.uniq_ref_json.delete(0, tk.END)
+            self.uniq_ref_json.insert(0, path)
 
     def _uniq_browse_wb(self):
         path = filedialog.askopenfilename(
@@ -1323,6 +1368,31 @@ class AIReviewMixin:
             messagebox.showinfo("Sheet name",
                                 "The new sheet name must differ from the source sheet.")
             return
+        # Optional reference-column → section-title matching.
+        ref_json = None
+        if self.uniq_refmap_var.get():
+            try:
+                from data_extraction.evaluation.column_evaluator import (
+                    is_reference_column)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Section matching",
+                                     f"column_evaluator unavailable:\n{exc}")
+                return
+            ref_cols = [c for c in columns if is_reference_column(c)]
+            if not ref_cols:
+                messagebox.showinfo(
+                    "No reference column",
+                    "Section matching is ticked, but none of the ticked columns "
+                    "has 'reference' in its name — tick a reference column, or "
+                    "untick the section-matching box.")
+                return
+            ref_json = self.uniq_ref_json.get().strip()
+            if not ref_json or not os.path.exists(ref_json):
+                messagebox.showinfo(
+                    "Sections JSON needed",
+                    "Pick the sections JSON whose section titles the reference "
+                    "values are matched against.")
+                return
 
         self._uniq_busy = True
         self.uniq_run_btn.configure(state="disabled")
@@ -1334,13 +1404,17 @@ class AIReviewMixin:
                      f"columns [{', '.join(columns)}], separator {sep_desc}"
                      f"{', case-insensitive' if case_insensitive else ''}, "
                      f"sort by {sort_by} → sheet '{out_name}' ===")
+        if ref_json:
+            self._ai_log(f"   reference columns [{', '.join(ref_cols)}] will be "
+                         f"matched against the section titles in "
+                         f"{os.path.basename(ref_json)}")
         self.status_var.set(f"Extracting unique values from {sheet}…")
 
         def work():
             try:
                 summary = self._uniq_build_sheet(
                     path, sheet, columns, separators, case_insensitive,
-                    sort_by, out_name)
+                    sort_by, out_name, ref_json)
             except Exception as exc:  # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._uniq_done(None, e))
             else:
@@ -1349,9 +1423,12 @@ class AIReviewMixin:
         threading.Thread(target=work, daemon=True).start()
 
     def _uniq_build_sheet(self, path, sheet, columns, separators,
-                          case_insensitive, sort_by, out_name):
+                          case_insensitive, sort_by, out_name, ref_json=None):
         """Worker: delegate to save_unique_elements_to_new_sheet, then read the
-        written sheet back for the per-column unique counts. Runs off the main
+        written sheet back for the per-column unique counts. When ``ref_json``
+        is given, the reference columns' unique values are additionally matched
+        against that JSON's section titles (column_evaluator.add_reference_sections
+        — the same pass the run-sheet 'Uniq' pipeline runs). Runs off the main
         thread — no widget access here."""
         import pandas as pd
 
@@ -1368,8 +1445,22 @@ class AIReviewMixin:
         written = pd.read_excel(path, sheet_name=out_name, engine="openpyxl")
         per_col = {c[len("Unique_"):]: int(written[c].notna().sum())
                    for c in written.columns if c.startswith("Unique_")}
-        return {"sheet": out_name, "rows": int(written.shape[0]),
-                "per_col": per_col, "path": path}
+        summary = {"sheet": out_name, "rows": int(written.shape[0]),
+                   "per_col": per_col, "path": path}
+        if ref_json:
+            from data_extraction.evaluation.column_evaluator import (
+                add_reference_sections, ref_map_sheet_name, references_from_json)
+            references = references_from_json(ref_json)
+            if not references:
+                raise RuntimeError(
+                    f"No sections found in {os.path.basename(ref_json)} — the "
+                    "reference values have no section titles to match against.")
+            summary.update(add_reference_sections(
+                path, out_name, references, columns,
+                map_sheet=ref_map_sheet_name(out_name)))
+            summary["ref_json"] = ref_json
+            summary["ref_titles"] = len(references)
+        return summary
 
     @staticmethod
     def _uniq_sanitize_sheet(name):
@@ -1393,14 +1484,31 @@ class AIReviewMixin:
             f"({detail}) in {os.path.basename(summary['path'])}")
         self._ai_log(f"=== Unique elements complete → '{summary['sheet']}' "
                      f"({detail}) ===")
+        secs = summary.get("ref_sections") or {}
+        if summary.get("ref_map_sheet"):
+            self._ai_log(
+                f"   → reference values matched against "
+                f"{summary.get('ref_titles', 0)} section title(s): "
+                + (", ".join(f"{c}: {len(t)} section(s) referenced"
+                             for c, t in secs.items()) or "no section matched")
+                + f" — Section_* columns added to '{summary['sheet']}', "
+                  f"details → '{summary['ref_map_sheet']}'")
         # Refresh the sheet list so the new sheet shows up immediately.
         self._uniq_refresh_sheets()
+        extra = ""
+        if summary.get("ref_map_sheet"):
+            extra = ("\n\nReference columns matched to section titles:\n"
+                     + "\n".join(f"{c}: {len(t)} section(s) referenced"
+                                 for c, t in secs.items())
+                     + f"\n\nSection_* columns added to '{summary['sheet']}'; "
+                       f"every match listed in '{summary['ref_map_sheet']}'.")
         messagebox.showinfo(
             "Unique elements",
             f"Written to sheet '{summary['sheet']}' in "
             f"{os.path.basename(summary['path'])}.\n\n"
             + "\n".join(f"{col}: {n} unique value(s)"
-                        for col, n in summary["per_col"].items()))
+                        for col, n in summary["per_col"].items())
+            + extra)
 
     # ----------------------------------------------------- Evaluation tab -- #
     def _build_ai_eval_tab(self):

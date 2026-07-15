@@ -58,8 +58,12 @@ against the combined reference text of the run's sections into a
 
 Columns that hold cross-references (name contains ``reference`` — see
 ``_REFERENCE_COLUMN_HINTS``) get one extra pass: each unique value is matched
-against the **section titles** by case-insensitive substring in either
-direction (``match_sections``). The ``Uniq <run sheet>`` sheet keeps its
+against the **section titles** (``match_sections``). Values that start with a
+CS / AMC / GM rule identifier (``AMC 25.21(g)(a)``) are matched by that
+identifier alone, by regex, so qualifiers and trailing prose are ignored and
+``AMC 25.21`` never lands on ``AMC 25.219``; any other value is stripped of its
+``(…)`` qualifiers and matched as a case-insensitive substring in either
+direction. The ``Uniq <run sheet>`` sheet keeps its
 ``Unique_<col>``/``Count_<col>`` pair as-is and gains ``Section_<col>``,
 ``Section_Count_<col>`` and ``Section_Matches_<col>`` beside it — the section
 tally lives next to the unique elements, most-referenced first — while every
@@ -135,6 +139,36 @@ _REFERENCE_COLUMN_HINTS = ("reference",)
 # ("A", "3") hit almost every title and would only add noise. Raise it for
 # stricter matching, lower it if your section titles are genuinely that short.
 _REF_MATCH_MIN_CHARS = 3
+
+# Sub-paragraph qualifiers in a reference value are dropped before it is matched
+# against the section titles: "AMC 25.21(g)(a)" points at the section titled
+# "AMC 25.21 …", which carries no "(g)(a)" in its title, so the parentheses have
+# to go or the value would never match. Applied repeatedly, so nested groups
+# ("(a(b))") are removed too.
+_PARENTHETICAL = re.compile(r"\([^()]*\)")
+
+# CS / AMC / GM rule identifiers ("CS 25.1309", "AMC 25.21", "GM 26.30") are
+# matched by their identifier alone rather than as raw substrings: the prefix,
+# whitespace, a 1-2 character book/part number, a dot and a 1-4 digit rule
+# number. Anchored at the start, so only values that *begin* with CS/AMC/GM take
+# this path; anything else (and CS/AMC/GM values that do not fit the format, e.g.
+# "GM 21.A.14", whose "A" is not a digit) falls back to substring matching.
+# Trailing qualifiers and prose after the identifier are ignored.
+_RULE_ID = re.compile(r"^\s*(CS|AMC|GM)\s+([A-Za-z0-9]{1,2})\.(\d{1,4})(?!\d)",
+                      re.IGNORECASE)
+
+# Detects whether the section titles themselves are written with CS/AMC/GM
+# prefixes ("AMC 25.1309 System design") or bare ("25.1309 System design").
+_RULE_PREFIX_IN_TITLE = re.compile(r"\b(CS|AMC|GM)\s+[A-Za-z0-9]{1,2}\.\d",
+                                   re.IGNORECASE)
+
+# When the full identifier ("AMC 25.21") matches no section title, retry with the
+# rule number alone ("25.21") — but only when the titles carry no CS/AMC/GM
+# prefix at all (e.g. "25.21 Proof of compliance"). Where the titles *are*
+# prefixed, a missing prefix match is a real miss, so "CS 25.1309" must not land
+# on an "AMC 25.1309 …" title (different book, same rule number). Set to False to
+# switch the fallback off entirely and always require the prefix to match.
+_RULE_MATCH_NUMBER_FALLBACK = True
 
 # Reference text is split into sentences so each candidate item can be scored
 # against the single most relevant sentence rather than the whole section.
@@ -938,33 +972,144 @@ def _count_value(v):
         return 0
 
 
+def strip_parentheticals(text):
+    """Drop every ``(…)`` qualifier from a reference value and tidy what is left,
+    so the bare rule identifier remains::
+
+        "AMC 25.21(g)(a)"   -> "AMC 25.21"
+        "21.A.14(b)"        -> "21.A.14"
+        "see 21.A.3A, point (b)" -> "see 21.A.3A"
+
+    Sub-paragraph qualifiers live in the *value*, never in the section title, so
+    they must go before matching or the value could not match its own section.
+    Nested groups are removed too (the substitution runs until it is stable), and
+    the leftover whitespace / orphaned separators are cleaned up. Returns ``""``
+    only when the value is nothing but parentheses.
+    """
+    out = str(text or "")
+    prev = None
+    while prev != out:
+        prev = out
+        out = _PARENTHETICAL.sub(" ", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out.strip(" ,;:-")
+
+
+def rule_identifier(text):
+    """The CS / AMC / GM rule identifier a reference value **starts with**, or
+    ``None`` when it does not begin with one in that format
+    (``_RULE_ID``: prefix, whitespace, a 1-2 character book/part number, a dot,
+    1-4 digits)::
+
+        "AMC 25.21(g)(a)"        -> ("AMC", "25.21")
+        "CS 25.1309(a) blah"     -> ("CS",  "25.1309")
+        "GM 26.30"               -> ("GM",  "26.30")
+        "GM 21.A.14"             -> None   # "A" is not a digit
+        "21.A.3A"                -> None   # no CS/AMC/GM prefix
+
+    Everything after the identifier — sub-paragraph qualifiers, prose — is
+    ignored, so the identifier is what gets matched against the section titles.
+    Returns ``(prefix, number)`` with the prefix upper-cased.
+    """
+    m = _RULE_ID.match(str(text or ""))
+    if not m:
+        return None
+    return m.group(1).upper(), f"{m.group(2).upper()}.{m.group(3)}"
+
+
+def _rule_regex(needle):
+    """Regex matching ``needle`` ("AMC 25.21" / "25.21") inside a section title:
+    whitespace between the parts is flexible, and the trailing ``(?!\\d)`` guard
+    stops "AMC 25.21" from also matching "AMC 25.219"."""
+    parts = [re.escape(p) for p in str(needle).split()]
+    return re.compile(r"\b" + r"\s+".join(parts) + r"(?!\d)", re.IGNORECASE)
+
+
+def _titles_use_rule_prefix(references):
+    """True when the section titles themselves carry CS/AMC/GM prefixes
+    ("AMC 25.1309 System design") rather than bare rule numbers."""
+    return any(_RULE_PREFIX_IN_TITLE.search(str(t or "")) for t in references)
+
+
+def match_rule_sections(prefix, number, references):
+    """Match a CS/AMC/GM rule identifier against the section titles **by regex**
+    (:func:`_rule_regex`) rather than by raw substring, so "AMC 25.21" finds
+    "AMC 25.21 Proof of compliance" but not "AMC 25.219 …".
+
+    The full identifier ("AMC 25.21") is tried first. Only if no title carries it
+    — and only when the titles are written without CS/AMC/GM prefixes at all
+    (:func:`_titles_use_rule_prefix`) and ``_RULE_MATCH_NUMBER_FALLBACK`` is on —
+    is the rule number alone ("25.21") retried. That keeps "CS 25.1309" off an
+    "AMC 25.1309 …" title (same rule number, different book) while still matching
+    bare titles like "25.1309 System design". Returns the same
+    ``[(section title, how, needle), ...]`` shape as :func:`match_sections`.
+    """
+    full = f"{prefix} {number}"
+    rx = _rule_regex(full)
+    hits = [(title, f"rule id '{full}' in section title", full)
+            for title in references if rx.search(str(title or ""))]
+    if hits or not _RULE_MATCH_NUMBER_FALLBACK:
+        return hits
+    if _titles_use_rule_prefix(references):
+        # The titles do use prefixes, so this rule genuinely is not among them.
+        return []
+    rx = _rule_regex(number)
+    return [(title, f"rule no. '{number}' in section title", number)
+            for title in references if rx.search(str(title or ""))]
+
+
 def match_sections(element, references):
     """Match one unique reference value against the reference **section titles**.
 
-    A hit is a case-insensitive substring match in either direction — the value
-    may name a section in short form (``"21.A.3"`` inside the title
-    ``"21.A.3 Failures, malfunctions and defects"``) or quote the title in full
-    inside a longer phrase (``"see 21.A.3 Failures …, point (b)"``). The needle
-    (the shorter, contained side) must be at least ``_REF_MATCH_MIN_CHARS``
-    characters, which vetoes trivial one/two-character hits.
+    Two paths, picked from the value itself:
 
-    Returns ``[(section title, how), ...]`` — possibly several, since one value
-    can legitimately name more than one section — where ``how`` is
-    ``"value in section title"`` or ``"section title in value"``. Returns ``[]``
-    for a blank value or when nothing matches.
+    * **CS / AMC / GM rule values** (:func:`rule_identifier` recognises the
+      identifier the value starts with, e.g. ``"AMC 25.21(g)(a)"`` ->
+      ``AMC 25.21``) are matched by :func:`match_rule_sections`, i.e. by regex on
+      that identifier alone. Sub-paragraph qualifiers and any trailing prose are
+      ignored, and the digit guard keeps ``AMC 25.21`` off ``AMC 25.219``. This
+      path is authoritative: when the identifier matches no title the value is
+      reported as unmatched rather than falling back to a looser substring hunt.
+    * **Everything else** keeps the substring behaviour: the value is stripped of
+      its ``(…)`` qualifiers (:func:`strip_parentheticals`) and matched
+      case-insensitively in either direction — the value may name a section in
+      short form (``"21.A.3"`` inside the title ``"21.A.3 Failures, malfunctions
+      and defects"``) or quote the title in full inside a longer phrase
+      (``"see 21.A.3 Failures …, point (b)"``). The needle (the shorter,
+      contained side) must be at least ``_REF_MATCH_MIN_CHARS`` characters, which
+      vetoes trivial one/two-character hits. The stripped form is tried first;
+      the raw text is then tried as a fallback, because dropping the qualifiers
+      shortens the value and could otherwise lose a match in the "title inside
+      value" direction. The first direction that hits wins per title.
+
+    Returns ``[(section title, how, needle), ...]`` — possibly several, since one
+    value can legitimately name more than one section — where ``how`` names the
+    rule/direction that matched and ``needle`` is the form of the value that
+    actually matched. Returns ``[]`` for a blank value or when nothing matches.
     """
-    el = str(element or "").strip().lower()
-    if not el:
+    el_raw = str(element or "").strip().lower()
+    if not el_raw:
         return []
+    # CS/AMC/GM rule values: match the identifier by regex, not by substring.
+    rule = rule_identifier(el_raw)
+    if rule:
+        return match_rule_sections(rule[0], rule[1], references)
+    el_norm = strip_parentheticals(el_raw)
+    # Qualifier-free form first (the intent); raw text as a fallback so no match
+    # that worked before the stripping is lost.
+    needles = [n for n in dict.fromkeys((el_norm, el_raw)) if n]
     hits = []
     for title in references:
         tl = str(title or "").strip().lower()
         if not tl:
             continue
-        if len(el) >= _REF_MATCH_MIN_CHARS and el in tl:
-            hits.append((title, "value in section title"))
-        elif len(tl) >= _REF_MATCH_MIN_CHARS and tl in el:
-            hits.append((title, "section title in value"))
+        for cand in needles:
+            if len(cand) >= _REF_MATCH_MIN_CHARS and cand in tl:
+                hits.append((title, "value in section title", cand))
+                break
+            if len(tl) >= _REF_MATCH_MIN_CHARS and tl in cand:
+                hits.append((title, "section title in value", cand))
+                break
     return hits
 
 
@@ -974,7 +1119,8 @@ def _reference_section_counts(df, col, references):
     ``{section title: [occurrences, matched values]}`` — ``occurrences`` sums the
     values' ``Count_<col>`` (how often the reference was actually generated),
     ``matched values`` counts the distinct unique values that hit that section —
-    and ``map_rows`` are the per-match audit records for the Ref Map sheet."""
+    and ``map_rows`` are the per-match audit records for the Ref Map sheet
+    (including the ``(…)``-stripped form each value was matched by)."""
     ucol, ccol = f"Unique_{col}", f"Count_{col}"
     sub = df[[ucol, ccol]].dropna(subset=[ucol]) if ccol in df.columns \
         else df[[ucol]].dropna(subset=[ucol]).assign(**{ccol: 0})
@@ -983,20 +1129,92 @@ def _reference_section_counts(df, col, references):
         n = _count_value(raw_count)
         hits = match_sections(element, references)
         if not hits:
+            rule = rule_identifier(str(element).strip())
+            searched = (f"{rule[0]} {rule[1]}" if rule
+                        else strip_parentheticals(element))
             map_rows.append({
                 "Column": col, "Unique value": element, "Count": n,
+                "Matched using": searched,
                 "Matched section": "— no match —", "Match type": "",
             })
             continue
-        for title, how in hits:
+        for title, how, needle in hits:
             acc = counts.setdefault(title, [0, 0])
             acc[0] += n
             acc[1] += 1
             map_rows.append({
                 "Column": col, "Unique value": element, "Count": n,
+                "Matched using": needle,
                 "Matched section": title, "Match type": how,
             })
     return counts, map_rows
+
+
+def ref_map_sheet_name(base):
+    """Name of the reference-match audit sheet for ``base`` (a run sheet or a
+    unique-elements sheet). A leading ``Uniq `` is dropped so ``Uniq Sheet1``
+    gives ``Ref Map Sheet1`` rather than ``Ref Map Uniq Sheet1``."""
+    b = str(base)
+    if b.lower().startswith("uniq "):
+        b = b[len("Uniq "):]
+    return f"Ref Map {b}"[:31]
+
+
+def add_reference_sections(file_path, uniq_sheet, references, columns,
+                           map_sheet=None):
+    """Match the unique values of every **reference column** in ``uniq_sheet``
+    (name contains a ``_REFERENCE_COLUMN_HINTS`` hint) against the reference
+    **section titles**. Each value is matched by its ``(…)``-free form
+    (``"AMC 25.21(g)(a)"`` -> ``"AMC 25.21"``, see :func:`match_sections`), and
+    the result is recorded in two places:
+
+    * ``uniq_sheet`` itself keeps its ``Unique_<col>`` / ``Count_<col>`` pairs
+      untouched and gains, beside them, ``Section_<col>`` (matched title),
+      ``Section_Count_<col>`` (how often that section was referenced — the sum
+      of the matching values' counts) and ``Section_Matches_<col>`` (how many
+      distinct unique values matched it), most-referenced first. The section
+      tally therefore lives in the same sheet as the unique elements.
+    * ``map_sheet`` (default :func:`ref_map_sheet_name`) receives one row per
+      individual match — which value matched which section and in which
+      direction — including the values that matched nothing.
+
+    Shared by :func:`evaluate_uniques` (the run-sheet pipeline) and the AI
+    Review *Unique elements* tab (any workbook/sheet), so both behave alike.
+    Rebuilt on every call. Returns ``{"ref_map_sheet": …, "ref_sections":
+    {col: {section: occurrences}}}``.
+    """
+    import pandas as pd
+
+    df = pd.read_excel(file_path, sheet_name=uniq_sheet, engine="openpyxl")
+    ref_blocks, ref_map_rows, ref_sections = [], [], {}
+    for col in columns:
+        if not is_reference_column(col) or f"Unique_{col}" not in df.columns:
+            continue
+        counts, map_rows = _reference_section_counts(df, col, references)
+        ref_map_rows.extend(map_rows)
+        if not counts:
+            continue
+        # Most-referenced section first, ties alphabetical.
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1][0], str(kv[0])))
+        ref_blocks.append(pd.DataFrame({
+            f"Section_{col}": [t for t, _ in ordered],
+            f"Section_Count_{col}": [v[0] for _, v in ordered],
+            f"Section_Matches_{col}": [v[1] for _, v in ordered],
+        }))
+        ref_sections[col] = {t: v[0] for t, v in ordered}
+
+    ref_map_sheet = None
+    if ref_blocks:
+        # Side by side with the existing Unique_/Count_ columns (the sheet is
+        # already a ragged, column-per-block layout; concat pads with NaN).
+        _write_sheet(file_path, uniq_sheet, pd.concat([df] + ref_blocks, axis=1))
+    if ref_map_rows:
+        ref_map_sheet = (map_sheet or ref_map_sheet_name(uniq_sheet))[:31]
+        _write_sheet(file_path, ref_map_sheet, pd.DataFrame(
+            ref_map_rows,
+            columns=["Column", "Unique value", "Count", "Matched using",
+                     "Matched section", "Match type"]))
+    return {"ref_map_sheet": ref_map_sheet, "ref_sections": ref_sections}
 
 
 def evaluate_uniques(file_path, run_sheet, references, columns):
@@ -1034,39 +1252,15 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
     combined = "\n".join(str(v or "") for v in references.values()).lower()
     df = pd.read_excel(file_path, sheet_name=uniq_sheet, engine="openpyxl")
 
-    # -- reference columns: unique values -> section titles ------------------ #
-    # Rebuilt on every call, exactly like the sheets below: the Uniq sheet is
-    # regenerated first (above), so the Section_* columns are re-derived rather
-    # than accumulated.
-    ref_blocks, ref_map_rows, ref_sections = [], [], {}
-    for col in columns:
-        if not is_reference_column(col) or f"Unique_{col}" not in df.columns:
-            continue
-        counts, map_rows = _reference_section_counts(df, col, references)
-        ref_map_rows.extend(map_rows)
-        if not counts:
-            continue
-        # Most-referenced section first, ties alphabetical.
-        ordered = sorted(counts.items(), key=lambda kv: (-kv[1][0], str(kv[0])))
-        ref_blocks.append(pd.DataFrame({
-            f"Section_{col}": [t for t, _ in ordered],
-            f"Section_Count_{col}": [v[0] for _, v in ordered],
-            f"Section_Matches_{col}": [v[1] for _, v in ordered],
-        }))
-        ref_sections[col] = {t: v[0] for t, v in ordered}
-
-    ref_map_sheet = None
-    if ref_blocks:
-        # Side by side with the existing Unique_/Count_ columns (the sheet is
-        # already a ragged, column-per-block layout; concat pads with NaN).
-        df = pd.concat([df] + ref_blocks, axis=1)
-        _write_sheet(file_path, uniq_sheet, df)
-    if ref_map_rows:
-        ref_map_sheet = f"Ref Map {run_sheet}"[:31]
-        _write_sheet(file_path, ref_map_sheet, pd.DataFrame(
-            ref_map_rows,
-            columns=["Column", "Unique value", "Count", "Matched section",
-                     "Match type"]))
+    # Reference columns: unique values -> section titles, added to the Uniq
+    # sheet itself plus the Ref Map audit sheet (shared with the Unique
+    # elements tab). Rebuilt on every call, like every sheet here: the Uniq
+    # sheet is regenerated above, so the Section_* columns are re-derived
+    # rather than accumulated.
+    ref = add_reference_sections(file_path, uniq_sheet, references, columns,
+                                 map_sheet=ref_map_sheet_name(run_sheet))
+    ref_map_sheet = ref["ref_map_sheet"]
+    ref_sections = ref["ref_sections"]
 
     blocks, uniq_coverage = [], {}
     for col in columns:
