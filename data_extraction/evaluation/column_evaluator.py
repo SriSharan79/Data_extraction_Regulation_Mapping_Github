@@ -88,6 +88,7 @@ import json
 import os
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 # Every selectable evaluation, in output order.
@@ -230,10 +231,39 @@ def split_items(cell):
     return [text]
 
 
+@lru_cache(maxsize=4096)
+def _squash_ws(text):
+    """Lower-cased with **every** whitespace character removed.
+
+    PDF extraction routinely drops or inserts spaces ("AMC2&3to CS-23",
+    "inaremark onthe specific lineofthat"), so the reference text and the
+    LLM's correctly-spaced item can differ by nothing but a space and still
+    fail a literal comparison. Collapsing runs of whitespace is not enough —
+    the space has to go entirely — hence ``"".join(text.split())``, which also
+    covers non-breaking spaces, tabs and newlines. Cached because the same long
+    reference is squashed once per item/sentence pair.
+    """
+    return "".join(str(text).split()).lower()
+
+
 def is_grounded(item, reference):
     """data_evaluator's Is_Subset check: the extracted item is contained in
-    the reference text (case-insensitive substring)."""
-    return bool(reference) and str(item).lower() in str(reference).lower()
+    the reference text (case-insensitive substring).
+
+    The comparison is also **whitespace-insensitive**: a literal match is tried
+    first, and only if that fails are both sides re-checked with all whitespace
+    removed (:func:`_squash_ws`). That keeps items grounded when the reference
+    text carries the extractor's missing/extra spaces — matching an item that
+    genuinely appears in the section is the point, and a space is not a
+    difference in content. It cannot un-ground anything: whatever matched
+    literally still matches squashed.
+    """
+    if not reference:
+        return False
+    if str(item).lower() in str(reference).lower():
+        return True
+    squashed_item = _squash_ws(item)
+    return bool(squashed_item) and squashed_item in _squash_ws(reference)
 
 
 def _is_sentence_end(text, dot, after):
@@ -595,9 +625,14 @@ def _embedding_metrics(reference, candidate, wanted):
     _lexical_metrics / _distance_metrics.
 
     * ``embedding_cosine`` — cosine of the two pooled unit vectors.
-    * ``bertscore_p/r/f1`` — greedy token-level BERTScore on the local backend;
-      on the remote backend (pooled vectors only) they fall back to the pooled
-      cosine, i.e. equal ``embedding_cosine``."""
+    * ``bertscore_p/r/f1`` — greedy token-level BERTScore, **local backend only**.
+      The remote /embeddings endpoint returns a single pooled vector per string,
+      and this dispatch scores one sentence against one item, so the cosine
+      matrix would be 1x1 and P, R and F1 would each collapse to the pooled
+      cosine — three columns duplicating ``embedding_cosine`` and telling you
+      nothing. They are therefore left None ("not measured") rather than filled
+      with a look-alike number. Same when the token embeddings are unavailable
+      for any other reason (e.g. they failed and the ladder could not recover)."""
     ecols = _emb_wanted(wanted)
     out = {c: None for c in ecols}
     if not ecols or not _EMB_CFG["enabled"]:
@@ -615,20 +650,14 @@ def _embedding_metrics(reference, candidate, wanted):
                       else round(mod.cosine(cv, rv), 4))
         if want_cos:
             out["embedding_cosine"] = pooled_cos
-        if bert_cols:
-            p = r = f1 = None
-            if _need_tokens():
-                rm, cm = _tok_mat(reference), _tok_mat(candidate)
-                if rm is not None and cm is not None and rm.size and cm.size:
-                    p, r, f1 = mod.greedy_bertscore(cm, rm)
-            if p is None:               # api backend / token path unavailable
-                p = r = f1 = pooled_cos
-            if "bertscore_p" in ecols:
-                out["bertscore_p"] = None if p is None else round(p, 4)
-            if "bertscore_r" in ecols:
-                out["bertscore_r"] = None if r is None else round(r, 4)
-            if "bertscore_f1" in ecols:
-                out["bertscore_f1"] = None if f1 is None else round(f1, 4)
+        if bert_cols and _need_tokens():
+            rm, cm = _tok_mat(reference), _tok_mat(candidate)
+            if rm is not None and cm is not None and rm.size and cm.size:
+                p, r, f1 = mod.greedy_bertscore(cm, rm)
+                for col, val in (("bertscore_p", p), ("bertscore_r", r),
+                                 ("bertscore_f1", f1)):
+                    if col in ecols:
+                        out[col] = None if val is None else round(val, 4)
     except Exception as e:  # noqa: BLE001 - guarded: one bad pair never aborts
         _warn_embeddings(f"scoring failed ({e})")
     return out
@@ -890,6 +919,16 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
         _warn_embeddings("an embedding metric is selected but embeddings are "
                          "not configured/enabled — recording None for it "
                          "(call configure_embeddings first).")
+    if (_EMB_CFG["enabled"] and not _need_tokens()
+            and any(m.startswith("bertscore") for m in metrics)):
+        msg = ("BERTScore needs token-level embeddings, which only the local "
+               "backend provides — the remote /embeddings endpoint returns one "
+               "pooled vector per string, so P/R/F1 could only echo "
+               "embedding_cosine. Leaving bertscore_* blank; use "
+               "embedding_cosine here, or switch the backend to 'local'.")
+        print(f"⚠️ {msg}")
+        if log:
+            log(f"⚠️ {msg}")
 
     df = pd.read_excel(file_path, sheet_name=run_sheet, engine="openpyxl")
     if "Section" not in df.columns:
@@ -1282,7 +1321,7 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
         if ucol not in df.columns:
             continue
         sub = df[[ucol, ccol]].dropna(subset=[ucol])
-        grounded = [str(el).lower() in combined for el in sub[ucol]]
+        grounded = [is_grounded(el, combined) for el in sub[ucol]]
         n_true, n = sum(grounded), len(grounded)
         pct = round(100.0 * n_true / n, 1) if n else None
         # Element | count | grounded, closed by a per-column coverage row.

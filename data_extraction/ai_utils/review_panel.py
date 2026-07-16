@@ -80,6 +80,12 @@ _EVAL_METRIC_OPTIONS = [
      ("bertscore_p", "bertscore_r", "bertscore_f1")),
 ]
 
+# BERTScore is local-backend-only: it needs one vector per TOKEN, and the remote
+# /embeddings endpoint returns a single pooled vector per string. The tab
+# disables this option on the API backend rather than let it silently duplicate
+# embedding_cosine (see _eval_sync_bertscore_state).
+_BERTSCORE_LABEL = "BERTScore (semantic P/R/F1)"
+
 # Uniques tab: UI label -> item separator inside one cell. ``None`` auto-detects
 # the most frequent among the common candidates; ``"custom"`` reads the free
 # text field so the user can type any separator (e.g. " / ", " and ").
@@ -1555,13 +1561,15 @@ class AIReviewMixin:
                                            "its reference text) ", padding=4)
         met_wrap.pack(fill="x", pady=(6, 0))
         self.eval_metric_vars = {}
+        self.eval_metric_btns = {}
         grid = ttk.Frame(met_wrap)
         grid.pack(fill="x")
         for i, (label, _names) in enumerate(_EVAL_METRIC_OPTIONS):
             var = tk.BooleanVar(value=True)
             self.eval_metric_vars[label] = var
-            ttk.Checkbutton(grid, text=label, variable=var).grid(
-                row=i % 4, column=i // 4, sticky="w", padx=(0, 18))
+            cb = ttk.Checkbutton(grid, text=label, variable=var)
+            cb.grid(row=i % 4, column=i // 4, sticky="w", padx=(0, 18))
+            self.eval_metric_btns[label] = cb
         self.eval_uniq_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(met_wrap, variable=self.eval_uniq_var,
                         text="Also evaluate the unique generated values "
@@ -1581,11 +1589,11 @@ class AIReviewMixin:
         self.eval_embed_backend = tk.StringVar(value="api")
         ttk.Radiobutton(emb_brow, text="Remote API", value="api",
                         variable=self.eval_embed_backend,
-                        command=self._eval_refresh_embed_models).pack(
+                        command=self._eval_backend_changed).pack(
             side="left", padx=(4, 8))
         ttk.Radiobutton(emb_brow, text="Local model", value="local",
                         variable=self.eval_embed_backend,
-                        command=self._eval_refresh_embed_models).pack(side="left")
+                        command=self._eval_backend_changed).pack(side="left")
         srow = ttk.Frame(emb_wrap)
         srow.pack(fill="x", pady=(4, 0))
         ttk.Label(srow, text="Service:").pack(side="left")
@@ -1605,9 +1613,11 @@ class AIReviewMixin:
                   text="The divided reference sentences and candidate items are "
                        "embedded in batches and compared by cosine similarity. "
                        "Leave Model blank to use the service's default embedding "
-                       "model. BERTScore is token-level on the local backend and "
-                       "falls back to item-level on the API.").pack(
-            anchor="w", pady=(2, 0))
+                       "model.").pack(anchor="w", pady=(2, 0))
+        self._eval_bertscore_note = ttk.Label(
+            emb_wrap, foreground="#666666", justify="left", text="")
+        self._eval_bertscore_note.pack(anchor="w")
+        self._eval_sync_bertscore_state()
 
         out_wrap = ttk.LabelFrame(ev, text=" Write results to ", padding=4)
         out_wrap.pack(fill="x", pady=(6, 0))
@@ -1666,6 +1676,41 @@ class AIReviewMixin:
             if self.eval_metric_vars[label].get():
                 metrics.extend(names)
         return metrics
+
+    def _eval_backend_changed(self):
+        """Embedding backend switched: BERTScore is local-only, so keep its
+        checkbox in step before refreshing the model list."""
+        self._eval_sync_bertscore_state()
+        self._eval_refresh_embed_models()
+
+    def _eval_sync_bertscore_state(self):
+        """Enable the BERTScore option only on the local backend.
+
+        BERTScore needs one vector per TOKEN. The remote /embeddings endpoint
+        returns a single pooled vector per string, and each evaluation scores one
+        sentence against one item — so the cosine matrix would be 1x1 and P, R
+        and F1 would each collapse to the pooled cosine, i.e. three columns
+        identical to embedding_cosine. Rather than write those look-alike
+        numbers, the option is unticked and greyed out on the API backend (and
+        column_evaluator records None if it is forced on some other way)."""
+        btn = getattr(self, "eval_metric_btns", {}).get(_BERTSCORE_LABEL)
+        note = getattr(self, "_eval_bertscore_note", None)
+        if btn is None:
+            return
+        if self.eval_embed_backend.get() == "local":
+            btn.configure(state="normal")
+            if note is not None:
+                note.configure(
+                    text="BERTScore: true token-level P/R/F1 from the local "
+                         "model.")
+        else:
+            self.eval_metric_vars[_BERTSCORE_LABEL].set(False)
+            btn.configure(state="disabled")
+            if note is not None:
+                note.configure(
+                    text="BERTScore needs token-level embeddings → local backend "
+                         "only. The remote API returns one pooled vector per "
+                         "string, so P/R/F1 could only repeat the cosine.")
 
     def _embedding_config_for(self, metrics):
         """Embedding config dict for column_evaluator (backend/service/model +
