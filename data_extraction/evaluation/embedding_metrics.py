@@ -102,6 +102,103 @@ def _np():
 # ---------------------------------------------------------------------------
 # Low-level embedding helpers (pooled, one vector per input string)
 # ---------------------------------------------------------------------------
+# Failure ladder for embedding calls
+# ---------------------------------------------------------------------------
+# A local embedding call that dies almost always dies of a CUDA OOM: the whole
+# pool of strings is padded to the longest one and pushed through an 8B model in
+# a single forward pass, so one long sentence can blow the batch. A remote call
+# dies for the mirror-image reason (payload too large / gateway timeout).
+# Either way the fix is the same: send fewer strings per call. So a failing call
+# is retried down a ladder --
+#     1. the whole pool in one call        (fast path, what succeeds normally)
+#     2. batches of EMBED_FALLBACK_BATCH   (default 10)
+#     3. one string at a time              (last resort)
+# -- keeping whatever each rung manages to embed. Strings that fail even alone
+# are reported and simply left un-embedded: their metrics stay blank (None)
+# rather than being faked with a zero vector, which would score as 0.0
+# similarity and read as "totally dissimilar" instead of "not measured".
+EMBED_FALLBACK_BATCH = 10
+
+# Set False to silence the per-rung retry messages.
+EMBED_VERBOSE = True
+
+
+def _log(msg):
+    if EMBED_VERBOSE:
+        print(f"⚠️ embedding_metrics: {msg}")
+
+
+def _cuda_recover():
+    """Release cached CUDA blocks between rungs. After an OOM the allocator is
+    still holding the cache that caused it, so a retry has no chance until it is
+    emptied. No-op when torch/CUDA are absent (e.g. the API backend)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
+
+
+def _ladder(items, call_fn, batch=None, what="embedding"):
+    """Run ``call_fn(chunk)`` (returning a sequence aligned with ``chunk``) down
+    the whole-pool -> batches -> individual ladder described above.
+
+    Returns ``(results, failed)`` where ``results`` is a list aligned with
+    ``items``, holding ``None`` for anything that could not be embedded, and
+    ``failed`` is how many of those there are.
+    """
+    n = len(items)
+    out = [None] * n
+    batch = max(1, int(batch or EMBED_FALLBACK_BATCH))
+
+    # Rung 1: the whole pool in one call.
+    try:
+        res = call_fn(items)
+        return [res[i] for i in range(n)], 0
+    except Exception as exc:  # noqa: BLE001
+        nxt = (f"retrying in batches of {batch}" if n > batch
+               else "retrying one string at a time")
+        _log(f"{what}: pool of {n} string(s) failed ({exc}); {nxt}")
+    _cuda_recover()
+
+    # Rung 2: batches of `batch` (skipped when the pool is already that small --
+    # rung 1 has just tried exactly that call).
+    if n > batch:
+        for start in range(0, n, batch):
+            chunk = items[start:start + batch]
+            try:
+                res = call_fn(chunk)
+                for k in range(len(chunk)):
+                    out[start + k] = res[k]
+            except Exception as exc:  # noqa: BLE001 - next batch may still work
+                _log(f"{what}: batch {start + 1}-{start + len(chunk)} failed "
+                     f"({exc})")
+                _cuda_recover()
+        if all(o is not None for o in out):
+            return out, 0
+        _log(f"{what}: retrying the remaining string(s) one at a time")
+
+    # Rung 3: one string at a time, for whatever is still missing.
+    for i, item in enumerate(items):
+        if out[i] is not None:
+            continue
+        try:
+            res = call_fn([item])
+            out[i] = res[0]
+        except Exception as exc:  # noqa: BLE001 - guarded: skip this string
+            _log(f"{what}: string #{i + 1} failed on its own ({exc})")
+            _cuda_recover()
+
+    failed = sum(1 for o in out if o is None)
+    if failed:
+        _log(f"{what}: {failed} of {n} string(s) could not be embedded — "
+             f"their metrics stay blank")
+    return out, failed
+
+
+# ---------------------------------------------------------------------------
 def _l2_normalize(mat):
     """Row-wise L2 normalise an (N, dim) array; zero rows are left as zeros."""
     np = _np()
@@ -131,15 +228,59 @@ def embed_texts(
         "local" -> llm_utils.vectorize_strings_local(list)
                    (local HuggingFace model; already L2-normalised).
 
-    Returns an empty (0, 0) array for empty input. Never raises for an empty
-    list; backend/HTTP errors from llm_utils propagate to the caller, which is
-    expected to guard them (see semantic_scores()).
+    A failing call is retried down the ladder in :func:`_ladder` (whole pool ->
+    batches of EMBED_FALLBACK_BATCH -> one string at a time), so a CUDA OOM on a
+    big pool degrades into smaller passes instead of losing the row.
+
+    Returns an empty (0, 0) array for empty input. Rows are aligned with the
+    non-blank inputs, so this raises RuntimeError if any string could not be
+    embedded even alone — the caller is expected to guard it (see
+    :func:`semantic_scores`). Use :func:`embed_texts_map` when partial results
+    are usable.
     """
     np = _np()
     items = [str(t) for t in (texts or []) if str(t).strip() != ""]
     if not items:
         return np.zeros((0, 0), dtype=np.float32)
 
+    vectors, failed = _ladder(
+        items, lambda chunk: _embed_call(chunk, backend, service, model, api_key),
+        what="pooled embedding")
+    if failed:
+        raise RuntimeError(
+            f"{failed} of {len(items)} string(s) could not be embedded "
+            f"(backend={backend}); see the messages above.")
+    return np.stack(vectors).astype(np.float32)
+
+
+def embed_texts_map(
+    texts: Sequence[str],
+    backend: str = "api",
+    service: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+):
+    """``{text: unit vector}`` for every string that could be embedded, using the
+    same ladder as :func:`embed_texts` but **keeping partial results**: a string
+    that fails even on its own is simply absent from the mapping, so the caller
+    can score everything else and leave that one blank.
+
+    Duplicates are embedded once. This is what the per-run cache in
+    column_evaluator fills itself from.
+    """
+    items = list(dict.fromkeys(
+        str(t) for t in (texts or []) if str(t).strip() != ""))
+    if not items:
+        return {}
+    vectors, _failed = _ladder(
+        items, lambda chunk: _embed_call(chunk, backend, service, model, api_key),
+        what="pooled embedding")
+    return {t: v for t, v in zip(items, vectors) if v is not None}
+
+
+def _embed_call(items, backend, service, model, api_key):
+    """One raw embedding call for ``items`` — no retry, no guarding. The unit of
+    work the ladder retries at ever-smaller sizes."""
     lu = _llm_utils()
     b = (backend or "api").lower()
 
@@ -275,17 +416,8 @@ def semantic_cosine(
 # ---------------------------------------------------------------------------
 # Local per-token embeddings (for TRUE token-level BERTScore)
 # ---------------------------------------------------------------------------
-def _token_embed_local(texts: Sequence[str], max_length: int = 512):
-    """
-    Per-TOKEN contextual embeddings for each string, using the SAME local model
-    that llm_utils loads (reuses its cached model/tokenizer - no reload, no new
-    weights). Returns a list of L2-normalised (n_tokens_i, dim) arrays, one per
-    input string, with padding removed.
-
-    This is what makes real (token-level) BERTScore possible on the local
-    backend. The remote /embeddings endpoint only returns pooled vectors, so it
-    cannot supply this.
-    """
+def _token_embed_call(texts: Sequence[str], max_length: int = 512):
+    """One raw per-token embedding call — the unit the ladder retries."""
     np = _np()
     import torch
     import torch.nn.functional as F
@@ -321,6 +453,34 @@ def _token_embed_local(texts: Sequence[str], max_length: int = 512):
             per_text.append(valid if valid.size else np.zeros((0, hidden.shape[2]),
                                                               dtype=np.float32))
     return per_text
+
+
+def _token_embed_local(texts: Sequence[str], max_length: int = 512):
+    """
+    Per-TOKEN contextual embeddings for each string, using the SAME local model
+    that llm_utils loads (reuses its cached model/tokenizer - no reload, no new
+    weights). Returns a list of L2-normalised (n_tokens_i, dim) arrays, one per
+    input string, with padding removed.
+
+    This is what makes real (token-level) BERTScore possible on the local
+    backend. The remote /embeddings endpoint only returns pooled vectors, so it
+    cannot supply this.
+
+    Token embeddings are far heavier than pooled ones (every token is kept, not
+    just one vector per string), so this is the most OOM-prone call in the
+    module and runs down the same ladder as :func:`embed_texts`. A string that
+    fails even alone gets an empty (0, dim) array, which the callers already
+    treat as "no token data" and fall back to the pooled cosine for.
+    """
+    np = _np()
+    items = [str(t) for t in texts]
+    if not items:
+        return []
+    mats, _failed = _ladder(
+        items, lambda chunk: _token_embed_call(chunk, max_length=max_length),
+        what="token embedding")
+    return [m if m is not None else np.zeros((0, 0), dtype=np.float32)
+            for m in mats]
 
 
 def _stack_tokens(per_text):

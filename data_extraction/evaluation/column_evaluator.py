@@ -451,6 +451,7 @@ _EMB_CFG = {
 }
 _EMB_POOL_CACHE = {}         # text -> pooled unit vector (np.ndarray)
 _EMB_TOK_CACHE = {}          # text -> token matrix (np.ndarray), local only
+_EMB_FAILED = set()          # texts the backend could not embed (never retried)
 _EMB_CACHE_CAP = 5000        # drop the caches past this many texts (bound RAM)
 _EMB_WARNED = False          # warn about a backend failure only once per run
 
@@ -495,6 +496,7 @@ def _reset_embedding_cache():
     global _EMB_WARNED
     _EMB_POOL_CACHE.clear()
     _EMB_TOK_CACHE.clear()
+    _EMB_FAILED.clear()
     _EMB_WARNED = False
 
 
@@ -526,23 +528,35 @@ def _cap_cache(cache):
 def _pre_embed(texts, tokens=False):
     """Batch-embed any not-yet-cached texts into the per-run caches. One request
     per batch (not per pair) keeps the rate limiter/pre-delay from firing
-    repeatedly. ``tokens=True`` also fills the token cache when it is needed."""
+    repeatedly. ``tokens=True`` also fills the token cache when it is needed.
+
+    embedding_metrics retries a failing call in smaller batches and then string
+    by string, so a partial result is normal: whatever came back is cached, and
+    anything that could not be embedded is remembered in ``_EMB_FAILED`` so the
+    per-pair lookups below neither retry it nor score it."""
     if not _EMB_CFG["enabled"]:
         return
     mod = _embedding_metrics_mod()
     if mod is None:
         return
     seen = {str(t) for t in texts if str(t).strip()}
-    todo = [t for t in seen if t not in _EMB_POOL_CACHE]
+    todo = [t for t in seen
+            if t not in _EMB_POOL_CACHE and t not in _EMB_FAILED]
     if todo:
         try:
-            vecs = mod.embed_texts(todo, backend=_EMB_CFG["backend"],
-                                   service=_EMB_CFG["service"],
-                                   model=_EMB_CFG["model"],
-                                   api_key=_EMB_CFG["api_key"])
-            for t, v in zip(todo, vecs):
-                _EMB_POOL_CACHE[t] = v
+            got = mod.embed_texts_map(todo, backend=_EMB_CFG["backend"],
+                                      service=_EMB_CFG["service"],
+                                      model=_EMB_CFG["model"],
+                                      api_key=_EMB_CFG["api_key"])
+            _EMB_POOL_CACHE.update(got)
+            missing = [t for t in todo if t not in got]
+            if missing:
+                _EMB_FAILED.update(missing)
+                _warn_embeddings(f"{len(missing)} of {len(todo)} string(s) could "
+                                 f"not be embedded even individually — their "
+                                 f"metrics stay blank")
         except Exception as e:  # noqa: BLE001 - guarded
+            _EMB_FAILED.update(todo)
             _warn_embeddings(f"pooled embedding failed ({e})")
     _cap_cache(_EMB_POOL_CACHE)
     if tokens and _need_tokens():
@@ -560,7 +574,7 @@ def _pre_embed(texts, tokens=False):
 def _pool_vec(text):
     t = str(text)
     v = _EMB_POOL_CACHE.get(t)
-    if v is None:
+    if v is None and t not in _EMB_FAILED:
         _pre_embed([t])                 # on-demand fallback (pre-embed avoids it)
         v = _EMB_POOL_CACHE.get(t)
     return v
