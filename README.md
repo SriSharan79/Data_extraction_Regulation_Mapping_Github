@@ -137,10 +137,23 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     Excel / JSON — is the export format) and writes them there automatically
     when the run finishes; cancel the dialog to abort the run.
   - *Column analysis* — define **columns** (name + what the LLM should
-    extract); a live **prompt preview** rebuilds as you add/edit/remove them.
+    extract); the definitions (and their ✓ unique-element checks) are
+    **remembered across sessions** (saved to
+    `~/.data_extraction/column_analysis_columns.json` on every change), so
+    closing and reopening the studio brings them back. A live **prompt
+    preview** rebuilds as you add/edit/remove them
+    and is **editable**: whatever you type above the `---` marker is sent as
+    the prompt of the next run (changing the column definitions rebuilds it).
     Each queued section is analyzed into one table row per section with one
     cell per column (the model is asked for strict JSON; unparseable replies
-    are surfaced as `[unparsed]`). Every analysis first asks for a **storage
+    are surfaced as `[unparsed]`). Starting an analysis first asks **how to
+    call the LLM**: *one call per section* (all columns in a single JSON
+    answer) or *one call per column value* (each column of a section is its
+    own focused LLM call; non-JSON replies are kept as the raw value). While
+    a run is going, **Pause / Resume / Stop** buttons next to *Analyze
+    queued* control it: pausing waits after the current LLM call, stopping
+    ends the run after it — every row already saved (and its evaluation)
+    is kept. Every analysis also asks for a **storage
     file**: choosing the *same* `.xlsx` again adds each new run as its own
     snapshot sheet (`Run N <timestamp>`) holding all sections of that batch,
     so one workbook accumulates the whole history (CSV/JSON hold the latest

@@ -5,7 +5,8 @@ Reusable AI-review workbench (mixin) shared by the review UIs.
 queue, the free-form review mode (presets, answer-format directive,
 pre-run storage dialog with per-result auto-save, export) and the
 column-analysis mode (column definitions with unique-element checkboxes,
-live prompt preview, row-by-row saving into an accumulating Excel
+live editable prompt preview, per-section or per-column LLM calls,
+pause/resume/stop, row-by-row saving into an accumulating Excel
 workbook with per-run snapshot sheets and Uniq sheets via
 scripts/excel_file_utils, table export), the evaluation tab (run the
 selected checks — substring grounding, Jaccard, ROUGE, BLEU, Levenshtein,
@@ -30,6 +31,7 @@ import json
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -101,6 +103,18 @@ _UNIQ_SEPARATORS = [
 # Candidates tried when auto-detecting a cell's separator.
 _UNIQ_AUTO_CANDIDATES = (";", "|", "\n", "\t", ",")
 
+# The column definitions of the Column-analysis tab persist here (same config
+# folder as the API keys) so they survive closing and reopening the studios.
+def _col_config_path():
+    from .file_manager import ALR_main_folder
+    return Path(ALR_main_folder) / "column_analysis_columns.json"
+
+
+# Placeholder appended to the editable prompt preview; everything above the
+# "---" line is the prompt head, the placeholder is replaced by the real
+# section at run time.
+_PREVIEW_TAIL = "\n\n---\nSECTION: <title>\n\n<section text>"
+
 _EXCEL_UTILS = None
 
 
@@ -131,6 +145,7 @@ class AIReviewMixin:
         self._col_results = []        # column-analysis rows (dicts) for export
         self._col_table_cols = []     # column names currently shown in the table
         self._col_uniq_checked = {name for name, _ in self._ai_columns}
+        self._col_load_columns()      # restore the previous session's columns
         self._col_run_uniq_cols = []  # checked columns snapshotted at run start
         self._ai_autosave_path = None # where the current free-form run auto-saves
         self._ai_run_start = 0        # index of the first result of the current run
@@ -145,6 +160,8 @@ class AIReviewMixin:
         self._col_run_eval_metrics = []  # evaluations chosen for this run
         self._col_run_eval_uniq = False  # also evaluate unique values per row
         self._col_eval_entries = []   # per-section evaluations of this run
+        self._col_pause_ev = threading.Event()  # set = worker pauses
+        self._col_stop_ev = threading.Event()   # set = worker stops ASAP
         self._eval_busy = False       # an evaluation is running
         self._uniq_busy = False       # a manual unique-elements run is in progress
         self._uniq_col_vars = {}      # {column name: BooleanVar} for the Uniques tab
@@ -338,16 +355,24 @@ class AIReviewMixin:
         ttk.Button(edit, text="Remove", command=self._col_remove).pack(side="left", padx=4)
         ttk.Button(edit, text="Clear all", command=self._col_clear).pack(side="left")
 
-        prev_wrap = ttk.LabelFrame(top, text=" Prompt preview (sent per section) ", padding=4)
+        prev_wrap = ttk.LabelFrame(
+            top, text=" Prompt preview (editable — sent per section) ", padding=4)
         top.add(prev_wrap, weight=1)
-        self.col_preview = scrolledtext.ScrolledText(prev_wrap, height=5, wrap="word",
-                                                     state="disabled")
+        # Editable: the text above the "---" marker is used as the prompt head
+        # of the next run. Changing the column definitions rebuilds it.
+        self.col_preview = scrolledtext.ScrolledText(prev_wrap, height=5, wrap="word")
         self.col_preview.pack(fill="both", expand=True)
 
         run_row = ttk.Frame(ca)
         run_row.pack(fill="x", pady=6)
         self.col_run_btn = ttk.Button(run_row, text="Analyze queued (0)", command=self._col_run)
         self.col_run_btn.pack(side="left")
+        self.col_pause_btn = ttk.Button(run_row, text="Pause", state="disabled",
+                                        command=self._col_pause_resume)
+        self.col_pause_btn.pack(side="left", padx=(6, 0))
+        self.col_stop_btn = ttk.Button(run_row, text="Stop", state="disabled",
+                                       command=self._col_stop)
+        self.col_stop_btn.pack(side="left", padx=(4, 0))
         # When on, Analyze queued first asks which evaluations to run
         # automatically once the batch finishes (see the Evaluation tab).
         self.eval_auto_var = tk.BooleanVar(value=True)
@@ -714,20 +739,50 @@ class AIReviewMixin:
         self.eval_run_btn.configure(state=state)
 
     # ------------------------------------------------- AI column analysis -- #
+    def _col_load_columns(self):
+        """Restore the column definitions saved by a previous session, if any.
+        A missing/broken config file just keeps the built-in defaults."""
+        try:
+            path = _col_config_path()
+            if not path.exists():
+                return
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if "columns" not in data:
+                return
+            cols = [(str(n), str(w)) for n, w in data["columns"] if str(n)]
+            self._ai_columns = cols   # may be empty: "Clear all" also persists
+            names = {n for n, _ in cols}
+            self._col_uniq_checked = {
+                str(n) for n in data.get("uniq_checked", []) if str(n) in names}
+        except Exception:  # noqa: BLE001 - never block startup on the config
+            pass
+
+    def _col_save_columns(self):
+        """Persist the current column definitions (and their ✓ unique-element
+        checks) so they are back after closing and reopening the studio."""
+        try:
+            path = _col_config_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"columns": [list(c) for c in self._ai_columns],
+                           "uniq_checked": sorted(self._col_uniq_checked)},
+                          f, indent=2, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 - saving is best-effort
+            self.status_var.set(f"Could not save the column definitions: {exc}")
+
     def _col_refresh_defs(self):
         """Redraw the column-definition list and the live prompt preview."""
         self.col_defs.delete(*self.col_defs.get_children())
         for name, what in self._ai_columns:
             glyph = "☑" if name in self._col_uniq_checked else "☐"
             self.col_defs.insert("", "end", text=name, values=(glyph, what))
-        self.col_preview.configure(state="normal")
         self.col_preview.delete("1.0", tk.END)
         if self._ai_columns:
             self.col_preview.insert("1.0", self._col_prompt_text()
-                                    + "\n\n---\nSECTION: <title>\n\n<section text>")
+                                    + _PREVIEW_TAIL)
         else:
             self.col_preview.insert("1.0", "Add at least one column to build the prompt.")
-        self.col_preview.configure(state="disabled")
 
     def _col_prompt_text(self):
         lines = ["Analyze the regulatory section below and extract the following data.",
@@ -738,6 +793,17 @@ class AIReviewMixin:
         lines.append('Use "" for any value the section does not contain.')
         lines.append('Use ";" for multiple values the section does contain.')
         return "\n".join(lines)
+
+    def _col_prompt_head(self):
+        """Prompt head actually sent: the preview text above the "---" marker,
+        so user edits made in the preview box are honoured. Falls back to the
+        generated prompt when the box was emptied or still shows the
+        no-columns placeholder."""
+        text = self.col_preview.get("1.0", "end-1c")
+        head = text.split("\n---\n", 1)[0].strip()
+        if not head or head.startswith("Add at least one column"):
+            return self._col_prompt_text()
+        return head
 
     def _col_on_select(self, event=None):
         sel = self.col_defs.selection()
@@ -766,6 +832,7 @@ class AIReviewMixin:
         else:
             self._col_uniq_checked.add(name)
         self.col_defs.set(iid, "uniq", "☑" if name in self._col_uniq_checked else "☐")
+        self._col_save_columns()
         return "break"
 
     def _col_toggle_uniq_all(self):
@@ -775,6 +842,7 @@ class AIReviewMixin:
             self._col_uniq_checked -= names
         else:
             self._col_uniq_checked |= names
+        self._col_save_columns()
         self._col_refresh_defs()
 
     def _col_add_update(self):
@@ -790,6 +858,7 @@ class AIReviewMixin:
         else:
             self._ai_columns.append((name, what))
             self._col_uniq_checked.add(name)   # new columns collect uniques by default
+        self._col_save_columns()
         self._col_refresh_defs()
 
     def _col_remove(self):
@@ -798,11 +867,13 @@ class AIReviewMixin:
             return
         self._ai_columns = [(n, w) for n, w in self._ai_columns if n not in names]
         self._col_uniq_checked -= names
+        self._col_save_columns()
         self._col_refresh_defs()
 
     def _col_clear(self):
         self._ai_columns = []
         self._col_uniq_checked.clear()
+        self._col_save_columns()
         self._col_refresh_defs()
 
     def _col_run(self):
@@ -817,8 +888,16 @@ class AIReviewMixin:
                                 "Add sections to the queue first (current node or checked nodes).")
             return
         jobs = list(self._ai_batch)
-        columns = [name for name, _ in self._ai_columns]
-        prompt_head = self._col_prompt_text()
+        col_defs = list(self._ai_columns)
+        columns = [name for name, _ in col_defs]
+        # The preview box is editable — send what it shows, not the template.
+        prompt_head = self._col_prompt_head()
+
+        # One combined call per section, or one call per column value?
+        per_col = self._col_ask_call_mode()
+        if per_col is None:
+            self.status_var.set("Column analysis cancelled.")
+            return
 
         # Always pick the storage file first. Re-choosing the same .xlsx appends
         # this run as a new snapshot sheet instead of overwriting.
@@ -876,55 +955,155 @@ class AIReviewMixin:
 
         self._ai_busy = True
         self._ai_set_busy_buttons("disabled")
+        self._col_pause_ev.clear()
+        self._col_stop_ev.clear()
+        self.col_pause_btn.configure(state="normal", text="Pause")
+        self.col_stop_btn.configure(state="normal")
         self._col_q = queue.Queue()
         self._ai_progress_start(len(jobs))
         self._ai_log(f"=== Column analysis: {len(jobs)} section(s) → "
                      f"columns [{', '.join(columns)}] via {service_label} "
-                     f"({model or 'default'}), store: {os.path.basename(store)} ===")
+                     f"({model or 'default'}), "
+                     + ("one LLM call per column value, "
+                        if per_col else "one LLM call per section, ")
+                     + f"store: {os.path.basename(store)} ===")
         self._ai_log("Auto-evaluation: "
                      + (f"[{', '.join(self._col_run_eval_metrics)}]"
                         + (" + unique values" if self._col_run_eval_uniq else "")
                         if auto_eval else "off"))
         self.status_var.set(f"Analyzing {len(jobs)} section(s) into {len(columns)} column(s)…")
         threading.Thread(target=self._col_worker,
-                         args=(jobs, columns, prompt_head, service, model),
+                         args=(jobs, col_defs, prompt_head, service, model, per_col),
                          daemon=True).start()
         self.root.after(150, self._col_poll)
 
-    def _col_worker(self, jobs, columns, prompt_head, service, model):
+    def _col_ask_call_mode(self):
+        """Modal: one combined LLM call per section (all columns in one JSON)
+        or one LLM call per column value. Returns True for per-column,
+        False for per-section, None if the user cancelled."""
+        win = tk.Toplevel(self.root)
+        win.title("LLM calls")
+        win.transient(self.root.winfo_toplevel())
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="How should the values be requested from the LLM?"
+                  ).pack(anchor="w")
+        mode = tk.StringVar(value="section")
+        ttk.Radiobutton(
+            frm, variable=mode, value="section",
+            text="One call per section — all columns in a single JSON answer "
+                 "(faster, fewer calls)").pack(anchor="w", pady=(8, 2))
+        ttk.Radiobutton(
+            frm, variable=mode, value="column",
+            text="One call per column value — each column of a section is a "
+                 "separate LLM call (slower, more focused)").pack(anchor="w")
+        result = {"value": None}
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(12, 0))
+
+        def _ok():
+            result["value"] = mode.get() == "column"
+            win.destroy()
+        ttk.Button(btns, text="OK — start the analysis", command=_ok
+                   ).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=win.destroy
+                   ).pack(side="left", padx=8)
+        win.grab_set()
+        win.wait_window()
+        return result["value"]
+
+    def _col_wait_if_paused(self):
+        """Worker helper: block while paused; False = the run was stopped."""
+        while self._col_pause_ev.is_set() and not self._col_stop_ev.is_set():
+            time.sleep(0.2)
+        return not self._col_stop_ev.is_set()
+
+    @staticmethod
+    def _col_single_prompt(name, what):
+        """Prompt head asking for exactly one column value."""
+        return (
+            "Analyze the regulatory section below and extract one value.\n"
+            "Return ONLY one valid JSON object with exactly this key "
+            "(no code fences, no commentary):\n"
+            f'- "{name}": {what or "extract this value"}\n'
+            'Use "" if the section does not contain it.\n'
+            'Use ";" for multiple values the section does contain.')
+
+    def _col_worker(self, jobs, col_defs, prompt_head, service, model, per_col):
         try:
             from data_extraction.ai_utils.llm_utils import llm_call
         except Exception as exc:  # noqa: BLE001
             self._col_q.put(("error", f"Could not load LLM utilities: {exc}"))
             self._col_q.put(None)
             return
+        columns = [name for name, _ in col_defs]
+
+        def _norm(v):
+            if isinstance(v, (list, tuple)):
+                return "; ".join(str(x) for x in v)
+            if isinstance(v, dict):
+                return json.dumps(v, ensure_ascii=False)
+            return "" if v is None else str(v)
+
         for i, (title, text) in enumerate(jobs, 1):
-            prompt = f"{prompt_head}\n\n---\nSECTION: {title}\n\n{text}"
+            if not self._col_wait_if_paused():
+                self._col_q.put(("stopped", i - 1))
+                break
             self._ai_log_bg(f"▶ [{i}/{len(jobs)}] Analyzing '{title}' "
                             f"({len(text or '')} chars): {self._ai_preview(text)}")
-            self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
-                            f"{self._ai_preview(prompt)}")
-            try:
-                resp = llm_call(prompt, None, service, model)
-            except Exception as exc:  # noqa: BLE001
-                resp = None
-                parsed = {columns[0]: f"[ERROR] {exc}"}
-                self._ai_log_bg(f"← LLM call failed: {exc}")
-            else:
-                self._ai_log_bg(f"← Response ({len(str(resp or ''))} chars): "
-                                f"{self._ai_preview(resp)}")
-                parsed = self._parse_llm_json(resp)
-                if parsed is None:
-                    parsed = {columns[0]: f"[unparsed] {resp}"}
-                    self._ai_log_bg("   response was not valid JSON — kept as [unparsed]")
             row = {"Section": title}
-            for c in columns:
-                v = parsed.get(c, "")
-                if isinstance(v, (list, tuple)):
-                    v = "; ".join(str(x) for x in v)
-                elif isinstance(v, dict):
-                    v = json.dumps(v, ensure_ascii=False)
-                row[c] = "" if v is None else str(v)
+            if per_col:
+                stopped = False
+                for name, what in col_defs:
+                    if not self._col_wait_if_paused():
+                        stopped = True
+                        break
+                    prompt = (f"{self._col_single_prompt(name, what)}"
+                              f"\n\n---\nSECTION: {title}\n\n{text}")
+                    self._ai_log_bg(f"→ [column '{name}'] Sent to LLM "
+                                    f"({len(prompt)} chars): {self._ai_preview(prompt)}")
+                    try:
+                        resp = llm_call(prompt, None, service, model)
+                    except Exception as exc:  # noqa: BLE001
+                        row[name] = f"[ERROR] {exc}"
+                        self._ai_log_bg(f"← [column '{name}'] LLM call failed: {exc}")
+                        continue
+                    self._ai_log_bg(f"← [column '{name}'] Response "
+                                    f"({len(str(resp or ''))} chars): "
+                                    f"{self._ai_preview(resp)}")
+                    parsed = self._parse_llm_json(resp)
+                    if parsed is None:
+                        row[name] = _norm(resp).strip()
+                        self._ai_log_bg(f"   [column '{name}'] response was not "
+                                        "valid JSON — kept the raw text")
+                    else:
+                        # accept the expected key, else the only/first value
+                        v = parsed.get(name)
+                        if v is None and parsed:
+                            v = next(iter(parsed.values()))
+                        row[name] = _norm(v)
+                if stopped:
+                    self._col_q.put(("stopped", i - 1))
+                    break
+            else:
+                prompt = f"{prompt_head}\n\n---\nSECTION: {title}\n\n{text}"
+                self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
+                                f"{self._ai_preview(prompt)}")
+                try:
+                    resp = llm_call(prompt, None, service, model)
+                except Exception as exc:  # noqa: BLE001
+                    parsed = {columns[0]: f"[ERROR] {exc}"}
+                    self._ai_log_bg(f"← LLM call failed: {exc}")
+                else:
+                    self._ai_log_bg(f"← Response ({len(str(resp or ''))} chars): "
+                                    f"{self._ai_preview(resp)}")
+                    parsed = self._parse_llm_json(resp)
+                    if parsed is None:
+                        parsed = {columns[0]: f"[unparsed] {resp}"}
+                        self._ai_log_bg("   response was not valid JSON — kept as [unparsed]")
+                for c in columns:
+                    row[c] = _norm(parsed.get(c, ""))
             self._col_q.put(("row", row))
         self._col_q.put(None)
 
@@ -949,8 +1128,13 @@ class AIReviewMixin:
                 if item is None:
                     self._ai_busy = False
                     self._ai_set_busy_buttons("normal")
+                    self.col_pause_btn.configure(state="disabled", text="Pause")
+                    self.col_stop_btn.configure(state="disabled")
                     self._ai_progress_done()
-                    done = f"Column analysis complete — {len(self._col_results)} row(s)"
+                    done = ("Column analysis stopped"
+                            if self._col_stop_ev.is_set()
+                            else "Column analysis complete")
+                    done += f" — {len(self._col_results)} row(s)"
                     if self._col_store_path and self._col_rows_saved:
                         done += f", saved to {os.path.basename(self._col_store_path)}"
                         if self._col_run_sheet:
@@ -964,6 +1148,9 @@ class AIReviewMixin:
                 if kind == "error":
                     messagebox.showerror("Column analysis", payload)
                     self._ai_log(f"[ERROR] {payload}")
+                elif kind == "stopped":
+                    self._ai_log(f"■ Analysis stopped by the user after "
+                                 f"{payload} completed section(s).")
                 else:
                     self._col_results.append(payload)
                     self.col_table.insert("", "end", values=[
@@ -973,6 +1160,34 @@ class AIReviewMixin:
         except queue.Empty:
             pass
         self.root.after(150, self._col_poll)
+
+    def _col_pause_resume(self):
+        """Toggle the pause of the running analysis (before the next LLM call)."""
+        if not self._ai_busy:
+            return
+        if self._col_pause_ev.is_set():
+            self._col_pause_ev.clear()
+            self.col_pause_btn.configure(text="Pause")
+            self._ai_log("▶ Analysis resumed.")
+            self.status_var.set("Column analysis resumed.")
+        else:
+            self._col_pause_ev.set()
+            self.col_pause_btn.configure(text="Resume")
+            self._ai_log("⏸ Analysis paused — the current LLM call still "
+                         "finishes, then the run waits.")
+            self.status_var.set("Column analysis paused.")
+
+    def _col_stop(self):
+        """Stop the running analysis after the current LLM call; already
+        saved rows (and their evaluations) are kept."""
+        if not self._ai_busy:
+            return
+        self._col_stop_ev.set()
+        self._col_pause_ev.clear()   # unblock a paused worker so it can exit
+        self.col_stop_btn.configure(state="disabled")
+        self.col_pause_btn.configure(state="disabled", text="Pause")
+        self._ai_log("■ Stop requested — finishing the current LLM call…")
+        self.status_var.set("Stopping the column analysis…")
 
     def _col_show_row(self, event=None):
         sel = self.col_table.selection()
