@@ -59,7 +59,8 @@ against the combined reference text of the run's sections into a
 Columns that hold cross-references (name contains ``reference`` — see
 ``_REFERENCE_COLUMN_HINTS``) get one extra pass: each unique value is matched
 against the **section titles** (``match_sections``). Values that start with a
-CS / AMC / GM rule identifier (``AMC 25.21(g)(a)``) are matched by that
+rule identifier — a 2-3 capital-letter prefix such as CS / AMC / GM / SC plus a
+``dd.dd``-``dd.dddd`` number (``AMC 25.21(g)(a)``) — are matched by that
 identifier alone, by regex, so qualifiers and trailing prose are ignored and
 ``AMC 25.21`` never lands on ``AMC 25.219``; any other value is stripped of its
 ``(…)`` qualifiers and matched as a case-insensitive substring in either
@@ -148,23 +149,38 @@ _REF_MATCH_MIN_CHARS = 3
 # ("(a(b))") are removed too.
 _PARENTHETICAL = re.compile(r"\([^()]*\)")
 
-# CS / AMC / GM rule identifiers ("CS 25.1309", "AMC 25.21", "GM 26.30") are
-# matched by their identifier alone rather than as raw substrings: the prefix,
-# whitespace, a 1-2 character book/part number, a dot and a 1-4 digit rule
-# number. Anchored at the start, so only values that *begin* with CS/AMC/GM take
-# this path; anything else (and CS/AMC/GM values that do not fit the format, e.g.
-# "GM 21.A.14", whose "A" is not a digit) falls back to substring matching.
-# Trailing qualifiers and prose after the identifier are ignored.
-_RULE_ID = re.compile(r"^\s*(CS|AMC|GM)\s+([A-Za-z0-9]{1,2})\.(\d{1,4})(?!\d)",
-                      re.IGNORECASE)
+# Rule identifiers ("CS 25.1309", "AMC 25.21", "GM 26.30") are matched by their
+# identifier alone rather than as raw substrings. The prefix is no longer a
+# hard-coded CS/AMC/GM list but any 2-3 **capital letters** ("CS", "AMC", "GM",
+# "SC", "CRI", …), followed by whitespace, a 2-digit book/part number, a dot
+# and a 2-4 digit rule number. Anchored at the
+# start, so only values that *begin* with such an identifier take this path;
+# anything else (and values that do not fit the digit format, e.g. "GM 21.A.14",
+# whose "A" is not a digit, or "CS 1.5", whose parts are too short) falls back
+# to substring matching. The prefix must genuinely be upper-case — no IGNORECASE
+# here, or ordinary lowercase words ("and 25.21 …") would be taken for rule
+# prefixes. Trailing qualifiers and prose after the identifier are ignored.
+_RULE_ID = re.compile(r"^\s*([A-Z]{2,3})\s+(\d{2})\.(\d{2,4})(?!\d)")
 
-# Detects whether the section titles themselves are written with CS/AMC/GM
-# prefixes ("AMC 25.1309 System design") or bare ("25.1309 System design").
-_RULE_PREFIX_IN_TITLE = re.compile(r"\b(CS|AMC|GM)\s+[A-Za-z0-9]{1,2}\.\d",
-                                   re.IGNORECASE)
+# Bare rule identifiers — values that carry no capital-letter prefix but *start*
+# with a rule number: 2 digits, a dot, then everything up to the first '(' or
+# whitespace ("23.1001(a) through (f)" -> "23.1001", "23.1011 Oil system
+# General" -> "23.1011", "21.A.3 Failures …" -> "21.A.3"). Tried only when
+# _RULE_ID above did not recognise the value, and — unlike the prefixed path —
+# NOT authoritative: a bare number is looser evidence, so when it matches no
+# section title the value falls through to the plain substring hunt instead of
+# being declared unmatched. Trailing punctuation on the captured number is
+# stripped so "23.1011," or "23.1011." do not poison the regex needle.
+_BARE_RULE_ID = re.compile(r"^\s*(\d{2}\.[^\s(]+)")
+
+# Detects whether the section titles themselves are written with rule prefixes
+# ("AMC 25.1309 System design") or bare ("25.1309 System design"). Same shape as
+# _RULE_ID (2-3 capitals, 2 digits, dot, 2 digits …) but searched anywhere in
+# the title, and likewise case-sensitive on the prefix.
+_RULE_PREFIX_IN_TITLE = re.compile(r"\b([A-Z]{2,3})\s+\d{2}\.\d{2}")
 
 # When the full identifier ("AMC 25.21") matches no section title, retry with the
-# rule number alone ("25.21") — but only when the titles carry no CS/AMC/GM
+# rule number alone ("25.21") — but only when the titles carry no rule
 # prefix at all (e.g. "25.21 Proof of compliance"). Where the titles *are*
 # prefixed, a missing prefix match is a real miss, so "CS 25.1309" must not land
 # on an "AMC 25.1309 …" title (different book, same rule number). Set to False to
@@ -1049,25 +1065,55 @@ def strip_parentheticals(text):
 
 
 def rule_identifier(text):
-    """The CS / AMC / GM rule identifier a reference value **starts with**, or
-    ``None`` when it does not begin with one in that format
-    (``_RULE_ID``: prefix, whitespace, a 1-2 character book/part number, a dot,
-    1-4 digits)::
+    """The rule identifier a reference value **starts with**, or ``None`` when
+    it does not begin with one in that format (``_RULE_ID``: 2-3 capital
+    letters, whitespace, a 2-digit book/part number, a dot, 2-4 digits)::
 
         "AMC 25.21(g)(a)"        -> ("AMC", "25.21")
         "CS 25.1309(a) blah"     -> ("CS",  "25.1309")
         "GM 26.30"               -> ("GM",  "26.30")
+        "SC 23.2005 something"   -> ("SC",  "23.2005")
         "GM 21.A.14"             -> None   # "A" is not a digit
-        "21.A.3A"                -> None   # no CS/AMC/GM prefix
+        "CS 1.5"                 -> None   # parts too short (need dd.dd)
+        "cs 25.1309"             -> None   # prefix must be capital letters
+        "21.A.3A"                -> None   # no capital-letter prefix
 
     Everything after the identifier — sub-paragraph qualifiers, prose — is
     ignored, so the identifier is what gets matched against the section titles.
-    Returns ``(prefix, number)`` with the prefix upper-cased.
+    Returns ``(prefix, number)``.
     """
     m = _RULE_ID.match(str(text or ""))
     if not m:
         return None
-    return m.group(1).upper(), f"{m.group(2).upper()}.{m.group(3)}"
+    return m.group(1), f"{m.group(2)}.{m.group(3)}"
+
+
+def bare_rule_identifier(text):
+    """The bare rule number a reference value **starts with** — 2 digits, a
+    dot, then everything up to the first ``(`` or whitespace — or ``None`` when
+    the value does not begin that way (``_BARE_RULE_ID``)::
+
+        "23.1001(a) through (f)"     -> "23.1001"
+        "23.1011"                    -> "23.1011"
+        "23.1011 Oil system General" -> "23.1011"
+        "21.A.3 Failures …"          -> "21.A.3"
+        "23.1011, see also …"        -> "23.1011"  # trailing ',' stripped
+        "2.5 percent"                -> None       # needs 2 digits before dot
+        "see 23.1011"                -> None       # must start with the number
+
+    Trailing punctuation on the captured number is stripped; a capture that is
+    left with nothing after the dot (``"23."``) is rejected. Meant to run
+    *after* :func:`rule_identifier` — prefixed values ("AMC 25.21") never reach
+    this because they do not start with a digit.
+    """
+    m = _BARE_RULE_ID.match(str(text or ""))
+    if not m:
+        return None
+    number = m.group(1).rstrip(".,;:-")
+    # "23." (nothing left after the dot once punctuation is gone) is no number.
+    if len(number) <= 3:
+        return None
+    return number
 
 
 def _rule_regex(needle):
@@ -1079,18 +1125,20 @@ def _rule_regex(needle):
 
 
 def _titles_use_rule_prefix(references):
-    """True when the section titles themselves carry CS/AMC/GM prefixes
-    ("AMC 25.1309 System design") rather than bare rule numbers."""
+    """True when the section titles themselves carry capital-letter rule
+    prefixes ("AMC 25.1309 System design", "SC 23.2005 …") rather than bare
+    rule numbers."""
     return any(_RULE_PREFIX_IN_TITLE.search(str(t or "")) for t in references)
 
 
 def match_rule_sections(prefix, number, references):
-    """Match a CS/AMC/GM rule identifier against the section titles **by regex**
-    (:func:`_rule_regex`) rather than by raw substring, so "AMC 25.21" finds
-    "AMC 25.21 Proof of compliance" but not "AMC 25.219 …".
+    """Match a rule identifier (2-3 capital-letter prefix + number) against the
+    section titles **by regex** (:func:`_rule_regex`) rather than by raw
+    substring, so "AMC 25.21" finds "AMC 25.21 Proof of compliance" but not
+    "AMC 25.219 …".
 
     The full identifier ("AMC 25.21") is tried first. Only if no title carries it
-    — and only when the titles are written without CS/AMC/GM prefixes at all
+    — and only when the titles are written without rule prefixes at all
     (:func:`_titles_use_rule_prefix`) and ``_RULE_MATCH_NUMBER_FALLBACK`` is on —
     is the rule number alone ("25.21") retried. That keeps "CS 25.1309" off an
     "AMC 25.1309 …" title (same rule number, different book) while still matching
@@ -1111,18 +1159,43 @@ def match_rule_sections(prefix, number, references):
             for title in references if rx.search(str(title or ""))]
 
 
+def match_bare_rule_sections(number, references):
+    """Match a bare rule number (:func:`bare_rule_identifier`, e.g. ``23.1001``)
+    against the section titles **by regex** (:func:`_rule_regex`), exactly like
+    the prefixed path: flexible whitespace, and the trailing digit guard keeps
+    ``23.100`` off ``23.1001 …`` titles. Works whether the titles are bare
+    (``"23.1001 Fuel system"``) or prefixed (``"CS 23.1001 Fuel system"``) —
+    the number matches inside either. Returns the same
+    ``[(section title, how, needle), ...]`` shape as :func:`match_sections`;
+    the caller falls back to substring matching when this returns ``[]``.
+    """
+    rx = _rule_regex(number)
+    return [(title, f"bare rule no. '{number}' in section title", number)
+            for title in references if rx.search(str(title or ""))]
+
+
 def match_sections(element, references):
     """Match one unique reference value against the reference **section titles**.
 
-    Two paths, picked from the value itself:
+    Three paths, tried in order, picked from the value itself:
 
-    * **CS / AMC / GM rule values** (:func:`rule_identifier` recognises the
-      identifier the value starts with, e.g. ``"AMC 25.21(g)(a)"`` ->
-      ``AMC 25.21``) are matched by :func:`match_rule_sections`, i.e. by regex on
+    * **Rule-identifier values** — a 2-3 capital-letter prefix (CS, AMC, GM,
+      SC, …) plus a ``dd.dd``-``dd.dddd`` number (:func:`rule_identifier`
+      recognises the identifier the value starts with, e.g.
+      ``"AMC 25.21(g)(a)"`` -> ``AMC 25.21``) — are matched by
+      :func:`match_rule_sections`, i.e. by regex on
       that identifier alone. Sub-paragraph qualifiers and any trailing prose are
       ignored, and the digit guard keeps ``AMC 25.21`` off ``AMC 25.219``. This
       path is authoritative: when the identifier matches no title the value is
       reported as unmatched rather than falling back to a looser substring hunt.
+    * **Bare rule numbers** — no prefix, but the value starts with 2 digits and
+      a dot (:func:`bare_rule_identifier` takes everything up to the first
+      ``(`` or whitespace: ``"23.1001(a) through (f)"`` -> ``23.1001``,
+      ``"23.1011 Oil system General"`` -> ``23.1011``) — are matched by
+      :func:`match_bare_rule_sections`, the same regex machinery with the same
+      digit guard. Unlike the prefixed path this one is *not* authoritative:
+      when the number matches no title, the value drops down to the substring
+      path below.
     * **Everything else** keeps the substring behaviour: the value is stripped of
       its ``(…)`` qualifiers (:func:`strip_parentheticals`) and matched
       case-insensitively in either direction — the value may name a section in
@@ -1140,13 +1213,24 @@ def match_sections(element, references):
     rule/direction that matched and ``needle`` is the form of the value that
     actually matched. Returns ``[]`` for a blank value or when nothing matches.
     """
-    el_raw = str(element or "").strip().lower()
+    el_orig = str(element or "").strip()
+    el_raw = el_orig.lower()
     if not el_raw:
         return []
-    # CS/AMC/GM rule values: match the identifier by regex, not by substring.
-    rule = rule_identifier(el_raw)
+    # Rule-identifier values: match the identifier by regex, not by substring.
+    # Checked against the original-case text — the prefix must be capitals, so
+    # the lower-cased form used by the substring path would never match.
+    rule = rule_identifier(el_orig)
     if rule:
         return match_rule_sections(rule[0], rule[1], references)
+    # Bare rule numbers ("23.1001(a) through (f)" -> "23.1001"): regex match
+    # like the prefixed path, but NOT authoritative — no title hit means fall
+    # through to the substring hunt below rather than report a miss.
+    bare = bare_rule_identifier(el_orig)
+    if bare:
+        hits = match_bare_rule_sections(bare, references)
+        if hits:
+            return hits
     el_norm = strip_parentheticals(el_raw)
     # Qualifier-free form first (the intent); raw text as a fallback so no match
     # that worked before the stripping is lost.
