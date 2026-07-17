@@ -145,8 +145,9 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     and is **editable**: whatever you type above the `---` marker is sent as
     the prompt of the next run (changing the column definitions rebuilds it).
     Each queued section is analyzed into one table row per section with one
-    cell per column (the model is asked for strict JSON; unparseable replies
-    are surfaced as `[unparsed]`). Starting an analysis first asks **how to
+    cell per column (the model is asked for strict JSON; an unparseable
+    reply is retried — the same prompt is re-sent up to 3 more times — and
+    only then surfaced as `[unparsed]`). Starting an analysis first asks **how to
     call the LLM**: *one call per section* (all columns in a single JSON
     answer) or *one call per column value* (each column of a section is its
     own focused LLM call; non-JSON replies are kept as the raw value). While

@@ -110,6 +110,10 @@ def _col_config_path():
     return Path(ALR_main_folder) / "column_analysis_columns.json"
 
 
+# Extra attempts when an LLM reply is not parsable JSON: the same prompt is
+# re-sent up to this many times before the value is marked [unparsed].
+_JSON_RETRIES = 3
+
 # Placeholder appended to the editable prompt preview; everything above the
 # "---" line is the prompt head, the placeholder is replaced by the real
 # section at run time.
@@ -1046,6 +1050,25 @@ class AIReviewMixin:
                 return json.dumps(v, ensure_ascii=False)
             return "" if v is None else str(v)
 
+        def _call_parsed(prompt, tag=""):
+            """llm_call that re-sends the prompt up to _JSON_RETRIES extra
+            times while the reply is not parsable JSON. Returns
+            (parsed dict or None, last raw response); call errors propagate."""
+            resp = None
+            for attempt in range(_JSON_RETRIES + 1):
+                if attempt:
+                    if not self._col_wait_if_paused():
+                        break   # stop requested mid-retry
+                    self._ai_log_bg(f"↻{tag} response was not valid JSON — "
+                                    f"retry {attempt}/{_JSON_RETRIES}")
+                resp = llm_call(prompt, None, service, model)
+                self._ai_log_bg(f"←{tag} Response ({len(str(resp or ''))} chars): "
+                                f"{self._ai_preview(resp)}")
+                parsed = self._parse_llm_json(resp)
+                if parsed is not None:
+                    return parsed, resp
+            return None, resp
+
         for i, (title, text) in enumerate(jobs, 1):
             if not self._col_wait_if_paused():
                 self._col_q.put(("stopped", i - 1))
@@ -1064,19 +1087,16 @@ class AIReviewMixin:
                     self._ai_log_bg(f"→ [column '{name}'] Sent to LLM "
                                     f"({len(prompt)} chars): {self._ai_preview(prompt)}")
                     try:
-                        resp = llm_call(prompt, None, service, model)
+                        parsed, resp = _call_parsed(prompt, f" [column '{name}']")
                     except Exception as exc:  # noqa: BLE001
                         row[name] = f"[ERROR] {exc}"
                         self._ai_log_bg(f"← [column '{name}'] LLM call failed: {exc}")
                         continue
-                    self._ai_log_bg(f"← [column '{name}'] Response "
-                                    f"({len(str(resp or ''))} chars): "
-                                    f"{self._ai_preview(resp)}")
-                    parsed = self._parse_llm_json(resp)
                     if parsed is None:
-                        row[name] = _norm(resp).strip()
-                        self._ai_log_bg(f"   [column '{name}'] response was not "
-                                        "valid JSON — kept the raw text")
+                        row[name] = f"[unparsed] {_norm(resp).strip()}"
+                        self._ai_log_bg(
+                            f"   [column '{name}'] still not valid JSON after "
+                            f"{_JSON_RETRIES} retries — marked [unparsed]")
                     else:
                         # accept the expected key, else the only/first value
                         v = parsed.get(name)
@@ -1091,17 +1111,15 @@ class AIReviewMixin:
                 self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
                                 f"{self._ai_preview(prompt)}")
                 try:
-                    resp = llm_call(prompt, None, service, model)
+                    parsed, resp = _call_parsed(prompt)
                 except Exception as exc:  # noqa: BLE001
                     parsed = {columns[0]: f"[ERROR] {exc}"}
                     self._ai_log_bg(f"← LLM call failed: {exc}")
                 else:
-                    self._ai_log_bg(f"← Response ({len(str(resp or ''))} chars): "
-                                    f"{self._ai_preview(resp)}")
-                    parsed = self._parse_llm_json(resp)
                     if parsed is None:
                         parsed = {columns[0]: f"[unparsed] {resp}"}
-                        self._ai_log_bg("   response was not valid JSON — kept as [unparsed]")
+                        self._ai_log_bg(f"   still not valid JSON after "
+                                        f"{_JSON_RETRIES} retries — kept as [unparsed]")
                 for c in columns:
                     row[c] = _norm(parsed.get(c, ""))
             self._col_q.put(("row", row))
