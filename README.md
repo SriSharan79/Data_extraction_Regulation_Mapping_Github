@@ -152,7 +152,20 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     elements) sits in a **vertically scrollable pane** — on a small
     window the tab scrolls (scrollbar or mouse wheel; text boxes and
     tables keep their own wheel), on a large one the content stretches
-    to fill it, so no widget can end up unreachable. A **＋ Specific
+    to fill it, so no widget can end up unreachable. The **progress
+    console** colours its lines by severity (errors red, warnings amber,
+    saves green, run headers blue), has a live **filter** box (hides
+    non-matching lines), an **auto-scroll** toggle, a **Save log…**
+    button, and an **Open results** button that opens the latest result
+    file (analysis workbook, free-form autosave, evaluation output,
+    uniques/entities sheet) with the system's default app. The LLM row
+    hosts an **inline model picker** (↻ loads the live list in the
+    background) plus an *Active: service · model* chip showing exactly
+    what the next run uses. Every Evaluation-tab metric checkbox has a
+    **hover tooltip** explaining the metric and its direction
+    (higher/lower is better). The page uses the *clam* ttk theme and
+    keyboard shortcuts: **Ctrl/Cmd+Return** = Analyze queued,
+    **Ctrl/Cmd+P** = Pause/Resume, **Ctrl/Cmd+.** = Stop. A **＋ Specific
     entities** button adds the predefined aviation entity-chain column
     (`data_extraction/ai_utils/entity_chains.py`): the LLM extracts
     `Reference-System Info-Process-Personal-QuantityValue` chains
@@ -205,8 +218,11 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     values; **Export table…** appends the same kind of snapshot.
   - *Evaluation* (`data_extraction/evaluation/column_evaluator.py`) — its own
     page next to *Column analysis*, fully independent of it: it evaluates
-    **files that already hold analyzed data**. Pick any analysis workbook,
-    one `Run N …` sheet or *All runs*, and the **sections JSON the analysis
+    **files that already hold analyzed data**. Pick any workbook and **any
+    sheet that has a `Section` column** — `Run N …` snapshots or your own
+    hand-made sheets alike (*All sheets* evaluates every such sheet; the
+    pipeline's own result sheets — `Eval`/`Uniq`/`Entities`/per-metric —
+    are excluded automatically) — and the **sections JSON the analysis
     was made from** (always asked; chunks cache, `Processed_chunks.json` or
     an EASA structured JSON — the shape is auto-detected). Each run-sheet
     row is matched automatically: its `Section` value is looked up among the

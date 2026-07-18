@@ -31,6 +31,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -83,6 +84,84 @@ _EVAL_METRIC_OPTIONS = [
     ("BERTScore (semantic P/R/F1)",
      ("bertscore_p", "bertscore_r", "bertscore_f1")),
 ]
+
+# Hover explanations for the Evaluation tab's metric checkboxes.
+_EVAL_METRIC_TIPS = {
+    "Substring check (item grounded in reference)":
+        "Splits each cell into its ';'-items and checks every item as a "
+        "case-insensitive substring of the reference text. Gives True/False "
+        "counts per column and a per-section Coverage % — higher is better.",
+    "Jaccard similarity":
+        "Overlap of the word sets of cell and reference: |common| / |union|. "
+        "0–1, higher is better. Needs no extra library.",
+    "ROUGE-1/2/L":
+        "Recall-oriented n-gram overlap: ROUGE-1 single words, ROUGE-2 word "
+        "pairs, ROUGE-L longest common subsequence. 0–1, higher is better.",
+    "BLEU":
+        "N-gram precision with a brevity penalty (machine-translation "
+        "metric). 0–1, higher is better; very short texts often score low.",
+    "Levenshtein distance":
+        "Number of single-character edits (insert/delete/replace) to turn "
+        "the reference into the cell text. 0+, LOWER is better.",
+    "Similarity ratio":
+        "Normalised edit similarity of the two texts. 0–1, higher is "
+        "better (1 = identical).",
+    "Word error rate (WER)":
+        "Word-level edits divided by the reference length (speech-"
+        "recognition metric). 0+, LOWER is better; can exceed 1.",
+    "Embedding cosine similarity (semantic)":
+        "Cosine similarity of the two texts' embedding vectors — measures "
+        "MEANING, not wording. −1–1, higher is better. Uses the embedding "
+        "backend configured below.",
+    "BERTScore (semantic P/R/F1)":
+        "Token-level semantic precision/recall/F1 from per-token embedding "
+        "matches. Higher is better. Local embedding backend only (the "
+        "remote API returns one pooled vector per string).",
+    "__uniq__":
+        "Additionally collects the unique generated values per column "
+        "(Uniq sheet) and grounds each against the combined reference "
+        "text (Uniq Eval sheet with coverage summaries).",
+}
+
+
+class _Tooltip:
+    """Small hover tooltip for a widget (delay, wraps long text)."""
+
+    def __init__(self, widget, text, delay=500):
+        self.widget, self.text, self.delay = widget, text, delay
+        self._after = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after:
+            self.widget.after_cancel(self._after)
+            self._after = None
+
+    def _show(self):
+        if self._tip:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self.text, wraplength=380, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1,
+                 padx=6, pady=4).pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
 
 # BERTScore is local-backend-only: it needs one vector per TOKEN, and the remote
 # /embeddings endpoint returns a single pooled vector per string. The tab
@@ -182,6 +261,7 @@ class AIReviewMixin:
         self._run_queue_iids = []     # queue rows snapshotted at run start
         self._col_rerun = False       # current run re-does failed rows only
         self._col_run_ctx = {}        # settings snapshot for "Re-run failed"
+        self._ai_last_output = None   # latest result file (Open results)
         self._eval_busy = False       # an evaluation is running
         self._uniq_busy = False       # a manual unique-elements run is in progress
         self._uniq_col_vars = {}      # {column name: BooleanVar} for the Uniques tab
@@ -200,24 +280,38 @@ class AIReviewMixin:
         return f"{stem}_{kind}.{ext}"
 
     def _build_ai_page(self, parent):
+        # A cleaner ttk look for the whole app (no-op when unavailable).
+        try:
+            style = ttk.Style(self.root)
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+        except tk.TclError:
+            pass
+
         ai = ttk.Frame(parent, padding=6)
         ai.pack(fill="both", expand=True)
 
-        # Integrated Modern Service Engine Frame
+        # LLM row: service, inline model picker (↻ loads the live list in the
+        # background) and a chip always showing what a run would use NOW.
         llm_frame = ttk.Frame(ai)
         llm_frame.pack(fill="x", padx=10, pady=5)
-        
+
         ttk.Label(llm_frame, text="LLM Processing Service Engine:").pack(side="left", padx=5)
         self.llm_choice_an = ttk.Combobox(llm_frame, values=["O", "B"], width=5, state="readonly")
         self.llm_choice_an.set("O")
         self.llm_choice_an.pack(side="left", padx=5)
-        self.llm_choice_an.bind("<<ComboboxSelected>>",
-                                lambda e: self._ui_state_save())
-        
-        ttk.Button(llm_frame, text="Choose Model...",
-                   command=lambda: self._choose_model_action(self.llm_choice_an.get())
-                   ).pack(side="left", padx=5)
-        
+        self.llm_choice_an.bind("<<ComboboxSelected>>", self._llm_service_changed)
+
+        ttk.Label(llm_frame, text="Model:").pack(side="left", padx=(8, 0))
+        self.llm_model_combo = ttk.Combobox(llm_frame, state="readonly", width=28,
+                                            values=[])
+        self.llm_model_combo.pack(side="left", padx=4)
+        self.llm_model_combo.bind("<<ComboboxSelected>>", self._llm_on_model_pick)
+        ttk.Button(llm_frame, text="↻", width=3,
+                   command=self._llm_models_refresh).pack(side="left")
+        self.llm_active_lbl = ttk.Label(llm_frame, foreground="#1a6fb0")
+        self.llm_active_lbl.pack(side="left", padx=(10, 0))
+
         ttk.Button(llm_frame, text="API keys…", command=self._ai_manage_keys).pack(side="right", padx=5)
 
         # Vertical split: analysis area on top (~80%), console pane below
@@ -274,9 +368,34 @@ class AIReviewMixin:
         self.ai_paused_lbl.pack(side="left", padx=(8, 0))
         self.ai_progress_info = ttk.Label(bar_row, text="", foreground="grey40")
         self.ai_progress_info.pack(side="right", padx=(8, 0))
+
+        # Console toolbar: filter (live, hides non-matching lines),
+        # auto-scroll toggle, open-last-result and save-log actions.
+        tools = ttk.Frame(prog_wrap)
+        tools.pack(fill="x", pady=(4, 0))
+        ttk.Label(tools, text="Filter:").pack(side="left")
+        self.ai_log_filter = ttk.Entry(tools, width=18)
+        self.ai_log_filter.pack(side="left", padx=4)
+        self.ai_log_filter.bind("<KeyRelease>", self._ai_log_refilter)
+        self.ai_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tools, variable=self.ai_autoscroll_var,
+                        text="Auto-scroll").pack(side="left", padx=8)
+        ttk.Button(tools, text="Save log…",
+                   command=self._ai_log_save).pack(side="right")
+        self.ai_open_btn = ttk.Button(tools, text="Open results",
+                                      state="disabled",
+                                      command=self._ai_open_results)
+        self.ai_open_btn.pack(side="right", padx=6)
+
         self.ai_console = scrolledtext.ScrolledText(
             prog_wrap, height=6, wrap="word", state="disabled")
         self.ai_console.pack(fill="both", expand=True, pady=(4, 0))
+        # Severity colours + an elide tag the filter uses to hide lines.
+        self.ai_console.tag_configure("err", foreground="#b00020")
+        self.ai_console.tag_configure("warn", foreground="#b8860b")
+        self.ai_console.tag_configure("ok", foreground="#1f7a1f")
+        self.ai_console.tag_configure("hdr", foreground="#1a6fb0")
+        self.ai_console.tag_configure("hidden", elide=True)
 
         # Place the sash once — at the saved position from the last session
         # when there is one, else at ~80/20 so the console gets a fifth of
@@ -296,18 +415,187 @@ class AIReviewMixin:
 
         # Restore last session's choices (built last: all widgets exist now).
         self._ui_state_load()
+        self._llm_update_chip()
+
+        # Keyboard shortcuts: Ctrl/Cmd+Return = Analyze queued,
+        # Ctrl/Cmd+P = Pause/Resume, Ctrl/Cmd+. = Stop.
+        top = self.root.winfo_toplevel()
+        for seq in ("<Control-Return>", "<Command-Return>"):
+            top.bind(seq, self._kb_run, add="+")
+        for seq in ("<Control-p>", "<Command-p>"):
+            top.bind(seq, self._kb_pause, add="+")
+        for seq in ("<Control-period>", "<Command-period>"):
+            top.bind(seq, self._kb_stop, add="+")
+
+    # ------------------------------------------------- keyboard shortcuts -- #
+    def _kb_run(self, _event=None):
+        if not self._ai_busy and not self._eval_busy:
+            self._col_run()
+        return "break"
+
+    def _kb_pause(self, _event=None):
+        if self._ai_busy and str(self.col_pause_btn.cget("state")) != "disabled":
+            self._col_pause_resume()
+        return "break"
+
+    def _kb_stop(self, _event=None):
+        if self._ai_busy and str(self.col_stop_btn.cget("state")) != "disabled":
+            self._col_stop()
+        return "break"
+
+    # -------------------------------------------- inline LLM model picker -- #
+    def _llm_service_label(self):
+        return "DLR Ollama" if self.llm_choice_an.get().upper() == "O" else "BlaBla"
+
+    def _llm_update_chip(self):
+        """Show what a run started NOW would use (service + model)."""
+        label = self._llm_service_label()
+        model = get_selected_model(label)
+        self.llm_active_lbl.configure(text=f"Active: {label} · {model or 'default'}")
+        current = model or ""
+        if current and current not in (self.llm_model_combo.cget("values") or ()):
+            self.llm_model_combo.configure(
+                values=[current, *self.llm_model_combo.cget("values")])
+        self.llm_model_combo.set(current)
+
+    def _llm_service_changed(self, _event=None):
+        self.llm_model_combo.configure(values=[])
+        self._llm_update_chip()
+        self._ui_state_save()
+
+    def _llm_on_model_pick(self, _event=None):
+        model = self.llm_model_combo.get().strip()
+        if model:
+            set_selected_model(self._llm_service_label(), model)
+        self._llm_update_chip()
+        self._ui_state_save()
+
+    def _llm_models_refresh(self):
+        """Load the service's live model list in the background and fill the
+        inline picker (the UI stays responsive; errors go to the status bar)."""
+        label = self._llm_service_label()
+        self.status_var.set(f"Loading {label} models…")
+
+        def work():
+            try:
+                models = list_available_models(label) or []
+            except Exception as exc:  # noqa: BLE001
+                models, err = [], str(exc)
+            else:
+                err = None
+
+            def apply():
+                if err or not models:
+                    self.status_var.set(
+                        f"Could not list {label} models"
+                        + (f": {err}" if err else " (empty list)."))
+                    return
+                self.llm_model_combo.configure(values=models)
+                current = get_selected_model(label)
+                if current in models:
+                    self.llm_model_combo.set(current)
+                self.status_var.set(f"{len(models)} {label} model(s) loaded.")
+            try:
+                self.root.after(0, apply)
+            except (RuntimeError, tk.TclError):
+                pass  # app closing / no mainloop
+
+        threading.Thread(target=work, daemon=True).start()
 
     # -------------------------------------------------- progress & console -- #
+    @staticmethod
+    def _ai_log_severity(msg):
+        """Colour tag for a console line, by content."""
+        if "[ERROR]" in msg or "❌" in msg:
+            return "err"
+        if "⚠" in msg or "↻" in msg or "[WARN]" in msg or "[unparsed]" in msg:
+            return "warn"
+        if msg.startswith("===") or msg.startswith("⚖"):
+            return "hdr"
+        if "💾" in msg or "✅" in msg or "✔" in msg or "→ wrote" in msg:
+            return "ok"
+        return None
+
     def _ai_log(self, msg):
-        """Append one line to the progress console (main thread only)."""
+        """Append one line to the progress console (main thread only):
+        severity-coloured, hidden immediately when it doesn't match the
+        active filter, auto-scrolled only while the toggle is on."""
         from datetime import datetime
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
+        tags = []
+        sev = self._ai_log_severity(str(msg))
+        if sev:
+            tags.append(sev)
+        filt = self.ai_log_filter.get().strip().lower()
+        if filt and filt not in line.lower():
+            tags.append("hidden")
         self.ai_console.configure(state="normal")
-        self.ai_console.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        self.ai_console.insert("end", line, tuple(tags))
         # keep the console bounded
         if int(self.ai_console.index("end-1c").split(".")[0]) > 2000:
             self.ai_console.delete("1.0", "500.0")
-        self.ai_console.see("end")
+        if self.ai_autoscroll_var.get():
+            self.ai_console.see("end")
         self.ai_console.configure(state="disabled")
+
+    def _ai_log_refilter(self, _event=None):
+        """Re-apply the console filter to every existing line (elide
+        non-matching ones; an empty filter shows everything again)."""
+        filt = self.ai_log_filter.get().strip().lower()
+        self.ai_console.configure(state="normal")
+        self.ai_console.tag_remove("hidden", "1.0", "end")
+        if filt:
+            last = int(self.ai_console.index("end-1c").split(".")[0])
+            for ln in range(1, last + 1):
+                text = self.ai_console.get(f"{ln}.0", f"{ln}.end")
+                if text and filt not in text.lower():
+                    self.ai_console.tag_add("hidden", f"{ln}.0", f"{ln + 1}.0")
+        if self.ai_autoscroll_var.get():
+            self.ai_console.see("end")
+        self.ai_console.configure(state="disabled")
+
+    def _ai_log_save(self):
+        """Write the whole console log (unfiltered) to a text file."""
+        from datetime import datetime
+        path = filedialog.asksaveasfilename(
+            title="Save the progress log as…",
+            defaultextension=".log",
+            filetypes=[("Log", "*.log"), ("Text", "*.txt")],
+            initialfile=f"ai_review_{datetime.now().strftime('%Y-%m-%d_%H%M')}.log")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.ai_console.get("1.0", "end-1c"))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Save log", str(exc))
+            return
+        self.status_var.set(f"Progress log saved → {path}")
+
+    def _ai_note_output(self, path):
+        """Remember the latest result file and arm the Open-results button."""
+        if path:
+            self._ai_last_output = str(path)
+            self.ai_open_btn.configure(state="normal")
+
+    def _ai_open_results(self):
+        """Open the latest result file with the system's default app."""
+        path = getattr(self, "_ai_last_output", None)
+        if not path or not os.path.exists(path):
+            self.status_var.set("No result file to open yet.")
+            return
+        try:
+            if sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", path])
+            elif os.name == "nt":
+                os.startfile(path)  # noqa: S606 - user-chosen file
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+            self.status_var.set(f"Opened {os.path.basename(path)}.")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Open results", str(exc))
 
     def _ai_log_bg(self, msg):
         """Thread-safe console logging for the worker threads."""
@@ -795,6 +1083,7 @@ class AIReviewMixin:
                     saved = len(self._ai_results) - self._ai_run_start
                     if self._ai_autosave_path and saved:
                         done += f", {saved} saved to {os.path.basename(self._ai_autosave_path)}"
+                        self._ai_note_output(self._ai_autosave_path)
                     self.status_var.set(done + ".")
                     self._ai_log(done + ".")
                     return
@@ -1625,6 +1914,7 @@ class AIReviewMixin:
                         done += f", saved to {os.path.basename(self._col_store_path)}"
                         if self._col_run_sheet:
                             done += f" (sheet '{self._col_run_sheet}')"
+                        self._ai_note_output(self._col_store_path)
                     self.status_var.set(done + ".")
                     self._ai_log(done + ".")
                     # Rows were evaluated as they were saved; finish up.
@@ -2073,6 +2363,7 @@ class AIReviewMixin:
             messagebox.showerror("Entity chains", str(exc))
             self._ai_log(f"[ERROR] entity-chain parsing failed: {exc}")
             return
+        self._ai_note_output(path)
         msg = (f"Parsed {summary['chains']} chain(s) from column '{column}' "
                f"({summary['rows']} row(s)) → sheet '{summary['sheet']}'")
         self.status_var.set(msg + ".")
@@ -2335,6 +2626,7 @@ class AIReviewMixin:
             self._ai_log(f"[ERROR] unique elements failed: {exc}")
             messagebox.showerror("Unique elements failed", str(exc))
             return
+        self._ai_note_output(summary.get("path"))
         detail = ", ".join(f"{col}: {n}" for col, n in summary["per_col"].items())
         self.status_var.set(
             f"Unique elements written → sheet '{summary['sheet']}' "
@@ -2374,7 +2666,8 @@ class AIReviewMixin:
         them (data_extraction.evaluation.column_evaluator)."""
         ev = self._scrollable_tab("Evaluation")
 
-        wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx with 'Run N …' sheets) ",
+        wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx — any sheet "
+                                          "with a 'Section' column) ",
                                  padding=4)
         wb_wrap.pack(fill="x")
         row = ttk.Frame(wb_wrap)
@@ -2420,11 +2713,15 @@ class AIReviewMixin:
             cb = ttk.Checkbutton(grid, text=label, variable=var)
             cb.grid(row=i % 4, column=i // 4, sticky="w", padx=(0, 18))
             self.eval_metric_btns[label] = cb
+            if label in _EVAL_METRIC_TIPS:   # hover explanation per metric
+                _Tooltip(cb, _EVAL_METRIC_TIPS[label])
         self.eval_uniq_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(met_wrap, variable=self.eval_uniq_var,
-                        text="Also evaluate the unique generated values "
-                             "(via save_unique_elements_to_new_sheet)").pack(
-            anchor="w", pady=(4, 0))
+        uniq_cb = ttk.Checkbutton(
+            met_wrap, variable=self.eval_uniq_var,
+            text="Also evaluate the unique generated values "
+                 "(via save_unique_elements_to_new_sheet)")
+        uniq_cb.pack(anchor="w", pady=(4, 0))
+        _Tooltip(uniq_cb, _EVAL_METRIC_TIPS["__uniq__"])
 
         # Embedding backend/service/model — only used when an embedding metric
         # (embedding cosine / BERTScore) is ticked above. Drives llm_utils'
@@ -2495,22 +2792,24 @@ class AIReviewMixin:
             self._eval_refresh_sheets()
 
     def _eval_refresh_sheets(self):
-        """List the workbook's 'Run N …' snapshot sheets; preselect the last."""
+        """List every evaluatable sheet of the workbook — ANY sheet with a
+        'Section' column (not just 'Run N …' snapshots), excluding the
+        pipeline's own result sheets — and preselect the last one."""
         path = self.eval_wb.get().strip()
-        runs = []
+        sheets = []
         if path and os.path.exists(path):
             try:
-                from openpyxl import load_workbook
-                wb = load_workbook(path, read_only=True)
-                runs = [s for s in wb.sheetnames if s.startswith("Run ")]
-                wb.close()
+                from data_extraction.evaluation.column_evaluator import (
+                    evaluatable_sheets)
+                sheets = evaluatable_sheets(path)
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Workbook", f"Could not read sheets:\n{exc}")
-        values = (["All runs"] + runs) if runs else []
+        values = (["All sheets"] + sheets) if sheets else []
         self.eval_sheet.configure(values=values)
-        self.eval_sheet.set(runs[-1] if runs else "")
-        if path and not runs:
-            self.status_var.set("No 'Run …' sheets found in the selected workbook.")
+        self.eval_sheet.set(sheets[-1] if sheets else "")
+        if path and not sheets:
+            self.status_var.set("No sheet with a 'Section' column found in "
+                                "the selected workbook.")
 
     def _eval_browse_ref_json(self):
         path = filedialog.askopenfilename(
@@ -2650,11 +2949,13 @@ class AIReviewMixin:
         if not path or os.path.splitext(path)[1].lower() != ".xlsx" \
                 or not os.path.exists(path):
             messagebox.showinfo("No workbook",
-                                "Pick a stored column-analysis .xlsx first "
-                                "(Browse… to an existing workbook).")
+                                "Pick an .xlsx with analyzed data first — any "
+                                "sheet with a 'Section' column can be "
+                                "evaluated (Browse… to an existing workbook).")
             return
         sheet = self.eval_sheet.get().strip()
-        run_sheets = None if (not sheet or sheet == "All runs") else [sheet]
+        run_sheets = (None if not sheet or sheet in ("All sheets", "All runs")
+                      else [sheet])
         metrics = self._eval_selected_metrics()
         if not metrics:
             messagebox.showinfo("No evaluations",
@@ -2724,9 +3025,10 @@ class AIReviewMixin:
             messagebox.showerror("Evaluation failed", str(exc))
             return
         if not results:
-            self.status_var.set("Evaluation found no 'Run …' sheets to evaluate.")
-            messagebox.showinfo("Evaluation", "The workbook has no "
-                                              "'Run …' snapshot sheets.")
+            self.status_var.set("Evaluation found no sheet with a 'Section' "
+                                "column to evaluate.")
+            messagebox.showinfo("Evaluation", "The workbook has no sheet "
+                                              "with a 'Section' column.")
             return
         lines = []
         for sheet, s in results.items():
@@ -2740,6 +3042,7 @@ class AIReviewMixin:
             lines.append(line)
         first = next(iter(results.values()))
         where = os.path.basename(first["out_path"])
+        self._ai_note_output(first["out_path"])
         self.status_var.set(f"Evaluation complete → {where}: " + " | ".join(lines))
         self._ai_log(f"=== Evaluation complete → {first['out_path']} ===")
         for line in lines:

@@ -128,6 +128,38 @@ METRIC_SHEET_CODES = {
     "bertscore_f1": "BsF",
 }
 
+# Result sheets this module (and the AI Review tab) write; they also carry a
+# 'Section' column, so sheet auto-detection must skip them or an evaluation
+# would evaluate its own outputs.
+_OUTPUT_SHEET_PREFIXES = tuple(f"{code} " for code in METRIC_SHEET_CODES.values()) + (
+    "Eval ", "Uniq ", "Ref Map", "Entities ")
+
+
+def is_output_sheet(name):
+    """True when a sheet name is one of this pipeline's result sheets."""
+    return str(name).startswith(_OUTPUT_SHEET_PREFIXES)
+
+
+def evaluatable_sheets(file_path):
+    """Every sheet of the workbook that can be evaluated: any sheet holding
+    a ``Section`` column — not just ``Run N …`` snapshots — excluding the
+    pipeline's own result sheets. Unreadable sheets are skipped."""
+    import pandas as pd
+
+    out = []
+    with pd.ExcelFile(str(file_path), engine="openpyxl") as xls:
+        for sheet in xls.sheet_names:
+            if is_output_sheet(sheet):
+                continue
+            try:
+                head = xls.parse(sheet, nrows=0)
+            except Exception:  # noqa: BLE001 - odd sheets are just skipped
+                continue
+            if "Section" in [str(c) for c in head.columns]:
+                out.append(sheet)
+    return out
+
+
 # Candidate item separators inside one extracted cell (the AI Review tab
 # joins list answers with "; "), mirroring excel_file_utils' detection.
 _SEPARATORS = (
@@ -1506,8 +1538,9 @@ def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
                       run_sheets=None, uniq_columns="all", out_path=None,
                       log=None, embedding=None):
     """
-    Evaluate every ``Run N …`` snapshot sheet of a column-analysis workbook
-    (or just ``run_sheets``). ``uniq_columns="all"`` evaluates the uniques of
+    Evaluate every evaluatable sheet of a workbook — any sheet holding a
+    ``Section`` column (:func:`evaluatable_sheets`), not just ``Run N …``
+    snapshots — or just ``run_sheets``. ``uniq_columns="all"`` evaluates the uniques of
     every extracted column; pass a list to restrict, or None to skip.
     ``out_path`` redirects all result sheets into a separate workbook;
     ``log`` is forwarded to :func:`evaluate_run` for per-row progress lines.
@@ -1520,9 +1553,7 @@ def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
     if embedding is not None:
         configure_embeddings(**embedding)
     file_path = str(file_path)
-    with pd.ExcelFile(file_path, engine="openpyxl") as xls:
-        all_runs = [s for s in xls.sheet_names if s.startswith("Run ")]
-    sheets = run_sheets if run_sheets else all_runs
+    sheets = run_sheets if run_sheets else evaluatable_sheets(file_path)
     results = {}
     for sheet in sheets:
         cols = uniq_columns
