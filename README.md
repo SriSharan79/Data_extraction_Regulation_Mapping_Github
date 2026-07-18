@@ -142,7 +142,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     checkbox, and the definitions with both check states are
     **remembered across sessions** (saved to
     `~/.data_extraction/column_analysis_columns.json` on every change), so
-    closing and reopening the studio brings them back. A **＋ Specific
+    closing and reopening the studio brings them back. The rest of the
+    page's session state persists too
+    (`~/.data_extraction/review_ui_state.json`): the last storage file,
+    the LLM service and selected models, the auto-evaluate box and its
+    picker choices, the Evaluation tab's workbook/metric/output choices,
+    and the window geometry with the console-sash position. A **＋ Specific
     entities** button adds the predefined aviation entity-chain column
     (`data_extraction/ai_utils/entity_chains.py`): the LLM extracts
     `Reference-System Info-Process-Personal-QuantityValue` chains
@@ -171,7 +176,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     queued* control it: pausing waits after the current LLM call (a
     **⏸ PAUSED** indicator appears beside the progress bar), stopping
     ends the run after it — every row already saved (and its evaluation)
-    is kept. The **sections queue shows a live status per section**
+    is kept. A **Re-run failed** button lights up after a run that left
+    `[ERROR]`/`[unparsed]` rows behind: it re-analyzes **only those
+    sections** with the run's own settings (prompt, call mode, service,
+    model) and **updates their existing rows in place** — in the table,
+    the run sheet, the Uniq/Entities sheets and the evaluation — instead
+    of appending. The **sections queue shows a live status per section**
     (⏳ queued / ▶ running / ✔ done / ✖ error — error covers `[ERROR]` and
     `[unparsed]` results) for both run modes, and the progress bar carries
     a live **`done/total · ETA · LLM calls` counter** (retries and

@@ -30,6 +30,7 @@ and the chunking studio share one implementation.
 import json
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -111,6 +112,13 @@ def _col_config_path():
     return Path(ALR_main_folder) / "column_analysis_columns.json"
 
 
+# Session state of the AI Review page (storage file, service/model, evaluation
+# choices, window geometry/sash) — restored on the next launch.
+def _ui_state_path():
+    from .file_manager import ALR_main_folder
+    return Path(ALR_main_folder) / "review_ui_state.json"
+
+
 # Extra attempts when an LLM reply is not parsable JSON: the same prompt is
 # re-sent up to this many times before the value is marked [unparsed].
 _JSON_RETRIES = 3
@@ -172,6 +180,8 @@ class AIReviewMixin:
         self._ai_call_count = 0       # LLM calls (incl. retries) of the run
         self._run_current = 0         # 1-based index of the section in work
         self._run_queue_iids = []     # queue rows snapshotted at run start
+        self._col_rerun = False       # current run re-does failed rows only
+        self._col_run_ctx = {}        # settings snapshot for "Re-run failed"
         self._eval_busy = False       # an evaluation is running
         self._uniq_busy = False       # a manual unique-elements run is in progress
         self._uniq_col_vars = {}      # {column name: BooleanVar} for the Uniques tab
@@ -201,6 +211,8 @@ class AIReviewMixin:
         self.llm_choice_an = ttk.Combobox(llm_frame, values=["O", "B"], width=5, state="readonly")
         self.llm_choice_an.set("O")
         self.llm_choice_an.pack(side="left", padx=5)
+        self.llm_choice_an.bind("<<ComboboxSelected>>",
+                                lambda e: self._ui_state_save())
         
         ttk.Button(llm_frame, text="Choose Model...",
                    command=lambda: self._choose_model_action(self.llm_choice_an.get())
@@ -212,6 +224,7 @@ class AIReviewMixin:
         # (~20% of the window) so the log stays visible; drag to adjust.
         vsplit = ttk.PanedWindow(ai, orient="vertical")
         vsplit.pack(fill="both", expand=True, pady=(6, 0))
+        self._ai_vsplit = vsplit
 
         body = ttk.PanedWindow(vsplit, orient="horizontal")
         vsplit.add(body, weight=4)
@@ -265,17 +278,24 @@ class AIReviewMixin:
             prog_wrap, height=6, wrap="word", state="disabled")
         self.ai_console.pack(fill="both", expand=True, pady=(4, 0))
 
-        # Place the sash once at ~80/20 so the console gets a fifth of the
-        # window from the start (weights only govern later resizes).
+        # Place the sash once — at the saved position from the last session
+        # when there is one, else at ~80/20 so the console gets a fifth of
+        # the window (weights only govern later resizes).
         def _place_sash(_event=None):
             height = vsplit.winfo_height()
             if height > 120 and not getattr(vsplit, "_sash_placed", False):
                 vsplit._sash_placed = True
+                pos = getattr(self, "_ui_saved_sash", None)
+                if not isinstance(pos, int) or not 60 <= pos <= height - 60:
+                    pos = int(height * 0.8)
                 try:
-                    vsplit.sashpos(0, int(height * 0.8))
+                    vsplit.sashpos(0, pos)
                 except tk.TclError:
                     pass
         vsplit.bind("<Configure>", _place_sash)
+
+        # Restore last session's choices (built last: all widgets exist now).
+        self._ui_state_load()
 
     # -------------------------------------------------- progress & console -- #
     def _ai_log(self, msg):
@@ -365,10 +385,27 @@ class AIReviewMixin:
             self.ai_batch_list.item(iid, values=(self._QUEUE_GLYPHS["pending"],),
                                     tags=("pending",))
 
+    def _queue_snapshot_for(self, titles):
+        """Map a re-run's jobs onto the queue rows with those titles (first
+        match wins per title; a title no longer queued maps to None)."""
+        by_text = {}
+        for iid in self.ai_batch_list.get_children():
+            by_text.setdefault(self.ai_batch_list.item(iid, "text"), []).append(iid)
+        self._run_queue_iids = []
+        for t in titles:
+            matches = by_text.get(t) or []
+            iid = matches.pop(0) if matches else None
+            self._run_queue_iids.append(iid)
+            if iid:
+                self.ai_batch_list.item(
+                    iid, values=(self._QUEUE_GLYPHS["pending"],),
+                    tags=("pending",))
+
     def _queue_set_status(self, idx, status):
         """Set the status glyph of the run's idx-th (0-based) section."""
         iids = self._run_queue_iids
-        if 0 <= idx < len(iids) and self.ai_batch_list.exists(iids[idx]):
+        if 0 <= idx < len(iids) and iids[idx] \
+                and self.ai_batch_list.exists(iids[idx]):
             self.ai_batch_list.item(iids[idx],
                                     values=(self._QUEUE_GLYPHS[status],),
                                     tags=(status,))
@@ -471,10 +508,17 @@ class AIReviewMixin:
         self.col_stop_btn = ttk.Button(run_row, text="Stop", state="disabled",
                                        command=self._col_stop)
         self.col_stop_btn.pack(side="left", padx=(4, 0))
+        # Enabled after a run that left [ERROR]/[unparsed] rows behind:
+        # re-analyzes only those sections and updates their existing rows.
+        self.col_rerun_btn = ttk.Button(run_row, text="Re-run failed",
+                                        state="disabled",
+                                        command=self._col_rerun_failed)
+        self.col_rerun_btn.pack(side="left", padx=(10, 0))
         # When on, Analyze queued first asks which evaluations to run
         # automatically once the batch finishes (see the Evaluation tab).
         self.eval_auto_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(run_row, variable=self.eval_auto_var,
+                        command=self._ui_state_save,
                         text="Auto-evaluate after the analysis").pack(side="left", padx=10)
         ttk.Button(run_row, text="Export table…", command=self._col_export).pack(side="right")
 
@@ -840,6 +884,7 @@ class AIReviewMixin:
                 messagebox.showinfo("No selection", "Please select a model, or close the dialog to keep the current one.")
                 return
             set_selected_model(service, models[sel[0]])
+            self._ui_state_save()
             dialog.destroy()
 
         ttk.Button(dialog, text="Use Selected Model", command=_on_confirm).pack(pady=10)
@@ -849,6 +894,117 @@ class AIReviewMixin:
         self.ai_batch_btn.configure(state=state)
         self.col_run_btn.configure(state=state)
         self.eval_run_btn.configure(state=state)
+        if state == "disabled":
+            self.col_rerun_btn.configure(state="disabled")
+        else:
+            self._col_rerun_btn_sync()
+
+    def _col_failed_rows(self):
+        """Rows of the last analysis whose cells hold [ERROR]/[unparsed]."""
+        return [r for r in self._col_results
+                if any(isinstance(v, str)
+                       and (v.startswith("[ERROR]") or v.startswith("[unparsed]"))
+                       for v in r.values())]
+
+    def _col_rerun_btn_sync(self):
+        """'Re-run failed' is only clickable when a finished run left failed
+        rows behind (and its settings snapshot exists to repeat them with)."""
+        ready = (not self._ai_busy and bool(self._col_run_ctx)
+                 and bool(self._col_failed_rows()))
+        self.col_rerun_btn.configure(state="normal" if ready else "disabled")
+
+    # ---------------------------------------------- session-state persist -- #
+    def _ui_state_save(self):
+        """Persist the page's session choices (storage file, LLM service and
+        models, auto-eval picker, Evaluation-tab ticks, window geometry and
+        console sash) so the next launch starts where this one left off.
+        Best-effort: a failure never disturbs the app."""
+        try:
+            sash = None
+            try:
+                if getattr(self._ai_vsplit, "_sash_placed", False):
+                    sash = int(self._ai_vsplit.sashpos(0))
+            except Exception:  # noqa: BLE001
+                pass
+            state = {
+                "store_path": self._col_store_path,
+                "llm_choice": self.llm_choice_an.get(),
+                "models": {lbl: get_selected_model(lbl)
+                           for lbl in ("BlaBla", "DLR Ollama")},
+                "eval_auto": bool(self.eval_auto_var.get()),
+                "col_eval_choices": {k: bool(v) for k, v
+                                     in self._col_eval_choices.items()},
+                "eval_metrics": {label: bool(var.get()) for label, var
+                                 in self.eval_metric_vars.items()},
+                "eval_uniq": bool(self.eval_uniq_var.get()),
+                "eval_out_choice": self.eval_out_choice.get(),
+                "eval_wb": self.eval_wb.get().strip(),
+                "geometry": self.root.winfo_toplevel().geometry(),
+                "sash": sash,
+            }
+            path = _ui_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+        except Exception:  # noqa: BLE001 - saving is best-effort
+            pass
+
+    def _ui_state_load(self):
+        """Restore the choices saved by :meth:`_ui_state_save`. Every field
+        is applied independently and guarded, so a stale or partial state
+        file can never block the startup."""
+        try:
+            path = _ui_state_path()
+            if not path.exists():
+                return
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(state.get("store_path"), str) and state["store_path"]:
+            self._col_store_path = state["store_path"]
+        if state.get("llm_choice") in ("O", "B"):
+            self.llm_choice_an.set(state["llm_choice"])
+        models = state.get("models") or {}
+        for lbl in ("BlaBla", "DLR Ollama"):
+            if isinstance(models.get(lbl), str) and models[lbl]:
+                try:
+                    set_selected_model(lbl, models[lbl])
+                except Exception:  # noqa: BLE001
+                    pass
+        if isinstance(state.get("eval_auto"), bool):
+            self.eval_auto_var.set(state["eval_auto"])
+        if isinstance(state.get("col_eval_choices"), dict):
+            self._col_eval_choices.update(
+                {str(k): bool(v) for k, v in state["col_eval_choices"].items()})
+        if isinstance(state.get("eval_metrics"), dict):
+            for label, val in state["eval_metrics"].items():
+                if label in self.eval_metric_vars:
+                    self.eval_metric_vars[label].set(bool(val))
+            try:  # re-apply the backend gating (e.g. BERTScore availability)
+                self._eval_backend_changed()
+            except Exception:  # noqa: BLE001
+                pass
+        if isinstance(state.get("eval_uniq"), bool):
+            self.eval_uniq_var.set(state["eval_uniq"])
+        if state.get("eval_out_choice") in ("same", "new"):
+            self.eval_out_choice.set(state["eval_out_choice"])
+        wb = state.get("eval_wb")
+        if isinstance(wb, str) and wb and os.path.exists(wb):
+            self.eval_wb.delete(0, tk.END)
+            self.eval_wb.insert(0, wb)
+            try:
+                self._eval_refresh_sheets()
+            except Exception:  # noqa: BLE001
+                pass
+        geo = state.get("geometry")
+        if isinstance(geo, str) and re.match(r"^\d+x\d+", geo):
+            try:
+                self.root.winfo_toplevel().geometry(geo)
+            except Exception:  # noqa: BLE001
+                pass
+        if isinstance(state.get("sash"), int):
+            self._ui_saved_sash = state["sash"]
 
     # ------------------------------------------------- AI column analysis -- #
     def _col_load_columns(self):
@@ -1131,6 +1287,13 @@ class AIReviewMixin:
             self.col_table.heading(c, text=c)
             self.col_table.column(c, width=140 if c == "Section" else 180, anchor="w")
 
+        # Settings snapshot so "Re-run failed" can repeat exactly this run.
+        self._col_run_ctx = {"col_defs": col_defs, "prompt_head": prompt_head,
+                             "per_col": per_col, "service": service,
+                             "model": model}
+        self._col_rerun = False
+        self._ui_state_save()
+
         self._ai_busy = True
         self._ai_set_busy_buttons("disabled")
         self._col_pause_ev.clear()
@@ -1191,6 +1354,51 @@ class AIReviewMixin:
         win.grab_set()
         win.wait_window()
         return result["value"]
+
+    def _col_rerun_failed(self):
+        """Re-analyze only the failed rows ([ERROR]/[unparsed]) of the last
+        run with its snapshotted settings, updating their existing rows in
+        the table and the run sheet instead of appending new ones."""
+        if self._ai_busy:
+            return
+        ctx = self._col_run_ctx
+        failed = self._col_failed_rows()
+        if not ctx or not failed:
+            self._col_rerun_btn_sync()
+            return
+        jobs, missing = [], []
+        for r in failed:
+            title = str(r.get("Section", ""))
+            text = self._col_run_refs.get(title)
+            if text is None:
+                missing.append(title)
+            else:
+                jobs.append((title, text))
+        if missing:
+            self._ai_log("[WARN] no section text for: " + ", ".join(missing))
+        if not jobs:
+            messagebox.showinfo("Re-run failed",
+                                "The failed sections' texts are not available "
+                                "any more — run the analysis again instead.")
+            return
+        self._col_rerun = True
+        self._ai_busy = True
+        self._ai_set_busy_buttons("disabled")
+        self._col_pause_ev.clear()
+        self._col_stop_ev.clear()
+        self.col_pause_btn.configure(state="normal", text="Pause")
+        self.col_stop_btn.configure(state="normal")
+        self._col_q = queue.Queue()
+        self._queue_snapshot_for([t for t, _ in jobs])
+        self._ai_progress_start(len(jobs))
+        self._ai_log(f"=== Re-running {len(jobs)} failed section(s): "
+                     + ", ".join(f"'{t}'" for t, _ in jobs) + " ===")
+        self.status_var.set(f"Re-running {len(jobs)} failed section(s)…")
+        threading.Thread(target=self._col_worker,
+                         args=(jobs, ctx["col_defs"], ctx["prompt_head"],
+                               ctx["service"], ctx["model"], ctx["per_col"]),
+                         daemon=True).start()
+        self.root.after(150, self._col_poll)
 
     def _col_wait_if_paused(self):
         """Worker helper: block while paused; False = the run was stopped."""
@@ -1343,13 +1551,13 @@ class AIReviewMixin:
                 item = self._col_q.get_nowait()
                 if item is None:
                     self._ai_busy = False
-                    self._ai_set_busy_buttons("normal")
                     self.col_pause_btn.configure(state="disabled", text="Pause")
                     self.col_stop_btn.configure(state="disabled")
                     self._ai_progress_done()
-                    done = ("Column analysis stopped"
-                            if self._col_stop_ev.is_set()
-                            else "Column analysis complete")
+                    what = ("Failed-row re-run" if self._col_rerun
+                            else "Column analysis")
+                    done = what + (" stopped" if self._col_stop_ev.is_set()
+                                   else " complete")
                     done += f" — {len(self._col_results)} row(s)"
                     if self._col_store_path and self._col_rows_saved:
                         done += f", saved to {os.path.basename(self._col_store_path)}"
@@ -1359,6 +1567,12 @@ class AIReviewMixin:
                     self._ai_log(done + ".")
                     # Rows were evaluated as they were saved; finish up.
                     self._col_eval_finish()
+                    self._col_rerun = False
+                    self._ai_set_busy_buttons("normal")  # syncs Re-run failed
+                    if self._col_failed_rows():
+                        self._ai_log(f"⚠ {len(self._col_failed_rows())} row(s) "
+                                     "still hold [ERROR]/[unparsed] — "
+                                     "'Re-run failed' repeats only those.")
                     return
                 kind, payload = item
                 if kind == "error":
@@ -1372,9 +1586,26 @@ class AIReviewMixin:
                     self._queue_set_status(payload - 1, "running")
                     self._ai_progress_info_update()
                 else:
-                    self._col_results.append(payload)
-                    self.col_table.insert("", "end", values=[
-                        payload.get(c, "") for c in self._col_table_cols])
+                    if self._col_rerun:
+                        # Replace the failed row (results + table) in place.
+                        title = payload.get("Section", "")
+                        for i, r in enumerate(self._col_results):
+                            if r.get("Section") == title:
+                                self._col_results[i] = payload
+                                break
+                        else:
+                            self._col_results.append(payload)
+                        for item in self.col_table.get_children():
+                            vals = self.col_table.item(item, "values")
+                            if vals and vals[0] == title:
+                                self.col_table.item(item, values=[
+                                    payload.get(c, "")
+                                    for c in self._col_table_cols])
+                                break
+                    else:
+                        self._col_results.append(payload)
+                        self.col_table.insert("", "end", values=[
+                            payload.get(c, "") for c in self._col_table_cols])
                     self._col_save_row(payload)
                     ok = not any(isinstance(v, str)
                                  and (v.startswith("[ERROR]")
@@ -1495,50 +1726,80 @@ class AIReviewMixin:
                     json.dump(self._col_results, f, indent=2, ensure_ascii=False)
             elif ext == ".csv":
                 import csv
-                mode = "w" if self._col_rows_saved == 0 else "a"
-                with open(path, mode, newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=cols)
-                    if self._col_rows_saved == 0:
+                if self._col_rerun:
+                    # replaced rows: rewrite the whole file from the results
+                    with open(path, "w", newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(f, fieldnames=cols)
                         w.writeheader()
-                    w.writerow(row)
+                        w.writerows(self._col_results)
+                else:
+                    mode = "w" if self._col_rows_saved == 0 else "a"
+                    with open(path, mode, newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(f, fieldnames=cols)
+                        if self._col_rows_saved == 0:
+                            w.writeheader()
+                        w.writerow(row)
             else:  # .xlsx
                 from datetime import datetime
 
                 from openpyxl import Workbook, load_workbook
                 from openpyxl.styles import Alignment, Font
                 from openpyxl.utils import get_column_letter
-                if self._col_rows_saved == 0:
-                    if os.path.exists(path):
-                        wb = load_workbook(path)
-                        ws = wb.create_sheet()
-                    else:
-                        wb = Workbook()
-                        ws = wb.active
-                    stamp = datetime.now().strftime("%Y-%m-%d %H.%M.%S")
-                    run_no = sum(1 for s in wb.sheetnames if s.startswith("Run ")) + 1
-                    ws.title = f"Run {run_no} {stamp}"[:31]
-                    self._col_run_sheet = ws.title
-                    ws.append(cols)
-                    for cell in ws[1]:
-                        cell.font = Font(bold=True)
-                    ws.column_dimensions["A"].width = 40
-                    for i in range(2, len(cols) + 1):
-                        ws.column_dimensions[get_column_letter(i)].width = 50
-                else:
+                if self._col_rerun and self._col_run_sheet:
+                    # Re-run of a failed row: overwrite its existing sheet
+                    # row (matched by the Section cell) instead of appending.
                     wb = load_workbook(path)
                     ws = wb[self._col_run_sheet]
-                ws.append([str(row.get(c, "")) for c in cols])
-                wrap = Alignment(wrap_text=True, vertical="top")
-                for cell in ws[ws.max_row]:
-                    cell.alignment = wrap
-                wb.save(path)
+                    wrap = Alignment(wrap_text=True, vertical="top")
+                    title = str(row.get("Section", ""))
+                    for r in range(2, ws.max_row + 1):
+                        if str(ws.cell(row=r, column=1).value or "") == title:
+                            for j, c in enumerate(cols, 1):
+                                cell = ws.cell(row=r, column=j,
+                                               value=str(row.get(c, "")))
+                                cell.alignment = wrap
+                            break
+                    else:  # row vanished from the sheet: append it back
+                        ws.append([str(row.get(c, "")) for c in cols])
+                        for cell in ws[ws.max_row]:
+                            cell.alignment = wrap
+                    wb.save(path)
+                else:
+                    if self._col_rows_saved == 0:
+                        if os.path.exists(path):
+                            wb = load_workbook(path)
+                            ws = wb.create_sheet()
+                        else:
+                            wb = Workbook()
+                            ws = wb.active
+                        stamp = datetime.now().strftime("%Y-%m-%d %H.%M.%S")
+                        run_no = sum(1 for s in wb.sheetnames
+                                     if s.startswith("Run ")) + 1
+                        ws.title = f"Run {run_no} {stamp}"[:31]
+                        self._col_run_sheet = ws.title
+                        ws.append(cols)
+                        for cell in ws[1]:
+                            cell.font = Font(bold=True)
+                        ws.column_dimensions["A"].width = 40
+                        for i in range(2, len(cols) + 1):
+                            ws.column_dimensions[get_column_letter(i)].width = 50
+                    else:
+                        wb = load_workbook(path)
+                        ws = wb[self._col_run_sheet]
+                    ws.append([str(row.get(c, "")) for c in cols])
+                    wrap = Alignment(wrap_text=True, vertical="top")
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = wrap
+                    wb.save(path)
                 self._col_update_uniques(path)
                 self._col_update_entities(path)
                 self._col_eval_saved_row(row)
-            self._col_rows_saved += 1
-            self.status_var.set(f"Saved row {self._col_rows_saved} "
-                                f"({row.get('Section', '')}) → {os.path.basename(path)}")
-            self._ai_log(f"💾 Row {self._col_rows_saved} saved → "
+            if not self._col_rerun:
+                self._col_rows_saved += 1
+            verb = "re-saved" if self._col_rerun else "saved"
+            self.status_var.set(f"Row ({row.get('Section', '')}) {verb} → "
+                                f"{os.path.basename(path)}")
+            self._ai_log(f"💾 Row '{row.get('Section', '')}' {verb} → "
                          f"{os.path.basename(path)}"
                          + (f" (sheet '{self._col_run_sheet}')"
                             if self._col_run_sheet else ""))
@@ -2340,6 +2601,7 @@ class AIReviewMixin:
                                 "Tick at least one evaluation to run.")
             return
         embedding = self._eval_embedding_config()
+        self._ui_state_save()   # remember workbook + metric choices
         references = self._eval_references()
         if references is None:
             return
@@ -2509,7 +2771,16 @@ class AIReviewMixin:
                              f"{self._ai_preview(row.get(col))}")
             entry = evaluate_row(row, self._col_run_refs, data_cols,
                                  self._col_run_eval_metrics)
-            self._col_eval_entries.append(entry)
+            if self._col_rerun:
+                # replace the failed row's earlier evaluation
+                for i, e in enumerate(self._col_eval_entries):
+                    if e.get("Section") == entry.get("Section"):
+                        self._col_eval_entries[i] = entry
+                        break
+                else:
+                    self._col_eval_entries.append(entry)
+            else:
+                self._col_eval_entries.append(entry)
             self._ai_log("   result: " + self._ai_preview(
                 "; ".join(f"{k}={v}" for k, v in entry.items()
                           if k not in ("Section",)), 300))
