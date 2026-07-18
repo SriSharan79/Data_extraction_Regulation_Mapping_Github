@@ -19,66 +19,122 @@ import tiktoken
 import re # Import regex
 from typing import List,Dict,Any
 init(autoreset=True)
+import threading
 import time
 
 
-REQUEST_TIMES = deque(maxlen=10)
+# ---------------------------------------------------------------------------
+# ONE shared rate limit for every remote API call (chat AND embeddings)
+# ---------------------------------------------------------------------------
+# Whatever kind of API call is made, at most `max_requests` requests go out
+# per `window` seconds across the whole session. Chat completions and
+# embedding requests draw from the SAME budget (they hit the same providers),
+# so bursts can never exceed the limit no matter which mix of calls runs.
+API_CALL_LIMITS = {
+    "max_requests": 10,   # total API calls allowed per window — shared budget
+    "window": 60.0,       # sliding window in seconds
+    "timeout": 60.0,      # per-request HTTP timeout for chat completions
+}
+REQUEST_TIMES = deque(maxlen=API_CALL_LIMITS["max_requests"])
+_REQUEST_LOCK = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# Embedding request throttling (independent of the chat REQUEST_TIMES above)
-# ---------------------------------------------------------------------------
-# Embeddings are cheaper than chat completions and are issued in tight batches
-# from the evaluation pipeline, so they get their OWN, independently tunable
-# HTTP timeout / rate limit / pre-request delay. Tune at runtime via
-# configure_embedding_limits() (e.g. from the desktop UI) without disturbing
-# the chat throttling. Defaults are looser than the old hard-coded 3 s sleep +
-# 10-per-60 s limit, because batched embedding calls are lighter.
+def _api_throttle(kind="API"):
+    """Block until this request fits the shared budget, then record it.
+    Thread-safe: concurrent workers queue up on the lock, so the
+    10-per-window limit holds across threads too."""
+    with _REQUEST_LOCK:
+        max_requests = int(API_CALL_LIMITS["max_requests"])
+        window = float(API_CALL_LIMITS["window"])
+        if len(REQUEST_TIMES) >= max_requests:
+            elapsed = time.time() - REQUEST_TIMES[0]
+            if elapsed < window:
+                sleep_time = window - elapsed
+                print(Fore.YELLOW + f"⚠️ {kind} rate limit: sleeping "
+                      f"{sleep_time:.2f}s (max {max_requests} API calls per "
+                      f"{int(window)}s, shared by chat + embeddings)"
+                      + Style.RESET_ALL)
+                time.sleep(sleep_time)
+        REQUEST_TIMES.append(time.time())
+
+
+# Embedding-specific knobs: only the HTTP timeout and an optional fixed
+# pre-request delay remain embedding-local — the rate limit itself is the
+# shared API_CALL_LIMITS budget above.
 EMBEDDING_LIMITS = {
     "timeout": 120,            # per-request HTTP timeout (seconds)
-    "max_requests": 20,        # requests allowed per `window` seconds
-    "window": 60,              # sliding window (seconds) for max_requests
     "pre_request_delay": 0.0,  # fixed pause before each request (seconds)
 }
-EMBEDDING_REQUEST_TIMES = deque(maxlen=EMBEDDING_LIMITS["max_requests"])
 
 
 def configure_embedding_limits(timeout=None, max_requests=None, window=None,
                                pre_request_delay=None):
-    """Tune the embedding throttling at runtime; only the given values change.
-    Resizing max_requests rebuilds the sliding-window deque (keeping the most
-    recent timestamps). Returns the effective settings."""
-    global EMBEDDING_REQUEST_TIMES
+    """Tune throttling at runtime; only the given values change.
+    ``max_requests``/``window`` adjust the SHARED API budget (chat +
+    embeddings together). Returns the effective settings."""
+    global REQUEST_TIMES
     if timeout is not None:
         EMBEDDING_LIMITS["timeout"] = float(timeout)
-    if window is not None:
-        EMBEDDING_LIMITS["window"] = float(window)
     if pre_request_delay is not None:
         EMBEDDING_LIMITS["pre_request_delay"] = max(0.0, float(pre_request_delay))
-    if max_requests is not None:
-        mr = max(1, int(max_requests))
-        EMBEDDING_LIMITS["max_requests"] = mr
-        EMBEDDING_REQUEST_TIMES = deque(EMBEDDING_REQUEST_TIMES, maxlen=mr)
-    return dict(EMBEDDING_LIMITS)
+    with _REQUEST_LOCK:
+        if window is not None:
+            API_CALL_LIMITS["window"] = float(window)
+        if max_requests is not None:
+            mr = max(1, int(max_requests))
+            API_CALL_LIMITS["max_requests"] = mr
+            REQUEST_TIMES = deque(REQUEST_TIMES, maxlen=mr)
+    return {**EMBEDDING_LIMITS, "max_requests": API_CALL_LIMITS["max_requests"],
+            "window": API_CALL_LIMITS["window"]}
 
 
 def _embedding_throttle():
-    """Pre-request delay, then a sliding-window rate limit, then record this
-    request's timestamp. Shared by every embedding request so the limit is
-    honoured across the whole session."""
+    """Optional pre-request delay, then the shared API rate limit."""
     delay = EMBEDDING_LIMITS["pre_request_delay"]
     if delay > 0:
         time.sleep(delay)
-    max_requests = int(EMBEDDING_LIMITS["max_requests"])
-    window = float(EMBEDDING_LIMITS["window"])
-    if len(EMBEDDING_REQUEST_TIMES) >= max_requests:
-        elapsed = time.time() - EMBEDDING_REQUEST_TIMES[0]
-        if elapsed < window:
-            sleep_time = window - elapsed
-            print(Fore.YELLOW + f"⚠️ Embedding rate limit approaching. "
-                  f"Sleeping for {sleep_time:.2f}s..." + Style.RESET_ALL)
-            time.sleep(sleep_time)
-    EMBEDDING_REQUEST_TIMES.append(time.time())
+    _api_throttle("Embedding")
+
+
+def _parse_embedding_response(result, expected):
+    """Pull the vectors out of an /embeddings response (OpenAI-compatible or
+    native Ollama shape). Raises ValueError on an unexpected shape or count."""
+    embeddings = None
+    if isinstance(result, dict) and result.get("data"):
+        # OpenAI-compatible: {"data": [{"embedding": [...], "index": 0}, ...]}
+        data_sorted = sorted(result["data"], key=lambda d: d.get("index", 0))
+        embeddings = [d["embedding"] for d in data_sorted if "embedding" in d]
+    elif isinstance(result, dict) and result.get("embeddings"):
+        # Native Ollama batch (/api/embed): {"embeddings": [[...], [...]]}
+        embeddings = result["embeddings"]
+    elif isinstance(result, dict) and result.get("embedding"):
+        # Native Ollama single (/api/embeddings): {"embedding": [...]}
+        embeddings = [result["embedding"]]
+    if not embeddings:
+        raise ValueError(f"No embedding vectors returned: {result}")
+    if expected and len(embeddings) != expected:
+        raise ValueError(f"Expected {expected} embedding vector(s), "
+                         f"got {len(embeddings)}")
+    return embeddings
+
+
+def _embed_in_halves(texts, embed_fn, label="embedding"):
+    """Embed a pool of strings with as few calls as possible: try the WHOLE
+    pool in one call first; if that fails (server limit, timeout, OOM …),
+    split the pool in half and retry each half the same way, recursively,
+    until the pieces go through. Returns one vector per input, in order.
+    A single item that still fails raises its error."""
+    try:
+        return embed_fn(texts)
+    except Exception as exc:  # noqa: BLE001 - any failure triggers the split
+        if len(texts) <= 1:
+            raise
+        mid = (len(texts) + 1) // 2
+        print(Fore.YELLOW + f"⚠️ {label} pool of {len(texts)} failed ({exc}) "
+              f"— splitting into {mid} + {len(texts) - mid} and retrying."
+              + Style.RESET_ALL)
+        return (_embed_in_halves(texts[:mid], embed_fn, label)
+                + _embed_in_halves(texts[mid:], embed_fn, label))
 
 
 # ---------------------------------------------------------------------------
@@ -295,15 +351,13 @@ def get_embedding(
         }
     """
     
-    # Resolve the effective timeout and apply the embedding-specific throttle
-    # (pre-request delay + sliding-window rate limit). Both are tunable at
-    # runtime via configure_embedding_limits(), independent of chat throttling.
+    # Resolve the effective timeout; the shared API rate limit is applied per
+    # request inside _request below (so halved retries are throttled too).
     if timeout is None:
         timeout = EMBEDDING_LIMITS["timeout"]
-    _embedding_throttle()
 
     start_time = time.time()
-    
+
     if service not in ("BlaBla", "DLR Ollama"):
         raise ValueError(f"Unknown service '{service}'. Expected 'BlaBla' or 'DLR Ollama'.")
 
@@ -325,37 +379,28 @@ def get_embedding(
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
-    payload = {
-        "model": resolved_model,
-        "input": inputs,
-    }
-
     url = f"{base_url}/embeddings"
 
-    start_time = time.time()
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    result = resp.json()
+    # Whole pool in ONE call when possible; on failure _embed_in_halves
+    # splits it recursively. `raw` keeps the server response only when a
+    # single request served the entire pool (a stitched pool has none).
+    raw_holder = {}
+
+    def _request(batch):
+        _embedding_throttle()
+        resp = requests.post(url, headers=headers,
+                             json={"model": resolved_model, "input": list(batch)},
+                             timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        if len(batch) == len(inputs):
+            raw_holder["raw"] = payload
+        return _parse_embedding_response(payload, len(batch))
+
+    embeddings = _embed_in_halves(list(inputs), _request,
+                                  f"{service} embedding")
+    result = raw_holder.get("raw")
     end_time = time.time()
-
-    try:
-        embeddings = None
-        if isinstance(result, dict) and result.get("data"):
-            # OpenAI-compatible: {"data": [{"embedding": [...], "index": 0}, ...]}
-            data_sorted = sorted(result["data"], key=lambda d: d.get("index", 0))
-            embeddings = [d["embedding"] for d in data_sorted if "embedding" in d]
-        elif isinstance(result, dict) and result.get("embeddings"):
-            # Native Ollama batch (/api/embed): {"embeddings": [[...], [...]]}
-            embeddings = result["embeddings"]
-        elif isinstance(result, dict) and result.get("embedding"):
-            # Native Ollama single (/api/embeddings): {"embedding": [...]}
-            embeddings = [result["embedding"]]
-
-        if not embeddings:
-            raise ValueError("No embedding vectors returned")
-    except (KeyError, TypeError, ValueError) as exc:
-        print(f"❌ {service} embedding call failed. Full response: {result}")
-        raise ValueError(f"Unexpected embedding response format from {service}: {exc}") from exc
 
     print(
         Fore.GREEN
@@ -501,23 +546,31 @@ def vectorize_strings_local(input_strings: list, max_length: int = 512):
 
     tokenizer, model = _get_embedding_model_and_tokenizer()
 
-    with torch.inference_mode():
-        batch = tokenizer(
-            input_strings,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        batch = {k: v.to(model.device) for k, v in batch.items()}
+    def _encode(strings):
+        # One forward pass over the given pool; raises on OOM etc. so
+        # _embed_in_halves can retry with smaller pools.
+        with torch.inference_mode():
+            batch = tokenizer(
+                list(strings),
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            batch = {k: v.to(model.device) for k, v in batch.items()}
 
-        outputs = model(**batch)
-        emb = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
+            outputs = model(**batch)
+            emb = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
 
-        # Normalise => cosine similarity works with inner product / L2
-        emb = F.normalize(emb, p=2, dim=1)
+            # Normalise => cosine similarity works with inner product / L2
+            emb = F.normalize(emb, p=2, dim=1)
 
-        return emb.detach().cpu().numpy().astype(np.float32)
+            return list(emb.detach().cpu().numpy().astype(np.float32))
+
+    # Whole pool first; on failure (e.g. GPU out-of-memory on a large pool)
+    # split in half recursively until the pieces fit.
+    vectors = _embed_in_halves(list(input_strings), _encode, "local embedding")
+    return np.stack(vectors).astype(np.float32)
 
 
 def count_tokens(messages, response_text, model):
@@ -640,25 +693,8 @@ def Ollama_ask_llm(
     max_tokens: int = 2000,
     model: str = None,
 ) -> str:
-    time.sleep(3)
-        
-    # --- RATE LIMITER LOGIC ---
-    current_time = time.time()
-    
-    # If we have already hit our 20 request capacity, check the oldest request
-    if len(REQUEST_TIMES) == 10:
-        oldest_request_time = REQUEST_TIMES[0]
-        elapsed_since_oldest = current_time - oldest_request_time
-        
-        # If the oldest request happened less than 60 seconds ago, we must wait
-        if elapsed_since_oldest < 60:
-            sleep_time = 60 - elapsed_since_oldest
-            print(Fore.YELLOW + f"⚠️ Rate limit approaching. Sleeping for {sleep_time:.2f} seconds..." + Style.RESET_ALL)
-            time.sleep(sleep_time)
-            
-    # Record the current timestamp for this request execution
-    REQUEST_TIMES.append(time.time())
-    # --------------------------
+    # Shared 10-per-window API budget (chat + embeddings together).
+    _api_throttle("Chat")
 
     start_time = time.time()
 
@@ -685,7 +721,8 @@ def Ollama_ask_llm(
         headers["Authorization"] = f"Bearer {Ollama_DLR_API_Key}"
 
     url = f'{OLLAMA_BASE_URL}/chat/completions'
-    resp = requests.post(url, headers=headers, json=payload)
+    resp = requests.post(url, headers=headers, json=payload,
+                         timeout=API_CALL_LIMITS["timeout"])
 
     # Raise an informative error if something went wrong
     resp.raise_for_status()
@@ -818,26 +855,9 @@ def blabla_ask_llm(
     model: str = None,
 ) -> str:
     """Query Blablador LLM with the selected (or default) model."""
-    
-    time.sleep(3)
-        
-    # --- RATE LIMITER LOGIC ---
-    current_time = time.time()
-    
-    # If we have already hit our 20 request capacity, check the oldest request
-    if len(REQUEST_TIMES) == 10:
-        oldest_request_time = REQUEST_TIMES[0]
-        elapsed_since_oldest = current_time - oldest_request_time
-        
-        # If the oldest request happened less than 60 seconds ago, we must wait
-        if elapsed_since_oldest < 60:
-            sleep_time = 60 - elapsed_since_oldest
-            print(Fore.YELLOW + f"⚠️ Rate limit approaching. Sleeping for {sleep_time:.2f} seconds..." + Style.RESET_ALL)
-            time.sleep(sleep_time)
-            
-    # Record the current timestamp for this request execution
-    REQUEST_TIMES.append(time.time())
-    # --------------------------
+
+    # Shared 10-per-window API budget (chat + embeddings together).
+    _api_throttle("Chat")
 
     start_time = time.time()
     # print_with_separator("DebugLog",'/')
@@ -866,7 +886,8 @@ def blabla_ask_llm(
 
     url = f"{BLABLADOR_BASE_URL}/chat/completions"
 
-    resp = requests.post(url, headers=headers, json=payload)
+    resp = requests.post(url, headers=headers, json=payload,
+                         timeout=API_CALL_LIMITS["timeout"])
     resp.raise_for_status()
 
     result = resp.json()
@@ -1013,7 +1034,10 @@ import threading
 # Timeout wrapper function
 def timeout_function(func, args=(), timeout=120, fallback=None):
     """
-    Executes a function with a timeout. If it exceeds the timeout, it will attempt a fallback function.
+    DEPRECATED: llm_call no longer uses this — the HTTP requests carry their
+    own ``timeout=`` now, which raises cleanly instead of abandoning a live
+    worker thread. Kept only for backward compatibility; the worker is a
+    daemon so a timed-out call can no longer block interpreter exit.
     """
     result = None
     error = None
@@ -1026,7 +1050,7 @@ def timeout_function(func, args=(), timeout=120, fallback=None):
             error = e  # If an error occurs, capture it
             traceback.print_exc()              
     
-    thread = threading.Thread(target=worker)
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     thread.join(timeout)
     
@@ -1064,31 +1088,41 @@ def llm_call(prompt: str, system_prompt: str, service: str, model: str = None):
     s = service.lower()
 
     # Optional per-call model override: record it as the session selection for
-    # the targeted service so the ask_* helpers (called via timeout_function)
-    # pick it up.
+    # the targeted service so the ask_* helpers pick it up.
     if model:
         if s == 'b':
             set_selected_model("BlaBla", model)
         elif s == 'o':
             set_selected_model("DLR Ollama", model)
 
-    # Service calling logic with timeout and fallback
+    # The HTTP requests carry their own timeout (API_CALL_LIMITS["timeout"]),
+    # so a hung call raises here instead of leaking a worker thread. On any
+    # failure the OTHER service is tried once, loudly, so the switch is
+    # visible in the logs; None only when both failed.
     if s == 'b':
-        # If service B (blabla) fails or times out, fallback to Ollama (o)
-        response = timeout_function(blabla_ask_llm, (prompt, sys_prompt), timeout=60, fallback=lambda prompt, sys_prompt: timeout_function(Ollama_ask_llm, (prompt, sys_prompt), timeout=60, fallback=None))
+        order = ((blabla_ask_llm, "Blablador"), (Ollama_ask_llm, "DLR Ollama"))
     elif s == 'o':
-        # If service O (Ollama) fails or times out, fallback to Blabla (b)
-        response = timeout_function(Ollama_ask_llm, (prompt, sys_prompt), timeout=60, fallback=lambda prompt, sys_prompt: timeout_function(blabla_ask_llm, (prompt, sys_prompt), timeout=60, fallback=None))
+        order = ((Ollama_ask_llm, "DLR Ollama"), (blabla_ask_llm, "Blablador"))
     elif s == 'l':
         # Local model call
-        # hf_pipeline=hf_pipeline_with_Lamma()  
-        response = Local_Model_call(prompt, sys_prompt)
+        return Local_Model_call(prompt, sys_prompt)
     else:
         error_msg = "Error: Invalid service. Use 'B', 'O', or 'L'."
         print(error_msg)
         return error_msg  # Return the error so the app doesn't crash downstream
 
-    return response
+    (primary, primary_label), (backup, backup_label) = order
+    try:
+        return primary(prompt, sys_prompt)
+    except Exception as exc:  # noqa: BLE001 - includes requests timeouts
+        print(Fore.YELLOW + f"⚠️ {primary_label} call failed ({exc}) — "
+              f"falling back to {backup_label}." + Style.RESET_ALL)
+        try:
+            return backup(prompt, sys_prompt)
+        except Exception as exc2:  # noqa: BLE001
+            print(Fore.RED + f"❌ {backup_label} fallback failed too "
+                  f"({exc2})." + Style.RESET_ALL)
+            return None
 
 # print(llm_call('hi','','o'))
 if __name__ == "__main__":
