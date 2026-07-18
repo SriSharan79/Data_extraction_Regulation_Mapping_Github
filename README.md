@@ -184,6 +184,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     True/False counts, metric columns, per-section **Coverage %**, an average
     row) — written **into the same workbook or into a new evaluation
     workbook** (your choice; the new file also gets a copy of the run sheet).
+    Alongside the per-metric item sheets, the **complete sentence-level
+    record** is stored as JSON in a `Metric_Sentence_Details/` folder next to
+    the evaluation workbook (one file per run, mirroring alr): for every
+    extracted item, every reference sentence with every selected metric's
+    value against it — the full item×sentence matrix the per-item sheets keep
+    only the best value of — plus the kept best value/sentence per metric.
     Optionally the unique generated values are identified via
     `scripts/excel_file_utils.save_unique_elements_to_new_sheet` (the
     `Uniq Run N …` sheet) and every unique element is grounded against the

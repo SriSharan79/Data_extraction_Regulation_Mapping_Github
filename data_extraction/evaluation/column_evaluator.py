@@ -33,7 +33,12 @@ against every reference sentence and only the **most relevant** sentence's
 value is kept — the highest for the similarity-style metrics, the lowest for
 the edit-distance / error-rate metrics — alongside the sentence that produced
 it. The **overview** (``Eval <run sheet>``) is unchanged: it still scores each
-whole cell against the whole reference.
+whole cell against the whole reference. The **complete sentence-level
+record** — every item scored against EVERY reference sentence, not just the
+best one — is additionally stored per run as JSON in a
+``Metric_Sentence_Details`` folder next to the evaluation workbook
+(:func:`write_sentence_details`, the counterpart of alr's per-document
+``Metric_Sentence_Details`` files).
 
 Each metric is guarded: a missing library or failure records ``None``
 instead of aborting. The **overview** (``Eval <run sheet>``) keeps the
@@ -766,6 +771,13 @@ def evaluate_row_items(row, references, data_cols, metrics=ALL_METRICS):
     empty reference records ``None`` (grounding stays a real True/False — an
     empty reference grounds nothing). These records feed
     :func:`write_metric_sheets`, which fans them out into one sheet per metric.
+
+    Each record additionally carries the **complete sentence-level record**
+    under ``"__sentences__"`` — one entry per reference sentence with every
+    selected metric's value for this item against that sentence (the full
+    item x sentence matrix the best values were picked from, the counterpart
+    of alr's ``Metric_Sentence_Details``). :func:`write_sentence_details`
+    stores it as JSON; :func:`write_metric_sheets` ignores the key.
     """
     metrics = [m for m in ALL_METRICS if m in set(metrics)]
     item_metrics = [m for m in metrics if m != "grounding"]
@@ -789,29 +801,37 @@ def evaluate_row_items(row, references, data_cols, metrics=ALL_METRICS):
         for idx, item in enumerate(items, 1):
             rec = {"Section": title, "Reference found": bool(reference),
                    "Column": col, "Item #": idx, "Item": item}
+            # One pass over the sentences fills both the full sentence-level
+            # record and the best value per metric.
+            detail = []
+            best = {m: None for m in item_metrics}
+            best_sent = {m: "" for m in item_metrics}
+            for sidx, sent in enumerate(sentences, 1):
+                vals = {}
+                if item_metrics and item:
+                    vals.update(_lexical_metrics(sent, item, item_metrics))
+                    vals.update(_distance_metrics(sent, item, item_metrics))
+                    vals.update(_embedding_metrics(sent, item, item_metrics))
+                srec = {"Sentence #": sidx, "Sentence": sent}
+                if grounding:
+                    srec["grounding"] = is_grounded(item, sent)
+                for m in item_metrics:
+                    v = vals.get(m)
+                    srec[m] = v
+                    if v is not None and _better(m, v, best[m]):
+                        best[m] = v
+                        best_sent[m] = sent
+                detail.append(srec)
             if grounding:
                 # Grounded if the item is a substring of ANY sentence; keep
                 # the first sentence that contains it as the witness.
-                hit = next((s for s in sentences if is_grounded(item, s)), "")
+                hit = next((s["Sentence"] for s in detail if s.get("grounding")), "")
                 rec["grounding"] = bool(hit)
                 rec["grounding__sentence"] = hit
-            if item_metrics:
-                best = {m: None for m in item_metrics}
-                best_sent = {m: "" for m in item_metrics}
-                if item and sentences:
-                    for sent in sentences:
-                        vals = {}
-                        vals.update(_lexical_metrics(sent, item, item_metrics))
-                        vals.update(_distance_metrics(sent, item, item_metrics))
-                        vals.update(_embedding_metrics(sent, item, item_metrics))
-                        for m in item_metrics:
-                            v = vals.get(m)
-                            if v is not None and _better(m, v, best[m]):
-                                best[m] = v
-                                best_sent[m] = sent
-                for m in item_metrics:
-                    rec[m] = best[m]
-                    rec[f"{m}__sentence"] = best_sent[m]
+            for m in item_metrics:
+                rec[m] = best[m]
+                rec[f"{m}__sentence"] = best_sent[m]
+            rec["__sentences__"] = detail
             records.append(rec)
     return records
 
@@ -889,6 +909,55 @@ def write_metric_sheets(file_path, run_sheet, item_records, metrics,
         _write_sheet(target, sheet, df)
         written[metric] = sheet
     return written
+
+
+def sentence_details_path(target, run_sheet):
+    """Where one run's full sentence-level record is stored: a JSON in a
+    ``Metric_Sentence_Details`` folder next to the evaluation workbook
+    (the counterpart of alr's ``Metric_Sentence_Details/{uuid}_{target}_
+    Sentence_Metrics.json``)."""
+    p = Path(target)
+    return (p.parent / "Metric_Sentence_Details"
+            / f"{p.stem} {run_sheet} Sentence_Metrics.json")
+
+
+def write_sentence_details(file_path, run_sheet, item_records, metrics,
+                           out_path=None):
+    """Store the **complete sentence-level record** of a run as JSON: for
+    every extracted item, every reference sentence with every selected
+    metric's value against it (the full matrix :func:`evaluate_row_items`
+    scored before keeping only the best sentence per metric). Rewritten on
+    every call (idempotent). Returns the JSON path, or ``None`` when the
+    records carry no sentence detail."""
+    target = str(out_path) if out_path else str(file_path)
+    metrics = [m for m in ALL_METRICS if m in set(metrics)]
+    items = []
+    for rec in item_records:
+        detail = rec.get("__sentences__")
+        if detail is None:
+            continue
+        items.append({
+            "Section": rec.get("Section"),
+            "Reference found": rec.get("Reference found"),
+            "Column": rec.get("Column"),
+            "Item #": rec.get("Item #"),
+            "Item": rec.get("Item"),
+            "best": {m: {"value": rec.get(m),
+                         "sentence": rec.get(f"{m}__sentence", "")}
+                     for m in metrics if m in rec},
+            "sentences": detail,
+        })
+    if not items:
+        return None
+    path = sentence_details_path(target, run_sheet)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"workbook": os.path.basename(target),
+                   "run_sheet": run_sheet,
+                   "metrics": metrics,
+                   "items": items},
+                  f, indent=2, ensure_ascii=False)
+    return str(path)
 
 
 def _preview(text, limit=180):
@@ -987,6 +1056,10 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
     if log and metric_sheets:
         log(f"→ per-item metric sheets ({len(item_records)} item(s)): "
             + ", ".join(f"{m} → '{s}'" for m, s in metric_sheets.items()))
+    details_path = write_sentence_details(target, run_sheet, item_records,
+                                          metrics)
+    if log and details_path:
+        log(f"→ full sentence-level record → {details_path}")
 
     total_true = sum(e.get("Row True") or 0 for e in entries)
     total_false = sum(e.get("Row False") or 0 for e in entries)
@@ -995,6 +1068,7 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
         "out_path": target,
         "eval_sheet": eval_sheet,
         "metric_sheets": metric_sheets,
+        "sentence_details": details_path,
         "items": len(item_records),
         "rows": len(entries),
         "metrics": metrics,
