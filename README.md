@@ -147,7 +147,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     (`~/.data_extraction/review_ui_state.json`): the last storage file,
     the LLM service and selected models, the auto-evaluate box and its
     picker choices, the Evaluation tab's workbook/metric/output choices,
-    and the window geometry with the console-sash position. A **＋ Specific
+    and the window geometry with the console-sash position. Every AI
+    Review tab (Free-form review, Column analysis, Evaluation, Unique
+    elements) sits in a **vertically scrollable pane** — on a small
+    window the tab scrolls (scrollbar or mouse wheel; text boxes and
+    tables keep their own wheel), on a large one the content stretches
+    to fill it, so no widget can end up unreachable. A **＋ Specific
     entities** button adds the predefined aviation entity-chain column
     (`data_extraction/ai_utils/entity_chains.py`): the LLM extracts
     `Reference-System Info-Process-Personal-QuantityValue` chains

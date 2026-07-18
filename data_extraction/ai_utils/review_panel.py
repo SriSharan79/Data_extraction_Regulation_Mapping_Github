@@ -411,9 +411,72 @@ class AIReviewMixin:
                                     tags=(status,))
             self.ai_batch_list.see(iids[idx])
 
+    def _scrollable_tab(self, title):
+        """Add a notebook tab whose whole content scrolls vertically, so every
+        widget stays reachable no matter how small the window is. Returns the
+        interior frame the tab's widgets should be packed into. When the
+        window is taller than the content, the interior stretches to fill it
+        (so expanding widgets keep working); when it is smaller, the tab
+        scrolls — via the scrollbar or the mouse wheel (widgets that scroll
+        themselves, like text boxes and tables, keep their own wheel)."""
+        outer = ttk.Frame(self.ai_nb)
+        self.ai_nb.add(outer, text=title)
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas, padding=6)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _layout(_event=None):
+            cw = max(canvas.winfo_width(), 1)
+            height = max(inner.winfo_reqheight(), canvas.winfo_height())
+            # only touch the canvas item when something changed, otherwise
+            # the <Configure> events re-trigger each other forever
+            if (canvas.itemcget(win, "width") != str(cw)
+                    or canvas.itemcget(win, "height") != str(height)):
+                canvas.itemconfigure(win, width=cw, height=height)
+            canvas.configure(scrollregion=(0, 0, cw, height))
+
+        inner.bind("<Configure>", _layout)
+        canvas.bind("<Configure>", _layout)
+
+        def _wheel(event):
+            w = event.widget
+            if w is not canvas and isinstance(
+                    w, (tk.Text, tk.Listbox, ttk.Treeview, tk.Canvas)):
+                return  # that widget scrolls itself
+            num = getattr(event, "num", None)
+            if num == 4:            # X11 wheel up
+                step = -1
+            elif num == 5:          # X11 wheel down
+                step = 1
+            else:
+                delta = getattr(event, "delta", 0)
+                if not delta:
+                    return
+                # Windows reports multiples of 120, macOS small counts
+                step = (-int(delta / 120) if abs(delta) >= 120
+                        else (-1 if delta > 0 else 1))
+            canvas.yview_scroll(step, "units")
+
+        def _bind_wheel(_e):
+            canvas.bind_all("<MouseWheel>", _wheel)
+            canvas.bind_all("<Button-4>", _wheel)
+            canvas.bind_all("<Button-5>", _wheel)
+
+        def _unbind_wheel(_e):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        return inner
+
     def _build_ai_freeform_tab(self):
-        ff = ttk.Frame(self.ai_nb, padding=6)
-        self.ai_nb.add(ff, text="Free-form review")
+        ff = self._scrollable_tab("Free-form review")
 
         cfg = ttk.Frame(ff)
         cfg.pack(fill="x")
@@ -449,8 +512,7 @@ class AIReviewMixin:
         self.ai_results.pack(fill="both", expand=True)
 
     def _build_ai_columns_tab(self):
-        ca = ttk.Frame(self.ai_nb, padding=6)
-        self.ai_nb.add(ca, text="Column analysis")
+        ca = self._scrollable_tab("Column analysis")
 
         top = ttk.PanedWindow(ca, orient="horizontal")
         top.pack(fill="x")
@@ -1850,8 +1912,7 @@ class AIReviewMixin:
         the chosen columns on a chosen separator and write the unique values
         (element + count) into a new sheet of the *same* file. Independent of a
         Column-analysis run — it works on any existing Excel file."""
-        uq = ttk.Frame(self.ai_nb, padding=6)
-        self.ai_nb.add(uq, text="Unique elements")
+        uq = self._scrollable_tab("Unique elements")
 
         wb_wrap = ttk.LabelFrame(uq, text=" Excel file ", padding=4)
         wb_wrap.pack(fill="x")
@@ -2311,8 +2372,7 @@ class AIReviewMixin:
         """Evaluation page: pick a stored analysis workbook + run sheet, the
         reference sections, the evaluations to compute and where to write
         them (data_extraction.evaluation.column_evaluator)."""
-        ev = ttk.Frame(self.ai_nb, padding=6)
-        self.ai_nb.add(ev, text="Evaluation")
+        ev = self._scrollable_tab("Evaluation")
 
         wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx with 'Run N …' sheets) ",
                                  padding=4)
