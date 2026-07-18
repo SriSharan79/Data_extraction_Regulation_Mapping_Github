@@ -137,10 +137,26 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     Excel / JSON — is the export format) and writes them there automatically
     when the run finishes; cancel the dialog to abort the run.
   - *Column analysis* — define **columns** (name + what the LLM should
-    extract); the definitions (and their ✓ unique-element checks) are
+    extract); every column has a **Run ✓** checkbox (only checked columns
+    are analyzed — heading click toggles all) next to its **Uniq ✓**
+    checkbox, and the definitions with both check states are
     **remembered across sessions** (saved to
     `~/.data_extraction/column_analysis_columns.json` on every change), so
-    closing and reopening the studio brings them back. A live **prompt
+    closing and reopening the studio brings them back. A **＋ Specific
+    entities** button adds the predefined aviation entity-chain column
+    (`data_extraction/ai_utils/entity_chains.py`): the LLM extracts
+    `Reference-System Info-Process-Personal-QuantityValue` chains
+    (`;`-separated, `#` = missing optional component, Reference
+    mandatory). When this column is part of a run its chains are
+    **auto-parsed into an `Entities <run sheet>` sheet** after every saved
+    row — one row per chain, one column per component plus the raw chain
+    (References may contain hyphens like `FAA AC 120-76D`; the parser
+    takes the last four `-`-fields as the optional components). In
+    per-column call mode this column's prompt is sent as-is and the raw
+    reply kept (no JSON wrapper). The *Unique elements* tab has the same
+    parser **standalone**: pick any workbook/sheet/column holding chain
+    values and *Parse chains → sheet* writes `Entities <sheet>` into the
+    same file. A live **prompt
     preview** rebuilds as you add/edit/remove them
     and is **editable**: whatever you type above the `---` marker is sent as
     the prompt of the next run (changing the column definitions rebuilds it).

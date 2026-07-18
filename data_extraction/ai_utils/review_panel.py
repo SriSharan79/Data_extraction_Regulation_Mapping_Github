@@ -37,6 +37,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from . import llm_utils as _llm_utils_mod
+from .entity_chains import is_entity_column as _is_entity_column
 from .llm_utils import (get_selected_model, list_available_models,
                         set_selected_model, list_embedding_models,
                         get_default_embedding_model)
@@ -149,6 +150,7 @@ class AIReviewMixin:
         self._col_results = []        # column-analysis rows (dicts) for export
         self._col_table_cols = []     # column names currently shown in the table
         self._col_uniq_checked = {name for name, _ in self._ai_columns}
+        self._col_analyze_checked = {name for name, _ in self._ai_columns}
         self._col_load_columns()      # restore the previous session's columns
         self._col_run_uniq_cols = []  # checked columns snapshotted at run start
         self._ai_autosave_path = None # where the current free-form run auto-saves
@@ -417,17 +419,22 @@ class AIReviewMixin:
         top.pack(fill="x")
 
         # Column definitions: every change here rebuilds the prompt preview.
-        cols_wrap = ttk.LabelFrame(top, text=" Columns to extract (✓ = collect unique elements) ",
-                                   padding=4)
+        cols_wrap = ttk.LabelFrame(
+            top, text=" Columns to extract (Run ✓ = analyze this column · "
+                      "Uniq ✓ = collect unique elements) ", padding=4)
         top.add(cols_wrap, weight=1)
-        self.col_defs = ttk.Treeview(cols_wrap, columns=("uniq", "what"),
+        self.col_defs = ttk.Treeview(cols_wrap, columns=("an", "uniq", "what"),
                                      show="tree headings", height=3)
         self.col_defs.heading("#0", text="Column")
-        self.col_defs.heading("uniq", text="✓", command=self._col_toggle_uniq_all)
+        self.col_defs.heading("an", text="Run ✓",
+                              command=self._col_toggle_analyze_all)
+        self.col_defs.heading("uniq", text="Uniq ✓",
+                              command=self._col_toggle_uniq_all)
         self.col_defs.heading("what", text="What should the LLM extract?")
         self.col_defs.column("#0", width=140, anchor="w")
-        self.col_defs.column("uniq", width=34, minwidth=28, anchor="center", stretch=False)
-        self.col_defs.column("what", width=350, anchor="w")
+        self.col_defs.column("an", width=48, minwidth=40, anchor="center", stretch=False)
+        self.col_defs.column("uniq", width=48, minwidth=40, anchor="center", stretch=False)
+        self.col_defs.column("what", width=330, anchor="w")
         self.col_defs.pack(fill="x")
         self.col_defs.bind("<<TreeviewSelect>>", self._col_on_select)
         self.col_defs.bind("<Button-1>", self._col_defs_click)
@@ -443,6 +450,8 @@ class AIReviewMixin:
         ttk.Button(edit, text="Add / Update", command=self._col_add_update).pack(side="left")
         ttk.Button(edit, text="Remove", command=self._col_remove).pack(side="left", padx=4)
         ttk.Button(edit, text="Clear all", command=self._col_clear).pack(side="left")
+        ttk.Button(edit, text="＋ Specific entities",
+                   command=self._col_add_entity_column).pack(side="left", padx=4)
 
         prev_wrap = ttk.LabelFrame(
             top, text=" Prompt preview (editable — sent per section) ", padding=4)
@@ -858,6 +867,10 @@ class AIReviewMixin:
             names = {n for n, _ in cols}
             self._col_uniq_checked = {
                 str(n) for n in data.get("uniq_checked", []) if str(n) in names}
+            # older configs have no analyze set: analyze everything then
+            self._col_analyze_checked = ({
+                str(n) for n in data["analyze_checked"] if str(n) in names}
+                if "analyze_checked" in data else set(names))
         except Exception:  # noqa: BLE001 - never block startup on the config
             pass
 
@@ -869,29 +882,31 @@ class AIReviewMixin:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"columns": [list(c) for c in self._ai_columns],
-                           "uniq_checked": sorted(self._col_uniq_checked)},
+                           "uniq_checked": sorted(self._col_uniq_checked),
+                           "analyze_checked": sorted(self._col_analyze_checked)},
                           f, indent=2, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001 - saving is best-effort
             self.status_var.set(f"Could not save the column definitions: {exc}")
+
+    def _col_analyze_cols(self):
+        """The Run ✓-checked column definitions — what the next run analyzes."""
+        return [(n, w) for n, w in self._ai_columns
+                if n in self._col_analyze_checked]
 
     def _col_refresh_defs(self):
         """Redraw the column-definition list and the live prompt preview."""
         self.col_defs.delete(*self.col_defs.get_children())
         for name, what in self._ai_columns:
-            glyph = "☑" if name in self._col_uniq_checked else "☐"
-            self.col_defs.insert("", "end", text=name, values=(glyph, what))
-        self.col_preview.delete("1.0", tk.END)
-        if self._ai_columns:
-            self.col_preview.insert("1.0", self._col_prompt_text()
-                                    + _PREVIEW_TAIL)
-        else:
-            self.col_preview.insert("1.0", "Add at least one column to build the prompt.")
+            an = "☑" if name in self._col_analyze_checked else "☐"
+            uq = "☑" if name in self._col_uniq_checked else "☐"
+            self.col_defs.insert("", "end", text=name, values=(an, uq, what))
+        self._col_refresh_preview()
 
     def _col_prompt_text(self):
         lines = ["Analyze the regulatory section below and extract the following data.",
                  "Return ONLY one valid JSON object with exactly these keys "
                  "(no code fences, no commentary):"]
-        for name, what in self._ai_columns:
+        for name, what in self._col_analyze_cols():
             lines.append(f'- "{name}": {what or "extract this value"}')
         lines.append('Use "" for any value the section does not contain.')
         lines.append('Use ";" for multiple values the section does contain.')
@@ -913,33 +928,61 @@ class AIReviewMixin:
         if not sel:
             return
         name = self.col_defs.item(sel[0], "text")
-        values = self.col_defs.item(sel[0], "values") or ("", "")
-        what = values[1] if len(values) > 1 else ""
+        values = self.col_defs.item(sel[0], "values") or ("", "", "")
+        what = values[2] if len(values) > 2 else ""
         self.col_name.delete(0, tk.END)
         self.col_name.insert(0, name)
         self.col_what.delete(0, tk.END)
         self.col_what.insert(0, what)
 
     def _col_defs_click(self, event):
-        """Toggle unique-element collection when the ✓ cell is clicked."""
+        """Toggle a column's Run ✓ (analyze) or Uniq ✓ cell on click."""
         if self.col_defs.identify("region", event.x, event.y) != "cell":
             return None
-        if self.col_defs.identify_column(event.x) != "#1":
+        col_id = self.col_defs.identify_column(event.x)
+        if col_id not in ("#1", "#2"):
             return None
         iid = self.col_defs.identify_row(event.y)
         if not iid:
             return None
         name = self.col_defs.item(iid, "text")
-        if name in self._col_uniq_checked:
-            self._col_uniq_checked.discard(name)
+        checked = (self._col_analyze_checked if col_id == "#1"
+                   else self._col_uniq_checked)
+        if name in checked:
+            checked.discard(name)
         else:
-            self._col_uniq_checked.add(name)
-        self.col_defs.set(iid, "uniq", "☑" if name in self._col_uniq_checked else "☐")
+            checked.add(name)
+        self.col_defs.set(iid, "an" if col_id == "#1" else "uniq",
+                          "☑" if name in checked else "☐")
         self._col_save_columns()
+        if col_id == "#1":   # the prompt only contains analyzed columns
+            self._col_refresh_preview()
         return "break"
 
+    def _col_refresh_preview(self):
+        """Rebuild only the prompt preview (keeps the defs list untouched)."""
+        self.col_preview.delete("1.0", tk.END)
+        if self._col_analyze_cols():
+            self.col_preview.insert("1.0", self._col_prompt_text() + _PREVIEW_TAIL)
+        elif self._ai_columns:
+            self.col_preview.insert(
+                "1.0", "No column has its Run ✓ ticked — tick at least one "
+                       "to build the prompt.")
+        else:
+            self.col_preview.insert("1.0", "Add at least one column to build the prompt.")
+
+    def _col_toggle_analyze_all(self):
+        """Run ✓ heading click: check every column, or clear if all checked."""
+        names = {name for name, _ in self._ai_columns}
+        if names and names <= self._col_analyze_checked:
+            self._col_analyze_checked -= names
+        else:
+            self._col_analyze_checked |= names
+        self._col_save_columns()
+        self._col_refresh_defs()
+
     def _col_toggle_uniq_all(self):
-        """✓ heading click: check every column, or clear if all are checked."""
+        """Uniq ✓ heading click: check every column, or clear if all checked."""
         names = {name for name, _ in self._ai_columns}
         if names and names <= self._col_uniq_checked:
             self._col_uniq_checked -= names
@@ -961,8 +1004,31 @@ class AIReviewMixin:
         else:
             self._ai_columns.append((name, what))
             self._col_uniq_checked.add(name)   # new columns collect uniques by default
+            self._col_analyze_checked.add(name)  # …and are analyzed by default
         self._col_save_columns()
         self._col_refresh_defs()
+
+    def _col_add_entity_column(self):
+        """Add (or refresh) the predefined 'Specific entities' column: the
+        aviation Reference-System-Process-Personal-Quantity chain extraction
+        (see ai_utils.entity_chains). Its chains are auto-parsed into an
+        'Entities <run sheet>' component sheet during every run."""
+        from .entity_chains import ENTITY_COLUMN, ENTITY_PROMPT
+        for i, (existing, _) in enumerate(self._ai_columns):
+            if existing == ENTITY_COLUMN:
+                self._ai_columns[i] = (ENTITY_COLUMN, ENTITY_PROMPT)
+                break
+        else:
+            self._ai_columns.append((ENTITY_COLUMN, ENTITY_PROMPT))
+        self._col_analyze_checked.add(ENTITY_COLUMN)
+        # chains are parsed into their own Entities sheet; whole-chain
+        # unique collection is rarely useful, so it starts unticked
+        self._col_uniq_checked.discard(ENTITY_COLUMN)
+        self._col_save_columns()
+        self._col_refresh_defs()
+        self.status_var.set(f"'{ENTITY_COLUMN}' column added — its chains are "
+                            "parsed into an 'Entities <run sheet>' sheet "
+                            "automatically.")
 
     def _col_remove(self):
         names = {self.col_defs.item(iid, "text") for iid in self.col_defs.selection()}
@@ -970,12 +1036,14 @@ class AIReviewMixin:
             return
         self._ai_columns = [(n, w) for n, w in self._ai_columns if n not in names]
         self._col_uniq_checked -= names
+        self._col_analyze_checked -= names
         self._col_save_columns()
         self._col_refresh_defs()
 
     def _col_clear(self):
         self._ai_columns = []
         self._col_uniq_checked.clear()
+        self._col_analyze_checked.clear()
         self._col_save_columns()
         self._col_refresh_defs()
 
@@ -991,7 +1059,14 @@ class AIReviewMixin:
                                 "Add sections to the queue first (current node or checked nodes).")
             return
         jobs = list(self._ai_batch)
-        col_defs = list(self._ai_columns)
+        # Only the Run ✓-checked columns are analyzed in this batch.
+        col_defs = self._col_analyze_cols()
+        if not col_defs:
+            messagebox.showinfo(
+                "No columns selected",
+                "Every column's Run ✓ is unticked — tick at least one "
+                "column to analyze.")
+            return
         columns = [name for name, _ in col_defs]
         # The preview box is editable — send what it shows, not the template.
         prompt_head = self._col_prompt_head()
@@ -1184,6 +1259,27 @@ class AIReviewMixin:
                     if not self._col_wait_if_paused():
                         stopped = True
                         break
+                    if _is_entity_column(name):
+                        # The Specific-entities prompt asks for a bare
+                        # formatted string, not JSON — send it as-is and
+                        # keep the raw reply.
+                        prompt = f"{what}\n\n---\nSECTION: {title}\n\n{text}"
+                        self._ai_log_bg(f"→ [column '{name}'] Sent to LLM "
+                                        f"({len(prompt)} chars): "
+                                        f"{self._ai_preview(prompt)}")
+                        try:
+                            self._ai_call_count += 1
+                            resp = llm_call(prompt, None, service, model)
+                        except Exception as exc:  # noqa: BLE001
+                            row[name] = f"[ERROR] {exc}"
+                            self._ai_log_bg(f"← [column '{name}'] LLM call "
+                                            f"failed: {exc}")
+                            continue
+                        self._ai_log_bg(f"← [column '{name}'] Response "
+                                        f"({len(str(resp or ''))} chars): "
+                                        f"{self._ai_preview(resp)}")
+                        row[name] = _norm(resp).strip()
+                        continue
                     prompt = (f"{self._col_single_prompt(name, what)}"
                               f"\n\n---\nSECTION: {title}\n\n{text}")
                     self._ai_log_bg(f"→ [column '{name}'] Sent to LLM "
@@ -1437,6 +1533,7 @@ class AIReviewMixin:
                     cell.alignment = wrap
                 wb.save(path)
                 self._col_update_uniques(path)
+                self._col_update_entities(path)
                 self._col_eval_saved_row(row)
             self._col_rows_saved += 1
             self.status_var.set(f"Saved row {self._col_rows_saved} "
@@ -1465,6 +1562,26 @@ class AIReviewMixin:
         _excel_utils().save_unique_elements_to_new_sheet(
             path, data_cols, new_sheet_name=uniq_sheet,
             source_sheet=self._col_run_sheet)
+
+    def _col_update_entities(self, path):
+        """Auto extraction for the 'Specific entities' column: after each
+        saved row, re-parse every chain of this run into an
+        'Entities <run sheet>' sheet (one row per chain, one column per
+        component). No-ops when the column is not part of the run; failures
+        only reach the console/status bar."""
+        if not self._col_run_sheet:
+            return
+        if not any(_is_entity_column(c) for c in self._col_table_cols):
+            return
+        try:
+            from .entity_chains import extract_rows, write_entity_sheet
+            rows = extract_rows(self._col_results)
+            sheet = write_entity_sheet(
+                path, rows, f"Entities {self._col_run_sheet}"[:31])
+            self._ai_log(f"   → '{sheet}' refreshed ({len(rows)} chain(s))")
+        except Exception as exc:  # noqa: BLE001 - never interrupt the analysis
+            self.status_var.set(f"Entity-sheet update failed: {exc}")
+            self._ai_log(f"[ERROR] entity-sheet update failed: {exc}")
 
     # ------------------------------------------------- Unique elements tab -- #
     def _build_ai_uniques_tab(self):
@@ -1579,11 +1696,67 @@ class AIReviewMixin:
             anchor="w", pady=(2, 0))
         self._uniq_refmap_toggle()
 
+        # Standalone Specific-entities chain parser: any column holding
+        # Reference-System-Process-Personal-Quantity chains is fanned out
+        # into an 'Entities <sheet>' component sheet of the same file.
+        ent_wrap = ttk.LabelFrame(
+            uq, text=" Specific-entity chains → component sheet (standalone) ",
+            padding=4)
+        ent_wrap.pack(fill="x", pady=(6, 0))
+        erow = ttk.Frame(ent_wrap)
+        erow.pack(fill="x")
+        ttk.Label(erow, text="Chain column:").pack(side="left")
+        self.uniq_ent_col = ttk.Combobox(erow, state="readonly", width=30,
+                                         values=[])
+        self.uniq_ent_col.pack(side="left", padx=4)
+        self.uniq_ent_btn = ttk.Button(erow, text="Parse chains → sheet",
+                                       command=self._uniq_parse_entities)
+        self.uniq_ent_btn.pack(side="left", padx=4)
+        ttk.Label(ent_wrap, foreground="#666666", justify="left",
+                  text="Parses Reference-System Info-Process-Personal-"
+                       "QuantityValue chains (';'-separated, '#' = empty) "
+                       "from the chosen column of the sheet above into an\n"
+                       "'Entities <sheet>' sheet — one row per chain, one "
+                       "column per component. Reference-less chains are "
+                       "skipped; an existing sheet is replaced.").pack(
+            anchor="w", pady=(2, 0))
+
         brow = ttk.Frame(uq)
         brow.pack(fill="x", pady=6)
         self.uniq_run_btn = ttk.Button(brow, text="Generate unique elements",
                                        command=self._uniq_generate)
         self.uniq_run_btn.pack(side="left")
+
+    def _uniq_parse_entities(self):
+        """Standalone chain parsing for the Unique-elements tab's workbook +
+        sheet: parse the chosen column's Specific-entity chains into an
+        'Entities <sheet>' component sheet of the same file."""
+        path = self.uniq_wb.get().strip()
+        sheet = self.uniq_sheet.get().strip()
+        column = self.uniq_ent_col.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showinfo("No workbook", "Pick an Excel file first.")
+            return
+        if not sheet:
+            messagebox.showinfo("No sheet", "Pick a sheet first (Refresh sheets).")
+            return
+        if not column:
+            messagebox.showinfo(
+                "No column", "Pick the column that holds the entity chains.")
+            return
+        try:
+            from .entity_chains import entities_from_workbook
+            summary = entities_from_workbook(path, sheet, column)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Entity chains", str(exc))
+            self._ai_log(f"[ERROR] entity-chain parsing failed: {exc}")
+            return
+        msg = (f"Parsed {summary['chains']} chain(s) from column '{column}' "
+               f"({summary['rows']} row(s)) → sheet '{summary['sheet']}'")
+        self.status_var.set(msg + ".")
+        self._ai_log(f"=== Entity chains: {os.path.basename(path)} [{sheet}] "
+                     f"— {msg} ===")
+        messagebox.showinfo("Entity chains", msg + f"\n\nin {path}")
 
     def _uniq_refmap_toggle(self):
         """Enable the sections-JSON picker only while section matching is on."""
@@ -1636,6 +1809,8 @@ class AIReviewMixin:
             ttk.Label(self.uniq_cols_frame, foreground="#666666",
                       text="Pick a workbook and sheet to list its columns.").pack(
                 anchor="w")
+            self.uniq_ent_col.configure(values=[])
+            self.uniq_ent_col.set("")
             return
         try:
             import pandas as pd
@@ -1645,6 +1820,11 @@ class AIReviewMixin:
             ttk.Label(self.uniq_cols_frame, foreground="#a00000",
                       text=f"Could not read columns: {exc}").pack(anchor="w")
             return
+        # Feed the standalone chain parser too; preselect a column named
+        # like the Specific-entities column when the sheet has one.
+        self.uniq_ent_col.configure(values=columns)
+        ent_default = next((c for c in columns if _is_entity_column(c)), "")
+        self.uniq_ent_col.set(ent_default)
         if not columns:
             ttk.Label(self.uniq_cols_frame, foreground="#666666",
                       text="This sheet has no columns.").pack(anchor="w")
