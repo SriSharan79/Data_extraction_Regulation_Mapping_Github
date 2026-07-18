@@ -152,9 +152,14 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     answer) or *one call per column value* (each column of a section is its
     own focused LLM call; non-JSON replies are kept as the raw value). While
     a run is going, **Pause / Resume / Stop** buttons next to *Analyze
-    queued* control it: pausing waits after the current LLM call, stopping
+    queued* control it: pausing waits after the current LLM call (a
+    **⏸ PAUSED** indicator appears beside the progress bar), stopping
     ends the run after it — every row already saved (and its evaluation)
-    is kept. Every analysis also asks for a **storage
+    is kept. The **sections queue shows a live status per section**
+    (⏳ queued / ▶ running / ✔ done / ✖ error — error covers `[ERROR]` and
+    `[unparsed]` results) for both run modes, and the progress bar carries
+    a live **`done/total · ETA · LLM calls` counter** (retries and
+    per-column calls included). Every analysis also asks for a **storage
     file**: choosing the *same* `.xlsx` again adds each new run as its own
     snapshot sheet (`Run N <timestamp>`) holding all sections of that batch,
     so one workbook accumulates the whole history (CSV/JSON hold the latest

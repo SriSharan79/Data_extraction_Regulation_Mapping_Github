@@ -166,6 +166,10 @@ class AIReviewMixin:
         self._col_eval_entries = []   # per-section evaluations of this run
         self._col_pause_ev = threading.Event()  # set = worker pauses
         self._col_stop_ev = threading.Event()   # set = worker stops ASAP
+        self._run_t0 = None           # wall-clock start of the current run
+        self._ai_call_count = 0       # LLM calls (incl. retries) of the run
+        self._run_current = 0         # 1-based index of the section in work
+        self._run_queue_iids = []     # queue rows snapshotted at run start
         self._eval_busy = False       # an evaluation is running
         self._uniq_busy = False       # a manual unique-elements run is in progress
         self._uniq_col_vars = {}      # {column name: BooleanVar} for the Uniques tab
@@ -210,10 +214,22 @@ class AIReviewMixin:
         body = ttk.PanedWindow(vsplit, orient="horizontal")
         vsplit.add(body, weight=4)
 
-        # Left: the shared sections queue both run modes consume
+        # Left: the shared sections queue both run modes consume. A Treeview
+        # so every section shows its live status during a run
+        # (⏳ queued / ▶ running / ✔ done / ✖ error).
         batch_wrap = ttk.LabelFrame(body, text=" Sections queue ", padding=4)
         body.add(batch_wrap, weight=1)
-        self.ai_batch_list = tk.Listbox(batch_wrap, height=4, selectmode="extended")
+        self.ai_batch_list = ttk.Treeview(batch_wrap, columns=("st",),
+                                          show="tree headings", height=4,
+                                          selectmode="extended")
+        self.ai_batch_list.heading("#0", text="Section")
+        self.ai_batch_list.heading("st", text="Status")
+        self.ai_batch_list.column("#0", width=170, anchor="w")
+        self.ai_batch_list.column("st", width=78, minwidth=64,
+                                  anchor="center", stretch=False)
+        for tag, color in (("pending", "grey35"), ("running", "#1a6fb0"),
+                           ("done", "#1f7a1f"), ("error", "#b00020")):
+            self.ai_batch_list.tag_configure(tag, foreground=color)
         self.ai_batch_list.pack(fill="both", expand=True)
         qbtns = ttk.Frame(batch_wrap)
         qbtns.pack(fill="x", pady=(4, 0))
@@ -234,8 +250,15 @@ class AIReviewMixin:
         # (what is analyzed / sent to the LLM / answered / evaluated).
         prog_wrap = ttk.LabelFrame(vsplit, text=" Progress ", padding=4)
         vsplit.add(prog_wrap, weight=1)
-        self.ai_progress = ttk.Progressbar(prog_wrap, mode="determinate")
-        self.ai_progress.pack(fill="x")
+        bar_row = ttk.Frame(prog_wrap)
+        bar_row.pack(fill="x")
+        self.ai_progress = ttk.Progressbar(bar_row, mode="determinate")
+        self.ai_progress.pack(side="left", fill="x", expand=True)
+        # Unmissable pause indicator + live "done/total · ETA · calls" info.
+        self.ai_paused_lbl = ttk.Label(bar_row, text="", foreground="#b8860b")
+        self.ai_paused_lbl.pack(side="left", padx=(8, 0))
+        self.ai_progress_info = ttk.Label(bar_row, text="", foreground="grey40")
+        self.ai_progress_info.pack(side="right", padx=(8, 0))
         self.ai_console = scrolledtext.ScrolledText(
             prog_wrap, height=6, wrap="word", state="disabled")
         self.ai_console.pack(fill="both", expand=True, pady=(4, 0))
@@ -276,16 +299,78 @@ class AIReviewMixin:
     def _ai_progress_start(self, total):
         self.ai_progress.stop()
         self.ai_progress.configure(mode="determinate", maximum=max(total, 1), value=0)
+        self._run_t0 = time.time()
+        self._ai_call_count = 0
+        self._run_current = 0
+        self._ai_progress_info_update()
 
     def _ai_progress_step(self):
         self.ai_progress.configure(
             value=min(float(self.ai_progress["value"]) + 1,
                       float(self.ai_progress["maximum"])))
+        self._ai_progress_info_update()
 
     def _ai_progress_done(self):
         self.ai_progress.stop()
         self.ai_progress.configure(mode="determinate",
                                    value=self.ai_progress["maximum"])
+        self.ai_paused_lbl.configure(text="")
+        self._ai_progress_info_update()
+
+    @staticmethod
+    def _fmt_eta(seconds):
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        m, s = divmod(seconds, 60)
+        if m < 60:
+            return f"{m}m {s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h {m:02d}m"
+
+    def _ai_progress_info_update(self):
+        """Refresh the 'done/total · ETA · calls' label beside the bar."""
+        if not self._run_t0:
+            self.ai_progress_info.configure(text="")
+            return
+        try:
+            total = int(float(self.ai_progress["maximum"]))
+            done = int(float(self.ai_progress["value"]))
+        except (tk.TclError, ValueError):
+            return
+        parts = [f"{done}/{total} section(s)"]
+        if 0 < done < total:
+            remaining = (time.time() - self._run_t0) / done * (total - done)
+            parts.append(f"~{self._fmt_eta(remaining)} left")
+        parts.append(f"{self._ai_call_count} LLM call(s)")
+        self.ai_progress_info.configure(text=" · ".join(parts))
+
+    # ------------------------------------------------ queue status column -- #
+    _QUEUE_GLYPHS = {"pending": "⏳ queued", "running": "▶ running",
+                     "done": "✔ done", "error": "✖ error"}
+
+    def _queue_add(self, title):
+        """Append one section to the queue Treeview (status: queued)."""
+        self.ai_batch_list.insert("", "end", text=title,
+                                  values=(self._QUEUE_GLYPHS["pending"],),
+                                  tags=("pending",))
+
+    def _queue_run_snapshot(self):
+        """Freeze the queue rows of the starting run (so later removals can't
+        shift the status mapping) and reset them all to 'queued'."""
+        self._run_queue_iids = list(self.ai_batch_list.get_children())
+        for iid in self._run_queue_iids:
+            self.ai_batch_list.item(iid, values=(self._QUEUE_GLYPHS["pending"],),
+                                    tags=("pending",))
+
+    def _queue_set_status(self, idx, status):
+        """Set the status glyph of the run's idx-th (0-based) section."""
+        iids = self._run_queue_iids
+        if 0 <= idx < len(iids) and self.ai_batch_list.exists(iids[idx]):
+            self.ai_batch_list.item(iids[idx],
+                                    values=(self._QUEUE_GLYPHS[status],),
+                                    tags=(status,))
+            self.ai_batch_list.see(iids[idx])
 
     def _build_ai_freeform_tab(self):
         ff = ttk.Frame(self.ai_nb, padding=6)
@@ -432,7 +517,7 @@ class AIReviewMixin:
             messagebox.showinfo("No section", "Select a section first.")
             return
         self._ai_batch.append(section)
-        self.ai_batch_list.insert("end", section[0])
+        self._queue_add(section[0])
         self._ai_update_queue_counts()
 
     def _ai_add_checked(self):
@@ -448,21 +533,24 @@ class AIReviewMixin:
             if job in queued:
                 continue
             self._ai_batch.append(job)
-            self.ai_batch_list.insert("end", job[0])
+            self._queue_add(job[0])
             added += 1
         self._ai_update_queue_counts()
         self.status_var.set(f"Added {added} checked section(s) to the AI batch"
                             + (f" ({len(sections) - added} already queued)." if added < len(sections) else "."))
 
     def _ai_remove_selected(self):
-        for i in reversed(self.ai_batch_list.curselection()):
+        items = list(self.ai_batch_list.get_children())
+        picked = sorted((items.index(iid) for iid in self.ai_batch_list.selection()),
+                        reverse=True)
+        for i in picked:
             del self._ai_batch[i]
-            self.ai_batch_list.delete(i)
+            self.ai_batch_list.delete(items[i])
         self._ai_update_queue_counts()
 
     def _ai_clear_batch(self):
         self._ai_batch = []
-        self.ai_batch_list.delete(0, tk.END)
+        self.ai_batch_list.delete(*self.ai_batch_list.get_children())
         self._ai_update_queue_counts()
 
     def _ai_update_queue_counts(self):
@@ -538,6 +626,7 @@ class AIReviewMixin:
         self._ai_busy = True
         self._ai_set_busy_buttons("disabled")
         self._ai_q = queue.Queue()
+        self._queue_run_snapshot()
         self._ai_progress_start(len(jobs))
         self._ai_log(f"=== Free-form review: {len(jobs)} section(s) via {service_label} "
                      f"({model or 'default'}), answer as {fmt}, "
@@ -561,11 +650,13 @@ class AIReviewMixin:
         full_instruction = f"{instruction}\n{directive}" if directive else instruction
         for i, (title, text) in enumerate(jobs, 1):
             prompt = f"{full_instruction}\n\n---\nSECTION: {title}\n\n{text}"
+            self._ai_q.put(("start", i))
             self._ai_log_bg(f"▶ [{i}/{len(jobs)}] Analyzing '{title}' "
                             f"({len(text or '')} chars): {self._ai_preview(text)}")
             self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
                             f"{self._ai_preview(prompt)}")
             try:
+                self._ai_call_count += 1
                 resp = llm_call(prompt, None, service, model)
             except Exception as exc:  # noqa: BLE001
                 resp = f"[ERROR] {exc}"
@@ -596,13 +687,21 @@ class AIReviewMixin:
                 if kind == "error":
                     self._ai_append(f"[ERROR] {payload}\n")
                     self._ai_log(f"[ERROR] {payload}")
+                elif kind == "start":
+                    self._run_current = payload
+                    self._queue_set_status(payload - 1, "running")
+                    self._ai_progress_info_update()
                 else:
                     self._ai_results.append(payload)
                     self._ai_append(f"\n## {payload['title']}\n{payload['response']}\n")
                     self._ai_autosave()  # keep the file current after every result
+                    ok = not str(payload.get("response", "")).startswith("[ERROR]")
+                    self._queue_set_status(self._run_current - 1,
+                                           "done" if ok else "error")
                     self._ai_progress_step()
         except queue.Empty:
             pass
+        self._ai_progress_info_update()   # live call counter while working
         self.root.after(150, self._ai_poll)
 
     def _ai_export(self):
@@ -964,6 +1063,7 @@ class AIReviewMixin:
         self.col_pause_btn.configure(state="normal", text="Pause")
         self.col_stop_btn.configure(state="normal")
         self._col_q = queue.Queue()
+        self._queue_run_snapshot()
         self._ai_progress_start(len(jobs))
         self._ai_log(f"=== Column analysis: {len(jobs)} section(s) → "
                      f"columns [{', '.join(columns)}] via {service_label} "
@@ -1061,6 +1161,7 @@ class AIReviewMixin:
                         break   # stop requested mid-retry
                     self._ai_log_bg(f"↻{tag} response was not valid JSON — "
                                     f"retry {attempt}/{_JSON_RETRIES}")
+                self._ai_call_count += 1
                 resp = llm_call(prompt, None, service, model)
                 self._ai_log_bg(f"←{tag} Response ({len(str(resp or ''))} chars): "
                                 f"{self._ai_preview(resp)}")
@@ -1073,6 +1174,7 @@ class AIReviewMixin:
             if not self._col_wait_if_paused():
                 self._col_q.put(("stopped", i - 1))
                 break
+            self._col_q.put(("start", i))
             self._ai_log_bg(f"▶ [{i}/{len(jobs)}] Analyzing '{title}' "
                             f"({len(text or '')} chars): {self._ai_preview(text)}")
             row = {"Section": title}
@@ -1169,14 +1271,25 @@ class AIReviewMixin:
                 elif kind == "stopped":
                     self._ai_log(f"■ Analysis stopped by the user after "
                                  f"{payload} completed section(s).")
+                elif kind == "start":
+                    self._run_current = payload
+                    self._queue_set_status(payload - 1, "running")
+                    self._ai_progress_info_update()
                 else:
                     self._col_results.append(payload)
                     self.col_table.insert("", "end", values=[
                         payload.get(c, "") for c in self._col_table_cols])
                     self._col_save_row(payload)
+                    ok = not any(isinstance(v, str)
+                                 and (v.startswith("[ERROR]")
+                                      or v.startswith("[unparsed]"))
+                                 for v in payload.values())
+                    self._queue_set_status(self._run_current - 1,
+                                           "done" if ok else "error")
                     self._ai_progress_step()
         except queue.Empty:
             pass
+        self._ai_progress_info_update()   # live call counter while working
         self.root.after(150, self._col_poll)
 
     def _col_pause_resume(self):
@@ -1186,11 +1299,13 @@ class AIReviewMixin:
         if self._col_pause_ev.is_set():
             self._col_pause_ev.clear()
             self.col_pause_btn.configure(text="Pause")
+            self.ai_paused_lbl.configure(text="")
             self._ai_log("▶ Analysis resumed.")
             self.status_var.set("Column analysis resumed.")
         else:
             self._col_pause_ev.set()
             self.col_pause_btn.configure(text="Resume")
+            self.ai_paused_lbl.configure(text="⏸ PAUSED")
             self._ai_log("⏸ Analysis paused — the current LLM call still "
                          "finishes, then the run waits.")
             self.status_var.set("Column analysis paused.")
@@ -1204,6 +1319,7 @@ class AIReviewMixin:
         self._col_pause_ev.clear()   # unblock a paused worker so it can exit
         self.col_stop_btn.configure(state="disabled")
         self.col_pause_btn.configure(state="disabled", text="Pause")
+        self.ai_paused_lbl.configure(text="")
         self._ai_log("■ Stop requested — finishing the current LLM call…")
         self.status_var.set("Stopping the column analysis…")
 
