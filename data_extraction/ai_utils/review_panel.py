@@ -2666,8 +2666,9 @@ class AIReviewMixin:
         them (data_extraction.evaluation.column_evaluator)."""
         ev = self._scrollable_tab("Evaluation")
 
-        wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx — any sheet "
-                                          "with a 'Section' column) ",
+        wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx — any data "
+                                          "sheet; without a 'Section' column you "
+                                          "are asked which column substitutes it) ",
                                  padding=4)
         wb_wrap.pack(fill="x")
         row = ttk.Frame(wb_wrap)
@@ -2792,24 +2793,68 @@ class AIReviewMixin:
             self._eval_refresh_sheets()
 
     def _eval_refresh_sheets(self):
-        """List every evaluatable sheet of the workbook — ANY sheet with a
-        'Section' column (not just 'Run N …' snapshots), excluding the
-        pipeline's own result sheets — and preselect the last one."""
+        """List every evaluatable sheet of the workbook — ANY data sheet,
+        with or without a 'Section' column (a substitute is asked for at run
+        time), excluding the pipeline's own result sheets — and preselect
+        the last one."""
         path = self.eval_wb.get().strip()
         sheets = []
         if path and os.path.exists(path):
             try:
                 from data_extraction.evaluation.column_evaluator import (
                     evaluatable_sheets)
-                sheets = evaluatable_sheets(path)
+                sheets = evaluatable_sheets(path, require_section=False)
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Workbook", f"Could not read sheets:\n{exc}")
         values = (["All sheets"] + sheets) if sheets else []
         self.eval_sheet.configure(values=values)
         self.eval_sheet.set(sheets[-1] if sheets else "")
         if path and not sheets:
-            self.status_var.set("No sheet with a 'Section' column found in "
-                                "the selected workbook.")
+            self.status_var.set("No evaluatable data sheet found in the "
+                                "selected workbook.")
+
+    def _eval_ask_section_column(self, sheet, columns):
+        """Modal picker shown when a sheet chosen for evaluation has no
+        'Section' column: choose the column that substitutes it — its values
+        become the per-row key matched against the reference section titles;
+        every other column is evaluated. Returns the column name, or None
+        when cancelled."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"No 'Section' column in '{sheet}'")
+        dlg.transient(self.root.winfo_toplevel())
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, justify="left",
+                  text=f"Sheet '{sheet}' has no 'Section' column.\n\n"
+                       "Choose the column that substitutes it: its values are "
+                       "the per-row key\nmatched against the reference section "
+                       "titles. All other columns are\nevaluated against the "
+                       "matched section text.").pack(anchor="w")
+        combo = ttk.Combobox(frm, state="readonly", values=list(columns),
+                             width=44)
+        # Preselect a likely key column by name, else the first one.
+        guess = next((c for c in columns
+                      if any(h in str(c).lower()
+                             for h in ("section", "title", "rule", "name", "id"))),
+                     columns[0])
+        combo.set(guess)
+        combo.pack(fill="x", pady=8)
+        out = {"col": None}
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+
+        def ok():
+            out["col"] = combo.get() or None
+            dlg.destroy()
+
+        ttk.Button(btns, text="Use this column", command=ok).pack(side="left")
+        ttk.Button(btns, text="Cancel",
+                   command=dlg.destroy).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda _e: ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return out["col"]
 
     def _eval_browse_ref_json(self):
         path = filedialog.askopenfilename(
@@ -2950,8 +2995,8 @@ class AIReviewMixin:
                 or not os.path.exists(path):
             messagebox.showinfo("No workbook",
                                 "Pick an .xlsx with analyzed data first — any "
-                                "sheet with a 'Section' column can be "
-                                "evaluated (Browse… to an existing workbook).")
+                                "data sheet can be evaluated (Browse… to an "
+                                "existing workbook).")
             return
         sheet = self.eval_sheet.get().strip()
         run_sheets = (None if not sheet or sheet in ("All sheets", "All runs")
@@ -2966,6 +3011,39 @@ class AIReviewMixin:
         references = self._eval_references()
         if references is None:
             return
+        # Resolve the sheet list now: sheets WITHOUT a 'Section' column need
+        # the user to choose which column substitutes it (the per-row key
+        # matched against the reference section titles).
+        try:
+            from data_extraction.evaluation.column_evaluator import (
+                evaluatable_sheets, sheet_columns)
+            sheets = (run_sheets if run_sheets
+                      else evaluatable_sheets(path, require_section=False))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Workbook", f"Could not read sheets:\n{exc}")
+            return
+        if not sheets:
+            messagebox.showinfo("Evaluation",
+                                "The workbook has no evaluatable data sheet.")
+            return
+        section_columns = {}
+        for s in sheets:
+            cols = sheet_columns(path, s)
+            if "Section" in cols:
+                continue
+            if len(cols) < 2:
+                messagebox.showerror(
+                    "Evaluation",
+                    f"Sheet '{s}' has {len(cols)} column(s) — it needs a "
+                    "section-key column plus at least one data column.")
+                return
+            pick = self._eval_ask_section_column(s, cols)
+            if not pick:
+                self.status_var.set("Evaluation cancelled — no substitute "
+                                    f"for the 'Section' column of '{s}' chosen.")
+                return
+            section_columns[s] = pick
+        run_sheets = sheets
         out_path = None
         if self.eval_out_choice.get() == "new":
             out_path = filedialog.asksaveasfilename(
@@ -2990,6 +3068,9 @@ class AIReviewMixin:
                      + (", uniques on" if uniq else "")
                      + (f", output → {os.path.basename(out_path)}" if out_path else "")
                      + " ===")
+        for s, c in section_columns.items():
+            self._ai_log(f"   '{s}' has no 'Section' column — using '{c}' "
+                         "as the section key")
         self.status_var.set(f"Evaluating {sheet or 'all runs'} against "
                             f"{len(references)} reference section(s)…")
         if embedding:
@@ -3007,7 +3088,8 @@ class AIReviewMixin:
                                             run_sheets=run_sheets,
                                             uniq_columns=uniq, out_path=out_path,
                                             log=self._ai_log_bg,
-                                            embedding=embedding)
+                                            embedding=embedding,
+                                            section_columns=section_columns or None)
             except Exception as exc:  # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._ai_eval_done(None, e))
             else:
@@ -3025,10 +3107,9 @@ class AIReviewMixin:
             messagebox.showerror("Evaluation failed", str(exc))
             return
         if not results:
-            self.status_var.set("Evaluation found no sheet with a 'Section' "
-                                "column to evaluate.")
-            messagebox.showinfo("Evaluation", "The workbook has no sheet "
-                                              "with a 'Section' column.")
+            self.status_var.set("Evaluation found no data sheet to evaluate.")
+            messagebox.showinfo("Evaluation",
+                                "The workbook has no evaluatable data sheet.")
             return
         lines = []
         for sheet, s in results.items():

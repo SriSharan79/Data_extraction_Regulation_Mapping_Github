@@ -219,10 +219,15 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
   - *Evaluation* (`data_extraction/evaluation/column_evaluator.py`) — its own
     page next to *Column analysis*, fully independent of it: it evaluates
     **files that already hold analyzed data**. Pick any workbook and **any
-    sheet that has a `Section` column** — `Run N …` snapshots or your own
-    hand-made sheets alike (*All sheets* evaluates every such sheet; the
-    pipeline's own result sheets — `Eval`/`Uniq`/`Entities`/per-metric —
-    are excluded automatically) — and the **sections JSON the analysis
+    data sheet** — `Run N …` snapshots or your own hand-made sheets alike
+    (*All sheets* evaluates every such sheet; the pipeline's own result
+    sheets — `Eval`/`Uniq`/`Entities`/per-metric — are excluded
+    automatically). Sheets with a `Section` column work as before; for a
+    sheet **without** one, a dialog asks **which column substitutes it** —
+    that column's values become the per-row key matched against the
+    reference section titles and every other column is evaluated
+    (`section_column=` / `section_columns=` in the evaluator API) — plus
+    the **sections JSON the analysis
     was made from** (always asked; chunks cache, `Processed_chunks.json` or
     an EASA structured JSON — the shape is auto-detected). Each run-sheet
     row is matched automatically: its `Section` value is looked up among the

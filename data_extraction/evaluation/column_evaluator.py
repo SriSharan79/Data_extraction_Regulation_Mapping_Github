@@ -140,10 +140,13 @@ def is_output_sheet(name):
     return str(name).startswith(_OUTPUT_SHEET_PREFIXES)
 
 
-def evaluatable_sheets(file_path):
-    """Every sheet of the workbook that can be evaluated: any sheet holding
-    a ``Section`` column — not just ``Run N …`` snapshots — excluding the
-    pipeline's own result sheets. Unreadable sheets are skipped."""
+def evaluatable_sheets(file_path, require_section=True):
+    """Every sheet of the workbook that can be evaluated, excluding the
+    pipeline's own result sheets. By default only sheets holding a
+    ``Section`` column qualify; with ``require_section=False`` any readable
+    sheet with at least one column does — a substitute section column can
+    then be chosen at evaluation time (``section_column`` of
+    :func:`evaluate_run`). Unreadable sheets are skipped."""
     import pandas as pd
 
     out = []
@@ -155,9 +158,26 @@ def evaluatable_sheets(file_path):
                 head = xls.parse(sheet, nrows=0)
             except Exception:  # noqa: BLE001 - odd sheets are just skipped
                 continue
-            if "Section" in [str(c) for c in head.columns]:
-                out.append(sheet)
+            cols = [str(c) for c in head.columns]
+            if not cols:
+                continue
+            if require_section and "Section" not in cols:
+                continue
+            out.append(sheet)
     return out
+
+
+def sheet_columns(file_path, sheet):
+    """The column names of one sheet (header row only); [] when the sheet
+    cannot be read."""
+    import pandas as pd
+
+    try:
+        head = pd.read_excel(str(file_path), sheet_name=sheet, nrows=0,
+                             engine="openpyxl")
+        return [str(c) for c in head.columns]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # Candidate item separators inside one extracted cell (the AI Review tab
@@ -998,7 +1018,8 @@ def _preview(text, limit=180):
 
 
 def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
-                 uniq_columns=None, out_path=None, log=None, embedding=None):
+                 uniq_columns=None, out_path=None, log=None, embedding=None,
+                 section_column=None):
     """
     Evaluate one column-analysis snapshot sheet against its reference
     sections. ``log`` is an optional ``log(message)`` callback that receives
@@ -1017,6 +1038,10 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
     is given the unique generated values of those columns are identified via
     save_unique_elements_to_new_sheet (``Uniq <run sheet>``) and grounded
     against the combined reference text into ``Uniq Eval <run sheet>``.
+    When the sheet has no ``Section`` column, ``section_column`` names the
+    column that substitutes it (the per-row key matched against the reference
+    section titles); it is renamed to ``Section`` for the evaluation, so all
+    result sheets keep their usual shape.
     Re-runs replace the sheets (idempotent). Returns a summary dict.
     """
     import pandas as pd
@@ -1049,8 +1074,16 @@ def evaluate_run(file_path, run_sheet, references, metrics=ALL_METRICS,
 
     df = pd.read_excel(file_path, sheet_name=run_sheet, engine="openpyxl")
     if "Section" not in df.columns:
-        raise ValueError(f"Sheet '{run_sheet}' has no 'Section' column — "
-                         "not a column-analysis run sheet.")
+        if section_column and section_column in df.columns:
+            df = df.rename(columns={section_column: "Section"})
+            if log:
+                log(f"⚖ Sheet '{run_sheet}': using column '{section_column}' "
+                    "as the 'Section' key")
+        else:
+            raise ValueError(
+                f"Sheet '{run_sheet}' has no 'Section' column — pass "
+                "section_column=<name> to use another column as the "
+                "section key.")
     data_cols = [c for c in df.columns if c != "Section"]
 
     target = str(out_path) if out_path else file_path
@@ -1536,7 +1569,7 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
 
 def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
                       run_sheets=None, uniq_columns="all", out_path=None,
-                      log=None, embedding=None):
+                      log=None, embedding=None, section_columns=None):
     """
     Evaluate every evaluatable sheet of a workbook — any sheet holding a
     ``Section`` column (:func:`evaluatable_sheets`), not just ``Run N …``
@@ -1546,7 +1579,10 @@ def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
     ``log`` is forwarded to :func:`evaluate_run` for per-row progress lines.
     ``embedding`` is an optional config dict for the semantic-embedding metrics
     (see :func:`configure_embeddings`); it is applied once here so each sheet
-    reuses the same backend/service. Returns ``{run sheet: summary dict}``.
+    reuses the same backend/service. ``section_columns`` is an optional
+    ``{sheet name: column name}`` map naming, per sheet WITHOUT a ``Section``
+    column, the column that substitutes it (see :func:`evaluate_run`).
+    Returns ``{run sheet: summary dict}``.
     """
     import pandas as pd
 
@@ -1556,17 +1592,18 @@ def evaluate_workbook(file_path, references, metrics=ALL_METRICS,
     sheets = run_sheets if run_sheets else evaluatable_sheets(file_path)
     results = {}
     for sheet in sheets:
+        sec_col = (section_columns or {}).get(sheet)
         cols = uniq_columns
         if uniq_columns == "all":
             head = pd.read_excel(file_path, sheet_name=sheet, nrows=0,
                                  engine="openpyxl")
-            cols = [c for c in head.columns if c != "Section"]
+            cols = [c for c in head.columns if c not in ("Section", sec_col)]
         # embedding already applied above -> pass None so evaluate_run only
         # refreshes its per-run cache (keeps the shared config in place).
         results[sheet] = evaluate_run(file_path, sheet, references,
                                       metrics=metrics, uniq_columns=cols,
                                       out_path=out_path, log=log,
-                                      embedding=None)
+                                      embedding=None, section_column=sec_col)
     return results
 
 
