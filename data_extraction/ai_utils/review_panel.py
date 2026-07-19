@@ -2666,9 +2666,9 @@ class AIReviewMixin:
         them (data_extraction.evaluation.column_evaluator)."""
         ev = self._scrollable_tab("Evaluation")
 
-        wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx — any data "
-                                          "sheet; without a 'Section' column you "
-                                          "are asked which column substitutes it) ",
+        wb_wrap = ttk.LabelFrame(ev, text=" Analysis workbook (.xlsx — any sheet; "
+                                          "without a 'Section' column you are "
+                                          "asked which column substitutes it) ",
                                  padding=4)
         wb_wrap.pack(fill="x")
         row = ttk.Frame(wb_wrap)
@@ -2793,25 +2793,27 @@ class AIReviewMixin:
             self._eval_refresh_sheets()
 
     def _eval_refresh_sheets(self):
-        """List every evaluatable sheet of the workbook — ANY data sheet,
-        with or without a 'Section' column (a substitute is asked for at run
-        time), excluding the pipeline's own result sheets — and preselect
-        the last one."""
+        """List EVERY sheet of the workbook — exactly like the Unique
+        elements tab: 'Run N …' snapshots, hand-made sheets and the
+        pipeline's own result sheets alike; with or without a 'Section'
+        column (a substitute is asked for at run time). Only the 'All
+        sheets' bulk option skips the result sheets so an evaluation never
+        evaluates its own outputs."""
         path = self.eval_wb.get().strip()
         sheets = []
         if path and os.path.exists(path):
             try:
-                from data_extraction.evaluation.column_evaluator import (
-                    evaluatable_sheets)
-                sheets = evaluatable_sheets(path, require_section=False)
+                from openpyxl import load_workbook
+                wb = load_workbook(path, read_only=True)
+                sheets = list(wb.sheetnames)
+                wb.close()
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Workbook", f"Could not read sheets:\n{exc}")
         values = (["All sheets"] + sheets) if sheets else []
         self.eval_sheet.configure(values=values)
-        self.eval_sheet.set(sheets[-1] if sheets else "")
+        self.eval_sheet.set(sheets[0] if sheets else "")
         if path and not sheets:
-            self.status_var.set("No evaluatable data sheet found in the "
-                                "selected workbook.")
+            self.status_var.set("No sheet found in the selected workbook.")
 
     def _eval_ask_section_column(self, sheet, columns):
         """Modal picker shown when a sheet chosen for evaluation has no

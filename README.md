@@ -219,10 +219,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
   - *Evaluation* (`data_extraction/evaluation/column_evaluator.py`) — its own
     page next to *Column analysis*, fully independent of it: it evaluates
     **files that already hold analyzed data**. Pick any workbook and **any
-    data sheet** — `Run N …` snapshots or your own hand-made sheets alike
-    (*All sheets* evaluates every such sheet; the pipeline's own result
-    sheets — `Eval`/`Uniq`/`Entities`/per-metric — are excluded
-    automatically). Sheets with a `Section` column work as before; for a
+    sheet** — the dropdown lists every sheet of the file, exactly like the
+    Unique elements tab: `Run N …` snapshots, hand-made sheets and even the
+    pipeline's own result sheets (only the *All sheets* bulk option skips
+    the result sheets — `Eval`/`Uniq`/`Entities`/per-metric — so an
+    evaluation never evaluates its own outputs). Sheets with a `Section`
+    column work as before; for a
     sheet **without** one, a dialog asks **which column substitutes it** —
     that column's values become the per-row key matched against the
     reference section titles and every other column is evaluated
