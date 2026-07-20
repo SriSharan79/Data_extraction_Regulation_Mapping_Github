@@ -168,13 +168,16 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     **Ctrl/Cmd+P** = Pause/Resume, **Ctrl/Cmd+.** = Stop. A **＋ Specific
     entities** button adds the predefined aviation entity-chain column
     (`data_extraction/ai_utils/entity_chains.py`): the LLM extracts
-    `Reference-System Info-Process-Personal-QuantityValue` chains
-    (`;`-separated, `#` = missing optional component, Reference
-    mandatory). When this column is part of a run its chains are
+    `Reference|System Info|Process|Personal|QuantityValue` chains
+    (components **pipe-separated**, `;` between chains, `#` = missing
+    optional component, Reference mandatory). The connector is a pipe (`|`)
+    rather than a hyphen precisely because References contain hyphens
+    themselves (`FAA AC 120-76D`, `RTCA DO-178C`), which used to break the
+    split; the pipe never appears inside a value, so parsing is an
+    unambiguous positional split (legacy hyphen-format values still parse
+    via a fallback). When this column is part of a run its chains are
     **auto-parsed into an `Entities <run sheet>` sheet** after every saved
-    row — one row per chain, one column per component plus the raw chain
-    (References may contain hyphens like `FAA AC 120-76D`; the parser
-    takes the last four `-`-fields as the optional components). In
+    row — one row per chain, one column per component plus the raw chain. In
     per-column call mode this column's prompt is sent as-is and the raw
     reply kept (no JSON wrapper). The *Unique elements* tab has the same
     parser **standalone**: pick any workbook/sheet/column holding chain

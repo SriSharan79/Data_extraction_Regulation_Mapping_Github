@@ -9,14 +9,17 @@ a component sheet.
 
 Chain format (one per relationship, ``;``-separated)::
 
-    Reference-System Info-Process-Personal-QuantityValue
+    Reference|System Info|Process|Personal|QuantityValue
 
 ``Reference`` is mandatory; missing optional components are ``#``.
-References routinely contain hyphens themselves (``FAA AC 120-76D``,
-``RTCA DO-178C``), so :func:`parse_chain` splits from the RIGHT: the last
-four ``-``-fields are the four optional components and everything before
-them is the Reference. Chains without a Reference are dropped, per the
-prompt's own rule.
+Components are joined with a pipe (``|``). The pipe is used instead of a
+hyphen because References routinely contain hyphens themselves
+(``FAA AC 120-76D``, ``RTCA DO-178C``) — a hyphen connector made the field
+boundaries ambiguous, whereas ``|`` never occurs inside a reference or
+value, so :func:`parse_chain` is a simple positional split. Chains without
+a Reference are dropped, per the prompt's own rule. Legacy hyphen-format
+values (produced before this change) are still parsed via a right-split
+fallback.
 
 Used in two places:
 
@@ -37,6 +40,12 @@ ENTITY_COLUMN = "Specific entities"
 
 COMPONENTS = ("Reference", "System Info", "Process", "Personal", "QuantityValue")
 
+# Component connector. A pipe is used (not a hyphen) because references
+# routinely contain hyphens (FAA AC 120-76D, RTCA DO-178C), which made a
+# hyphen connector ambiguous to split. The pipe never appears inside a
+# reference or value, so parsing is a plain positional split.
+COMPONENT_SEP = "|"
+
 ENTITY_PROMPT = """analyze aviation texts and extract relationships into a strict format based on five specific categories:
 
 1. Reference (Mandatory): Any regulatory, legal, national/international authority rules, or technical industry standards. (e.g., EASA AMC1 ORO.GEN.200, FAA FAR Part 21, ICAO Annex 19, RTCA DO-178C, ISO 9001).
@@ -46,22 +55,23 @@ ENTITY_PROMPT = """analyze aviation texts and extract relationships into a stric
 5. QuantityValue (Optional): Physical measurements, numerical limits, intervals, or tolerances including their units. (e.g., 500 hours, 25 kg, 15°C)
 
 ### Formatting Rules:
-- Format every extracted chain exactly as: Reference-System Info-Process-Personal-QuantityValue
+- Format every extracted chain exactly as: Reference|System Info|Process|Personal|QuantityValue
+- Use the pipe character '|' to separate the five components. Do NOT use hyphens as separators (references such as FAA AC 120-76D contain hyphens themselves).
 - The "Reference" component must ALWAYS exist. If no Reference is found, do not create a chain.
-- The order of components must be strictly maintained. Do not include spaces around the hyphens.
+- The order of components must be strictly maintained. Do not include spaces around the pipes. Never use the '|' character inside a component value.
 - If an optional component (System, Process, Personal, or QuantityValue) is missing, replace it with the '#' character.
 - If multiple distinct chains or relationships are found in the text, separate each chain with a semicolon (;).
 - Return ONLY the final formatted string. No explanations, no introductory text, no markdown code blocks.
 
 ### Examples for Training:
 - Input: "According to FAA AC 120-76D, the operator must evaluate the electronic flight bag software every 6 months."
-  Output: FAA AC 120-76D-electronic flight bag software-evaluation-operator-6 months
+  Output: FAA AC 120-76D|electronic flight bag software|evaluation|operator|6 months
 
 - Input: "RTCA DO-178C states that the software development team shall perform code reviews for Level A software."
-  Output: RTCA DO-178C-Level A software-code reviews-software development team-#
+  Output: RTCA DO-178C|Level A software|code reviews|software development team|#
 
 - Input: "Per ISO 9001:2015, the internal auditor must verify the calibration of all torque wrenches weighing over 5 kg."
-  Output: ISO 9001:2015-torque wrenches-calibration verification-internal auditor-over 5 kg"""
+  Output: ISO 9001:2015|torque wrenches|calibration verification|internal auditor|over 5 kg"""
 
 
 def is_entity_column(name):
@@ -70,11 +80,39 @@ def is_entity_column(name):
 
 
 def parse_chain(chain):
-    """Parse one ``Reference-System-Process-Personal-Quantity`` chain into a
+    """Parse one ``Reference|System|Process|Personal|Quantity`` chain into a
     ``{component: value}`` dict, or ``None`` for an empty / Reference-less
-    chain. ``#`` placeholders become "". Because References themselves may
-    contain hyphens, the last four ``-``-fields are taken as the optional
-    components and everything before them joins back into the Reference."""
+    chain. ``#`` placeholders become "". Components are pipe-separated, so
+    this is a plain positional split; the first field is the (mandatory)
+    Reference and the next four are the optional components. Legacy
+    hyphen-format chains (no pipe present) fall back to the old right-split
+    that tolerates hyphens inside the Reference."""
+    raw = str(chain or "")
+    if COMPONENT_SEP not in raw:
+        return _parse_chain_legacy_hyphen(raw)
+    parts = [("" if p.strip() == "#" else p.strip())
+             for p in raw.split(COMPONENT_SEP)]
+    if not any(parts):
+        return None
+    ref = parts[0]
+    if not ref:
+        return None  # the prompt forbids Reference-less chains
+    # Positional: 4 optional components after the Reference; anything beyond
+    # the fifth field (a stray '|' in a value) is appended to QuantityValue.
+    tail = parts[1:5] + [""] * (4 - len(parts[1:5]))
+    if len(parts) > 5:
+        extra = COMPONENT_SEP.join(p for p in parts[5:] if p)
+        tail[3] = (tail[3] + COMPONENT_SEP + extra).strip(COMPONENT_SEP) \
+            if extra else tail[3]
+    return dict(zip(COMPONENTS, [ref] + tail))
+
+
+def _parse_chain_legacy_hyphen(chain):
+    """Parse a pre-pipe ``Reference-System-Process-Personal-Quantity`` chain.
+    References may contain hyphens, so the last four ``-``-fields are the
+    optional components and everything before them joins back into the
+    Reference. Kept so entity sheets/values produced before the pipe switch
+    still parse."""
     parts = [p.strip() for p in str(chain or "").split("-")]
     parts = [("" if p == "#" else p) for p in parts]
     if not any(parts):
@@ -88,8 +126,7 @@ def parse_chain(chain):
         tail = parts[1:] + [""] * (4 - len(parts[1:]))
     if not ref:
         return None  # the prompt forbids Reference-less chains
-    values = [ref] + tail
-    return dict(zip(COMPONENTS, values))
+    return dict(zip(COMPONENTS, [ref] + tail))
 
 
 def parse_chains(cell):

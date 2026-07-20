@@ -1517,7 +1517,7 @@ class AIReviewMixin:
 
     def _col_add_entity_column(self):
         """Add (or refresh) the predefined 'Specific entities' column: the
-        aviation Reference-System-Process-Personal-Quantity chain extraction
+        aviation Reference|System|Process|Personal|Quantity chain extraction
         (see ai_utils.entity_chains). Its chains are auto-parsed into an
         'Entities <run sheet>' component sheet during every run."""
         from .entity_chains import ENTITY_COLUMN, ENTITY_PROMPT
@@ -2309,7 +2309,7 @@ class AIReviewMixin:
         self._uniq_refmap_toggle()
 
         # Standalone Specific-entities chain parser: any column holding
-        # Reference-System-Process-Personal-Quantity chains is fanned out
+        # Reference|System|Process|Personal|Quantity chains is fanned out
         # into an 'Entities <sheet>' component sheet of the same file.
         ent_wrap = ttk.LabelFrame(
             uq, text=" Specific-entity chains → component sheet (standalone) ",
@@ -2325,8 +2325,9 @@ class AIReviewMixin:
                                        command=self._uniq_parse_entities)
         self.uniq_ent_btn.pack(side="left", padx=4)
         ttk.Label(ent_wrap, foreground="#666666", justify="left",
-                  text="Parses Reference-System Info-Process-Personal-"
-                       "QuantityValue chains (';'-separated, '#' = empty) "
+                  text="Parses Reference|System Info|Process|Personal|"
+                       "QuantityValue chains (pipe-separated; ';' between "
+                       "chains, '#' = empty) "
                        "from the chosen column of the sheet above into an\n"
                        "'Entities <sheet>' sheet — one row per chain, one "
                        "column per component. Reference-less chains are "
