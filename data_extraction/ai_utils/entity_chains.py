@@ -79,6 +79,41 @@ def is_entity_column(name):
     return str(name or "").strip().lower() == ENTITY_COLUMN.lower()
 
 
+def clean_chain_text(text):
+    """Strip a markdown code fence (```…```) and surrounding whitespace from
+    a raw LLM reply, leaving the bare chain string."""
+    raw = str(text if text is not None else "").strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        lines = lines[1:]                       # drop the ``` / ```text line
+        while lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    return raw
+
+
+def looks_like_chain(text):
+    """True when a raw LLM reply *is* entity-chain text rather than JSON or
+    prose, so it can be recorded as-is instead of re-prompting for JSON.
+
+    Deliberately strict: every ``;``-separated segment must use the pipe
+    connector and at least one must parse into a valid chain. Requiring the
+    pipe is what keeps ordinary prose (which is full of hyphens) from being
+    mistaken for a chain; a Reference-less segment may still fail to parse
+    and is simply dropped later, so only one valid chain is required. A
+    JSON-looking reply is rejected outright so this stays correct even when
+    called before a JSON parse."""
+    raw = clean_chain_text(text)
+    if not raw or COMPONENT_SEP not in raw:
+        return False
+    if raw.startswith("{") or raw.startswith("["):
+        return False        # JSON (which may well contain pipes in values)
+    segments = [s.strip() for s in raw.split(";") if s.strip()]
+    if not segments or not all(COMPONENT_SEP in s for s in segments):
+        return False
+    return any(parse_chain(s) is not None for s in segments)
+
+
 def parse_chain(chain):
     """Parse one ``Reference|System|Process|Personal|Quantity`` chain into a
     ``{component: value}`` dict, or ``None`` for an empty / Reference-less

@@ -177,7 +177,12 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     unambiguous positional split (legacy hyphen-format values still parse
     via a fallback). When this column is part of a run its chains are
     **auto-parsed into an `Entities <run sheet>` sheet** after every saved
-    row — one row per chain, one column per component plus the raw chain. In
+    row — one row per chain, one column per component plus the raw chain.
+    Because the chain format is itself a valid answer, a reply that is
+    **bare chain text rather than JSON is accepted and recorded as-is**
+    instead of triggering the JSON retries (a fenced ```` ``` ```` wrapper is
+    stripped; a JSON-wrapped chain is unwrapped) — only genuinely unusable
+    replies still cost retries and end up `[unparsed]`. In
     per-column call mode this column's prompt is sent as-is and the raw
     reply kept (no JSON wrapper). The *Unique elements* tab has the same
     parser **standalone**: pick any workbook/sheet/column holding chain

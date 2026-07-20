@@ -39,7 +39,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from . import llm_utils as _llm_utils_mod
-from .entity_chains import is_entity_column as _is_entity_column
+from .entity_chains import (clean_chain_text as _clean_chain_text,
+                            is_entity_column as _is_entity_column,
+                            looks_like_chain as _looks_like_chain)
 from .llm_utils import (get_selected_model, list_available_models,
                         set_selected_model, list_embedding_models,
                         get_default_embedding_model)
@@ -1784,9 +1786,13 @@ class AIReviewMixin:
                 return json.dumps(v, ensure_ascii=False)
             return "" if v is None else str(v)
 
-        def _call_parsed(prompt, tag=""):
+        def _call_parsed(prompt, tag="", chain_col=None):
             """llm_call that re-sends the prompt up to _JSON_RETRIES extra
-            times while the reply is not parsable JSON. Returns
+            times while the reply is not parsable JSON. When ``chain_col`` is
+            given (a Specific-entities column is expected in this answer), a
+            reply that is bare entity-chain text instead of JSON is accepted
+            as that column's value — the chain format is a valid answer, so
+            re-prompting for JSON would only waste LLM calls. Returns
             (parsed dict or None, last raw response); call errors propagate."""
             resp = None
             for attempt in range(_JSON_RETRIES + 1):
@@ -1802,6 +1808,11 @@ class AIReviewMixin:
                 parsed = self._parse_llm_json(resp)
                 if parsed is not None:
                     return parsed, resp
+                if chain_col and _looks_like_chain(resp):
+                    self._ai_log_bg(
+                        f"✔{tag} reply is entity-chain text, not JSON — "
+                        f"recorded as '{chain_col}' (no retry needed)")
+                    return {chain_col: _clean_chain_text(resp)}, resp
             return None, resp
 
         for i, (title, text) in enumerate(jobs, 1):
@@ -1837,7 +1848,17 @@ class AIReviewMixin:
                         self._ai_log_bg(f"← [column '{name}'] Response "
                                         f"({len(str(resp or ''))} chars): "
                                         f"{self._ai_preview(resp)}")
-                        row[name] = _norm(resp).strip()
+                        # Normally bare chain text — kept as-is. If the model
+                        # wrapped it in JSON anyway, unwrap it here rather
+                        # than re-asking (either shape costs one call).
+                        value = _norm(resp)
+                        wrapped = self._parse_llm_json(resp)
+                        if wrapped is not None:
+                            v = wrapped.get(name)
+                            if v is None and wrapped:
+                                v = next(iter(wrapped.values()))
+                            value = _norm(v)
+                        row[name] = _clean_chain_text(value)
                         continue
                     prompt = (f"{self._col_single_prompt(name, what)}"
                               f"\n\n---\nSECTION: {title}\n\n{text}")
@@ -1867,8 +1888,12 @@ class AIReviewMixin:
                 prompt = f"{prompt_head}\n\n---\nSECTION: {title}\n\n{text}"
                 self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
                                 f"{self._ai_preview(prompt)}")
+                # A Specific-entities column may be answered as bare chain
+                # text instead of JSON — that is a valid reply, so accept it.
+                chain_col = next((c for c in columns if _is_entity_column(c)),
+                                 None)
                 try:
-                    parsed, resp = _call_parsed(prompt)
+                    parsed, resp = _call_parsed(prompt, chain_col=chain_col)
                 except Exception as exc:  # noqa: BLE001
                     parsed = {columns[0]: f"[ERROR] {exc}"}
                     self._ai_log_bg(f"← LLM call failed: {exc}")
