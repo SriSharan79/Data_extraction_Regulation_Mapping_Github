@@ -529,10 +529,38 @@ def generate_and_cache_document(pdf_path, paths, logger):
         return []
 
 
-def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file, logger):
+def _triage_llm(logger):
+    """An ``llm(prompt, system_prompt)`` callable for the triage's heading
+    check, or None when the LLM layer is unavailable — the triage then falls
+    back to the Table of Contents / deterministic rules on its own."""
+    try:
+        from data_extraction.ai_utils.llm_utils import (get_selected_model,
+                                                        llm_call)
+    except Exception as exc:  # noqa: BLE001
+        logger.info(f"Triage runs without an LLM ({exc}).")
+        return None
+
+    def call(prompt, system_prompt):
+        service = "o"
+        try:
+            model = get_selected_model(service)
+        except Exception:  # noqa: BLE001
+            model = None
+        return llm_call(prompt, system_prompt, service, model)
+
+    return call
+
+
+def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file,
+                      logger, bulk=True):
     """
     Launch chunk review with automatic section review continuation.
     When chunk review completes, section review launches automatically.
+
+    ``bulk`` (the default) opens the triage screen: the chunks are sorted
+    automatically against the document's Table of Contents (or an LLM-checked
+    heading list) and only the uncertain ones need attention. Pass
+    ``bulk=False`` for the original one-chunk-at-a-time tool.
     """
     def on_chunk_review_complete():
         """Callback when chunk review finishes - auto-launch section review."""
@@ -547,15 +575,26 @@ def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file
         section_window.mainloop()
 
     review_window = tk.Tk()
-    app = ChunkReviewApp(
-        root=review_window,
-        chunks_data=chunks_data,
-        logged_chunks=logged_chunks,
-        processed_indices=processed_indices,
-        output_file_name=output_file,
-        logger=logger,
-        on_complete_callback=on_chunk_review_complete
-    )
+    if bulk:
+        from .chunk_triage_ui import ChunkTriageApp
+        app = ChunkTriageApp(
+            root=review_window,
+            chunks_data=chunks_data,
+            output_file_name=output_file,
+            logger=logger,
+            on_complete_callback=on_chunk_review_complete,
+            llm=_triage_llm(logger),
+        )
+    else:
+        app = ChunkReviewApp(
+            root=review_window,
+            chunks_data=chunks_data,
+            logged_chunks=logged_chunks,
+            processed_indices=processed_indices,
+            output_file_name=output_file,
+            logger=logger,
+            on_complete_callback=on_chunk_review_complete
+        )
     review_window.mainloop()
 
 
