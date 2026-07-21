@@ -1417,7 +1417,7 @@ class AIReviewMixin:
                  "(no code fences, no commentary):"]
         for name, what in self._col_analyze_cols():
             lines.append(f'- "{name}": {what or "extract this value"}')
-        lines.append('Use "" for any value the section does not contain.')
+        # lines.append('Use "" for any value the section does not contain.')
         lines.append('Use ";" for multiple values the section does contain.')
         return "\n".join(lines)
 

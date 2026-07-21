@@ -119,6 +119,21 @@ def looks_like_chain(text):
     return any(parse_chain(s) is not None for s in segments)
 
 
+def chain_text_or_none(text):
+    """Accept-or-reject gate for an LLM reply to the entity prompt.
+
+    Returns the cleaned chain string when ``text`` is a valid entity-chain
+    reply — so the caller can accept it as-is instead of parsing it as JSON —
+    and ``None`` otherwise (empty, prose, or a JSON reply). This is the single
+    canonical check for "accept the reply as chain text": it reuses
+    :func:`clean_chain_text` (code-fence / whitespace stripping) and
+    :func:`looks_like_chain` (strict chain detection) so callers do not
+    re-implement either. A ``None`` result means "fall back to the JSON path",
+    not "the chain was unparseable"."""
+    cleaned = clean_chain_text(text)
+    return cleaned if looks_like_chain(cleaned) else None
+
+
 def parse_chain(chain):
     """Parse one ``Reference|System Info|Process|Personal|Physical Quantity|QuantityValue``
     chain into a ``{component: value}`` dict, or ``None`` for an empty /
