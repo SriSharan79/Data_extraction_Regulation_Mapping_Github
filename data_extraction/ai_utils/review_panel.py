@@ -1519,7 +1519,7 @@ class AIReviewMixin:
 
     def _col_add_entity_column(self):
         """Add (or refresh) the predefined 'Specific entities' column: the
-        aviation Reference|System|Process|Personal|Quantity chain extraction
+        aviation  Reference|System Info|Process|Personal|Physical Quantity|Quantity Value chain extraction
         (see ai_utils.entity_chains). Its chains are auto-parsed into an
         'Entities <run sheet>' component sheet during every run."""
         from .entity_chains import ENTITY_COLUMN, ENTITY_PROMPT

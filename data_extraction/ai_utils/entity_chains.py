@@ -9,7 +9,7 @@ a component sheet.
 
 Chain format (one per relationship, ``;``-separated)::
 
-    Reference|System Info|Process|Personal|QuantityValue
+    Reference|System Info|Process|Personal|Physical Quantity|QuantityValue
 
 ``Reference`` is mandatory; missing optional components are ``#``.
 Components are joined with a pipe (``|``). The pipe is used instead of a
@@ -38,7 +38,7 @@ import os
 
 ENTITY_COLUMN = "Specific entities"
 
-COMPONENTS = ("Reference", "System Info", "Process", "Personal", "QuantityValue")
+COMPONENTS = ("Reference", "System Info", "Process", "Personal","Physical Quantity", "QuantityValue")
 
 # Component connector. A pipe is used (not a hyphen) because references
 # routinely contain hyphens (FAA AC 120-76D, RTCA DO-178C), which made a
@@ -46,32 +46,37 @@ COMPONENTS = ("Reference", "System Info", "Process", "Personal", "QuantityValue"
 # reference or value, so parsing is a plain positional split.
 COMPONENT_SEP = "|"
 
-ENTITY_PROMPT = """analyze aviation texts and extract relationships into a strict format based on five specific categories:
+ENTITY_PROMPT = """analyze text and extract structured relationships based on these six specific categories:
 
-1. Reference (Mandatory): Any regulatory, legal, national/international authority rules, or technical industry standards. (e.g., EASA AMC1 ORO.GEN.200, FAA FAR Part 21, ICAO Annex 19, RTCA DO-178C, ISO 9001).
-2. System Info (Optional): Aircraft models, engine types, components, parts, systems, software, or ground tools. (e.g., landing gear)
-3. Process (Optional): Technical or operational actions like inspection, overhaul, auditing, software verification, or risk assessment. (e.g., defect rectification)
-4. Personal (Optional): Accountable managers, certifying staff, pilots, operators, manufacturers, airlines, or competent authorities. (e.g., CAMO, FAA inspector)
-5. QuantityValue (Optional): Physical measurements, numerical limits, intervals, or tolerances including their units. (e.g., 500 hours, 25 kg, 15°C)
+1. Reference (Mandatory): Standard/regulatory anchor (e.g., EASA AMC1 ORO.GEN.200, FAA AC 120-76D, DO-178C, ISO 9001).
+2. System Info (Optional): Aircraft, component, tool, or software being regulated (e.g., landing gear, EFB software).
+3. Process (Optional): Technical or operational actions (e.g., inspection, calibration, risk assessment).
+4. Personal (Optional): Responsible role, organization, or authority (e.g., CAMO, certifying staff, operator).
+5. Physical Quantity (Optional): The parameter or property being measured (e.g., mass, temperature, maintenance interval, operating pressure).
+6. Quantity Value (Optional): The numerical magnitude, range, or threshold along with its units (e.g., 25 kg, 15°C, 12 months, 500 hours).
 
 ### Formatting Rules:
-- Format every extracted chain exactly as: Reference|System Info|Process|Personal|QuantityValue
-- Use the pipe character '|' to separate the five components. Do NOT use hyphens as separators (references such as FAA AC 120-76D contain hyphens themselves).
+- Format every extracted chain exactly as: Reference|System Info|Process|Personal|Physical Quantity|Quantity Value
+- Use the pipe character '|' to separate the six components. Do NOT use hyphens as separators (references such as FAA AC 120-76D contain hyphens themselves).
 - The "Reference" component must ALWAYS exist. If no Reference is found, do not create a chain.
 - The order of components must be strictly maintained. Do not include spaces around the pipes. Never use the '|' character inside a component value.
-- If an optional component (System, Process, Personal, or QuantityValue) is missing, replace it with the '#' character.
+- If an optional component (System, Process, Personal, Physical Quantity, or Quantity Value) is missing, replace it with the '#' character.
 - If multiple distinct chains or relationships are found in the text, separate each chain with a semicolon (;).
 - Return ONLY the final formatted string. No explanations, no introductory text, no markdown code blocks.
 
 ### Examples for Training:
-- Input: "According to FAA AC 120-76D, the operator must evaluate the electronic flight bag software every 6 months."
-  Output: FAA AC 120-76D|electronic flight bag software|evaluation|operator|6 months
+- Input: "According to AMC1 SPO.SPEC.HES.100, the operator must perform an inspection on the hoist system every 12 months."
+  Output: AMC1 SPO.SPEC.HES.100|hoist system|inspection|operator|maintenance interval|12 months
 
-- Input: "RTCA DO-178C states that the software development team shall perform code reviews for Level A software."
-  Output: RTCA DO-178C|Level A software|code reviews|software development team|#
+- Input: "Part-145.A.30 states that the approved maintenance organization shall ensure certifying staff are qualified."
+  Output: Part-145.A.30|#|qualification verification|approved maintenance organization|#|#;Part-145.A.30|#|#|certifying staff|#|#
 
-- Input: "Per ISO 9001:2015, the internal auditor must verify the calibration of all torque wrenches weighing over 5 kg."
-  Output: ISO 9001:2015|torque wrenches|calibration verification|internal auditor|over 5 kg"""
+- Input: "Per ISO 9001:2015, the internal auditor must verify the calibration of all torque wrenches with a capacity exceeding 50 Nm."
+  Output: ISO 9001:2015|torque wrenches|calibration verification|internal auditor|torque capacity|exceeding 50 Nm
+
+- Input: "As required by CS 25.1309, the applicant must conduct a safety assessment on fly-by-wire components operating at temperatures above 70°C."
+  Output: CS 25.1309|fly-by-wire components|safety assessment|applicant|operating temperature|above 70°C
+"""
 
 
 def is_entity_column(name):
@@ -115,13 +120,18 @@ def looks_like_chain(text):
 
 
 def parse_chain(chain):
-    """Parse one ``Reference|System|Process|Personal|Quantity`` chain into a
-    ``{component: value}`` dict, or ``None`` for an empty / Reference-less
-    chain. ``#`` placeholders become "". Components are pipe-separated, so
-    this is a plain positional split; the first field is the (mandatory)
-    Reference and the next four are the optional components. Legacy
-    hyphen-format chains (no pipe present) fall back to the old right-split
-    that tolerates hyphens inside the Reference."""
+    """Parse one ``Reference|System Info|Process|Personal|Physical Quantity|QuantityValue``
+    chain into a ``{component: value}`` dict, or ``None`` for an empty /
+    Reference-less chain. ``#`` placeholders become "". Components are
+    pipe-separated, so this is a plain positional split; the first field is
+    the (mandatory) Reference and the next five are the optional components.
+
+    A 5-field pipe chain is treated as the legacy pre-``Physical Quantity``
+    format (``Reference|System Info|Process|Personal|QuantityValue``): its
+    trailing field is mapped to QuantityValue with Physical Quantity left
+    empty, so old entity values are not shifted one component to the left.
+    Legacy hyphen-format chains (no pipe present) fall back to the old
+    right-split that tolerates hyphens inside the Reference."""
     raw = str(chain or "")
     if COMPONENT_SEP not in raw:
         return _parse_chain_legacy_hyphen(raw)
@@ -132,13 +142,24 @@ def parse_chain(chain):
     ref = parts[0]
     if not ref:
         return None  # the prompt forbids Reference-less chains
-    # Positional: 4 optional components after the Reference; anything beyond
-    # the fifth field (a stray '|' in a value) is appended to QuantityValue.
-    tail = parts[1:5] + [""] * (4 - len(parts[1:5]))
-    if len(parts) > 5:
-        extra = COMPONENT_SEP.join(p for p in parts[5:] if p)
-        tail[3] = (tail[3] + COMPONENT_SEP + extra).strip(COMPONENT_SEP) \
-            if extra else tail[3]
+    n_opt = len(COMPONENTS) - 1  # 5 optional components after the Reference
+    if len(parts) == n_opt:
+        # Legacy 5-field pipe chain (predates 'Physical Quantity'):
+        # Reference|System Info|Process|Personal|QuantityValue. Its trailing
+        # field is the quantity value, so map it to QuantityValue and leave
+        # Physical Quantity empty rather than shifting every value one
+        # component to the left.
+        sys_info, process, personal, qty_value = parts[1:5]
+        tail = [sys_info, process, personal, "", qty_value]
+    else:
+        # New 6-field format (Reference + 5 optional). Anything beyond the
+        # sixth field (a stray '|' inside a value) is appended to
+        # QuantityValue, the last component.
+        tail = parts[1:1 + n_opt] + [""] * (n_opt - len(parts[1:1 + n_opt]))
+        if len(parts) > len(COMPONENTS):
+            extra = COMPONENT_SEP.join(p for p in parts[len(COMPONENTS):] if p)
+            if extra:
+                tail[-1] = (tail[-1] + COMPONENT_SEP + extra).strip(COMPONENT_SEP)
     return dict(zip(COMPONENTS, [ref] + tail))
 
 
@@ -146,8 +167,10 @@ def _parse_chain_legacy_hyphen(chain):
     """Parse a pre-pipe ``Reference-System-Process-Personal-Quantity`` chain.
     References may contain hyphens, so the last four ``-``-fields are the
     optional components and everything before them joins back into the
-    Reference. Kept so entity sheets/values produced before the pipe switch
-    still parse."""
+    Reference. The hyphen format predates ``Physical Quantity``; its trailing
+    field is the quantity value, so it is mapped to QuantityValue and
+    Physical Quantity is left empty. Kept so entity sheets/values produced
+    before the pipe switch still parse."""
     parts = [p.strip() for p in str(chain or "").split("-")]
     parts = [("" if p == "#" else p) for p in parts]
     if not any(parts):
@@ -155,12 +178,16 @@ def _parse_chain_legacy_hyphen(chain):
     if len(parts) >= 5:
         ref = "-".join(str(chain).split("-")[:len(parts) - 4]).strip()
         ref = "" if ref == "#" else ref
-        tail = parts[-4:]
+        sys_info, process, personal, qty_value = parts[-4:]
     else:  # malformed / short chain: first field is the Reference
         ref = parts[0]
-        tail = parts[1:] + [""] * (4 - len(parts[1:]))
+        opt = parts[1:] + [""] * (4 - len(parts[1:]))
+        sys_info, process, personal, qty_value = opt
     if not ref:
         return None  # the prompt forbids Reference-less chains
+    # Physical Quantity did not exist in the hyphen format; keep it empty and
+    # place the trailing quantity field in QuantityValue.
+    tail = [sys_info, process, personal, "", qty_value]
     return dict(zip(COMPONENTS, [ref] + tail))
 
 
@@ -186,7 +213,7 @@ def parse_chains(cell):
 def extract_rows(records, column=ENTITY_COLUMN, section_key="Section"):
     """Parse the entity column of analysis-row dicts into sheet rows:
     ``Section | Reference | System Info | Process | Personal |
-    QuantityValue | Chain`` — one row per chain."""
+    Physical Quantity | QuantityValue | Chain`` — one row per chain."""
     rows = []
     for rec in records:
         # the column may be typed with different capitalisation
