@@ -51,6 +51,15 @@ class ExtractionLauncherUI:
         self.btn_full_pipeline = ttk.Button(btn_box, text="Run Extraction + Review Process",
                                             command=self.run_full_pipeline)
         self.btn_full_pipeline.pack(side="left", padx=5)
+        ttk.Label(
+            frame_pdf,
+            text=("Converts the PDF with Docling, then opens the bulk triage "
+                  "review: the chunks arrive pre-sorted against the document's "
+                  "Table of Contents\n(or a validated heading list) and only "
+                  "the uncertain ones need a decision."),
+            foreground="#666666",
+            justify="left",
+        ).grid(row=3, column=1, sticky="w", pady=(2, 0))
         frame_pdf.columnconfigure(1, weight=1)
 
         # Section B: Independent Review Process from Pre-existing Cache

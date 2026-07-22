@@ -23,13 +23,10 @@ class SectionReviewApp:
         self.root.title("Docling Section Review & Refinement Tool")
         self.root.geometry("1000x750")
         self.root.minsize(900, 650)
-        
-        # UI Styling
-        self.bg_color = "#f4f4f6"
-        self.card_color = "#ffffff"
-        self.accent_color = "#3498db"
-        self.root.configure(bg=self.bg_color)
-        
+
+        # Styling comes from the shared ttk theme (clam, applied studio-wide
+        # and by the AI Review page) — no hard-coded colours here.
+
         # Load data first; if it fails the window is torn down, so stop before
         # building any widgets on a destroyed root.
         if not self.load_sections_from_output():
@@ -77,126 +74,124 @@ class SectionReviewApp:
             return False
 
     def setup_ui(self):
-        """Build the section review interface."""
-        
+        """Build the section review interface (AI-Review-style ttk widgets)."""
+
         # ============ TOP HEADER FRAME ============
-        header_frame = tk.LabelFrame(self.root, text=" Section Selection & Navigation ", 
-                                    bg=self.card_color, font=("Arial", 11, "bold"), 
-                                    padx=15, pady=10)
-        header_frame.pack(fill="x", padx=15, pady=10)
-        
-        # Section selector label and dropdown
-        tk.Label(header_frame, text="Select Section to Review:", font=("Arial", 10, "bold"), 
-                bg=self.card_color).grid(row=0, column=0, sticky="w", pady=(0, 5))
-        
-        self.section_selector = ttk.Combobox(header_frame, state="readonly", font=("Arial", 10), width=80)
-        self.section_selector.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(0, 10))
+        header_frame = ttk.LabelFrame(
+            self.root, text=" Section Selection & Navigation ", padding=8)
+        header_frame.pack(fill="x", padx=10, pady=(10, 4))
+
+        ttk.Label(header_frame, text="Select Section to Review:").grid(
+            row=0, column=0, sticky="w", pady=(0, 4))
+
+        self.section_selector = ttk.Combobox(header_frame, state="readonly",
+                                             width=80)
+        self.section_selector.grid(row=1, column=0, sticky="ew",
+                                   padx=(0, 10), pady=(0, 4))
         self.section_selector.bind("<<ComboboxSelected>>", self.on_section_selected)
-        
+
         # Navigation buttons
-        nav_frame = tk.Frame(header_frame, bg=self.card_color)
+        nav_frame = ttk.Frame(header_frame)
         nav_frame.grid(row=1, column=1, sticky="ew", padx=5)
-        
-        self.btn_prev = tk.Button(nav_frame, text="← Prev", font=("Arial", 9, "bold"), 
-                                 bg="#95a5a6", fg="white", width=8, command=self.go_prev_section)
+
+        self.btn_prev = ttk.Button(nav_frame, text="← Prev", width=8,
+                                   command=self.go_prev_section)
         self.btn_prev.pack(side="left", padx=2)
-        
-        self.btn_next = tk.Button(nav_frame, text="Next →", font=("Arial", 9, "bold"), 
-                                 bg="#95a5a6", fg="white", width=8, command=self.go_next_section)
+
+        self.btn_next = ttk.Button(nav_frame, text="Next →", width=8,
+                                   command=self.go_next_section)
         self.btn_next.pack(side="left", padx=2)
-        
+
         header_frame.columnconfigure(0, weight=1)
-        
+
         # ============ SECTION METADATA FRAME ============
-        meta_frame = tk.LabelFrame(self.root, text=" Section Metadata ", 
-                                  bg=self.card_color, font=("Arial", 10, "bold"), 
-                                  padx=15, pady=10)
-        meta_frame.pack(fill="x", padx=15, pady=5)
-        
-        # Section heading display
-        tk.Label(meta_frame, text="Section Heading:", font=("Arial", 9, "bold"), bg=self.card_color).grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.meta_heading = tk.Label(meta_frame, text="N/A", font=("Arial", 10), bg="#ecf0f1", fg="#2c3e50", padx=10, pady=5)
+        meta_frame = ttk.LabelFrame(self.root, text=" Section Metadata ",
+                                    padding=8)
+        meta_frame.pack(fill="x", padx=10, pady=4)
+
+        ttk.Label(meta_frame, text="Section Heading:").grid(
+            row=0, column=0, sticky="w", padx=(0, 10))
+        self.meta_heading = ttk.Label(meta_frame, text="N/A",
+                                      foreground="#1a1a1a")
         self.meta_heading.grid(row=0, column=1, sticky="ew", pady=2)
-        
-        # Chunk indices info
-        tk.Label(meta_frame, text="Source Chunks:", font=("Arial", 9, "bold"), bg=self.card_color).grid(row=1, column=0, sticky="w", padx=(0, 10))
-        self.meta_chunks = tk.Label(meta_frame, text="N/A", font=("Arial", 9), bg="#ecf0f1", fg="#34495e", padx=10, pady=5)
+
+        ttk.Label(meta_frame, text="Source Chunks:").grid(
+            row=1, column=0, sticky="w", padx=(0, 10))
+        self.meta_chunks = ttk.Label(meta_frame, text="N/A",
+                                     foreground="#666666")
         self.meta_chunks.grid(row=1, column=1, sticky="ew", pady=2)
-        
-        # Document item types info
-        tk.Label(meta_frame, text="Content Types:", font=("Arial", 9, "bold"), bg=self.card_color).grid(row=2, column=0, sticky="w", padx=(0, 10))
-        self.meta_types = tk.Label(meta_frame, text="N/A", font=("Arial", 9), bg="#ecf0f1", fg="#34495e", padx=10, pady=5)
+
+        ttk.Label(meta_frame, text="Content Types:").grid(
+            row=2, column=0, sticky="w", padx=(0, 10))
+        self.meta_types = ttk.Label(meta_frame, text="N/A",
+                                    foreground="#666666")
         self.meta_types.grid(row=2, column=1, sticky="ew", pady=2)
-        
-        # Page numbers info
-        tk.Label(meta_frame, text="Page Numbers:", font=("Arial", 9, "bold"), bg=self.card_color).grid(row=3, column=0, sticky="w", padx=(0, 10))
-        self.meta_pages = tk.Label(meta_frame, text="N/A", font=("Arial", 9), bg="#ecf0f1", fg="#34495e", padx=10, pady=5)
+
+        ttk.Label(meta_frame, text="Page Numbers:").grid(
+            row=3, column=0, sticky="w", padx=(0, 10))
+        self.meta_pages = ttk.Label(meta_frame, text="N/A",
+                                    foreground="#666666")
         self.meta_pages.grid(row=3, column=1, sticky="ew", pady=2)
-        
+
         meta_frame.columnconfigure(1, weight=1)
-        
+
         # ============ HEADING EDITOR FRAME ============
-        heading_edit_frame = tk.Frame(self.root, bg=self.bg_color)
-        heading_edit_frame.pack(fill="x", padx=15, pady=(10, 5))
-        
-        tk.Label(heading_edit_frame, text="Edit Section Heading:", font=("Arial", 10, "bold"), bg=self.bg_color).pack(anchor="w")
-        self.heading_entry = tk.Entry(heading_edit_frame, font=("Arial", 10), bd=2, relief="groove")
-        self.heading_entry.pack(fill="x", pady=(2, 8))
+        heading_edit_frame = ttk.Frame(self.root)
+        heading_edit_frame.pack(fill="x", padx=10, pady=(6, 2))
+
+        ttk.Label(heading_edit_frame, text="Edit Section Heading:").pack(anchor="w")
+        self.heading_entry = ttk.Entry(heading_edit_frame)
+        self.heading_entry.pack(fill="x", pady=(2, 4))
         self.heading_entry.bind("<KeyRelease>", lambda e: self.mark_unsaved())
-        
+
         # ============ CONTENT EDITOR FRAME ============
-        content_frame = tk.LabelFrame(self.root, text=" Merged Section Text Content (Editable) ", 
-                                     bg=self.card_color, font=("Arial", 10, "bold"), 
-                                     padx=10, pady=10)
-        content_frame.pack(fill="both", expand=True, padx=15, pady=5)
-        
-        self.text_editor = scrolledtext.ScrolledText(content_frame, font=("Consolas", 10), 
-                                                    wrap=tk.WORD, bd=2, relief="groove", 
-                                                    bg="#fafafa", fg="#2c3e50")
+        content_frame = ttk.LabelFrame(
+            self.root, text=" Merged Section Text Content (Editable) ",
+            padding=6)
+        content_frame.pack(fill="both", expand=True, padx=10, pady=4)
+
+        self.text_editor = scrolledtext.ScrolledText(
+            content_frame, font=("Consolas", 10), wrap=tk.WORD,
+            relief="flat", borderwidth=1)
         self.text_editor.pack(fill="both", expand=True)
         self.text_editor.bind("<KeyRelease>", lambda e: self.mark_unsaved())
-        
+
         # ============ ACTION BUTTON FRAME ============
-        btn_frame = tk.Frame(self.root, bg=self.bg_color, pady=10)
-        btn_frame.pack(fill="x", padx=15)
-        
-        # Left side buttons
-        left_btn_frame = tk.Frame(btn_frame, bg=self.bg_color)
+        btn_frame = ttk.Frame(self.root, padding=(0, 6))
+        btn_frame.pack(fill="x", padx=10)
+
+        left_btn_frame = ttk.Frame(btn_frame)
         left_btn_frame.pack(side="left", anchor="w")
-        
-        self.btn_add_section = tk.Button(left_btn_frame, text="＋ Add New Section", 
-                                        font=("Arial", 10, "bold"), bg="#27ae60", fg="white", 
-                                        width=18, command=self.add_new_section, relief="raised", bd=2)
-        self.btn_add_section.pack(side="left", padx=5)
-        
-        self.btn_delete_section = tk.Button(left_btn_frame, text="❌ Delete Section", 
-                                           font=("Arial", 10, "bold"), bg="#e74c3c", fg="white", 
-                                           width=16, command=self.delete_current_section, relief="raised", bd=2)
-        self.btn_delete_section.pack(side="left", padx=5)
-        
-        # Right side buttons
-        right_btn_frame = tk.Frame(btn_frame, bg=self.bg_color)
+
+        self.btn_add_section = ttk.Button(left_btn_frame,
+                                          text="＋ Add New Section",
+                                          command=self.add_new_section)
+        self.btn_add_section.pack(side="left", padx=(0, 4))
+
+        self.btn_delete_section = ttk.Button(left_btn_frame,
+                                             text="Delete Section",
+                                             command=self.delete_current_section)
+        self.btn_delete_section.pack(side="left", padx=4)
+
+        right_btn_frame = ttk.Frame(btn_frame)
         right_btn_frame.pack(side="right", anchor="e")
-        
-        self.btn_save = tk.Button(right_btn_frame, text="💾 Save Changes", 
-                                 font=("Arial", 10, "bold"), bg="#f39c12", fg="white", 
-                                 width=16, command=self.save_changes, relief="raised", bd=2)
-        self.btn_save.pack(side="left", padx=5)
-        
-        self.btn_export = tk.Button(right_btn_frame, text="📤 Export & Finish", 
-                                   font=("Arial", 11, "bold"), bg="#27ae60", fg="white", 
-                                   width=18, command=self.export_and_finish, relief="raised", bd=3)
-        self.btn_export.pack(side="left", padx=5)
-        
-        self.btn_close = tk.Button(right_btn_frame, text="Exit", 
-                                  font=("Arial", 9), bg="#95a5a6", fg="white", 
-                                  width=8, command=self.on_close)
-        self.btn_close.pack(side="left", padx=5)
-        
+
+        self.btn_save = ttk.Button(right_btn_frame, text="💾 Save Changes",
+                                   command=self.save_changes)
+        self.btn_save.pack(side="left", padx=4)
+
+        self.btn_export = ttk.Button(right_btn_frame, text="Export & Finish",
+                                     command=self.export_and_finish)
+        self.btn_export.pack(side="left", padx=4)
+
+        self.btn_close = ttk.Button(right_btn_frame, text="Exit", width=8,
+                                    command=self.on_close)
+        self.btn_close.pack(side="left", padx=4)
+
         # ============ STATUS BAR ============
-        self.status_label = tk.Label(self.root, text="Ready", font=("Arial", 9, "italic"), 
-                                    bg=self.bg_color, fg="#7f8c8d", anchor="w")
-        self.status_label.pack(fill="x", padx=15, pady=(5, 10))
+        self.status_label = ttk.Label(self.root, text="Ready",
+                                      foreground="#666666", anchor="w")
+        self.status_label.pack(fill="x", padx=12, pady=(2, 8))
 
     def load_section_selector(self):
         """Populate the section dropdown with all available sections."""
