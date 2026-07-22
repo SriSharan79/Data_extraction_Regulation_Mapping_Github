@@ -624,16 +624,21 @@ class _BaseStudio:
     def _make_review_launcher(self):
         """
         Creates a patched launch_review_app function that:
-        1. Opens chunk review in a Toplevel modal window.
-        2. When chunk review completes, auto-launches Section Review in a
+        1. Opens the bulk chunk-triage review in a Toplevel modal window
+           (chunks are sorted automatically first — see
+           ``data_extraction.chunking.chunk_triage``).
+        2. When the review is accepted, auto-launches Section Review in a
            second Toplevel modal window.
         Used by the PDF Extraction tab (both its pipeline and its
         review-from-cache flow).
         """
         studio_root = self.root
 
-        def _launch(chunks_data, logged_chunks, processed_indices, output_file, logger):
+        def _launch(chunks_data, logged_chunks, processed_indices, output_file,
+                    logger, bulk=True):
+            from data_extraction.chunking.chunk_triage_ui import ChunkTriageApp
             from data_extraction.chunking.chunk_review_ui import ChunkReviewApp
+            from data_extraction.chunking.logic import _triage_llm
             from data_extraction.chunking.section_review_ui import SectionReviewApp
 
             def on_chunk_review_complete():
@@ -650,20 +655,31 @@ class _BaseStudio:
 
             chunk_win = tk.Toplevel(studio_root)
             chunk_win.transient(studio_root)
-            ChunkReviewApp(
-                root=chunk_win,
-                chunks_data=chunks_data,
-                logged_chunks=logged_chunks,
-                processed_indices=processed_indices,
-                output_file_name=output_file,
-                logger=logger,
-                on_complete_callback=on_chunk_review_complete,
-            )
+            if bulk:
+                ChunkTriageApp(
+                    root=chunk_win,
+                    chunks_data=chunks_data,
+                    output_file_name=output_file,
+                    logger=logger,
+                    on_complete_callback=on_chunk_review_complete,
+                    llm=_triage_llm(logger),
+                )
+            else:
+                ChunkReviewApp(
+                    root=chunk_win,
+                    chunks_data=chunks_data,
+                    logged_chunks=logged_chunks,
+                    processed_indices=processed_indices,
+                    output_file_name=output_file,
+                    logger=logger,
+                    on_complete_callback=on_chunk_review_complete,
+                )
             # If there was nothing to review (e.g. resuming an already-completed
-            # document, or an empty chunk set), ChunkReviewApp finishes inside its
-            # own __init__ and destroys chunk_win — and its on_complete callback
-            # has already run Section Review synchronously. Only grab/wait when the
-            # window is still alive, otherwise grab_set() would raise a TclError.
+            # document, or an empty chunk set), the review app may finish inside
+            # its own __init__ and destroy chunk_win — and its on_complete
+            # callback has already run Section Review synchronously. Only
+            # grab/wait when the window is still alive, otherwise grab_set()
+            # would raise a TclError.
             if chunk_win.winfo_exists():
                 chunk_win.grab_set()
                 studio_root.wait_window(chunk_win)

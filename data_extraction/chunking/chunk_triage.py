@@ -41,6 +41,13 @@ from difflib import SequenceMatcher
 # Docling doc-item labels that are page furniture rather than content.
 BOILERPLATE_LABELS = frozenset({"page_header", "page_footer"})
 
+# Docling labels for Table-of-Contents / index entries. Docling routinely
+# shreds a printed TOC into many dot-leader fragments and tags them
+# ``document_index``; that whole run is navigation, not content, so it is
+# always skipped (and never re-used as the section reference — printed TOCs
+# come out too mangled to trust).
+INDEX_LABELS = frozenset({"document_index"})
+
 # Structural labels: these are short by nature, so the "too short to be
 # content" rule must not throw them away.
 HEADING_LABELS = frozenset({"title", "subtitle", "section_header"})
@@ -54,6 +61,12 @@ CONTENT_LABELS = frozenset({
 
 # A chunk shorter than this (after normalisation) carries no usable content.
 MIN_CONTENT_CHARS = 25
+
+# A parsed TOC is only trusted as the section reference when it yields at
+# least this many entries carrying page numbers. Docling frequently mangles a
+# printed TOC into a handful of dot-leader fragments; below this it is
+# rejected and heading refinement falls through to the LLM / rules.
+MIN_TOC_ENTRIES = 4
 
 # Identical text repeated on at least this many pages is running furniture.
 BOILERPLATE_REPEAT_PAGES = 4
@@ -73,6 +86,13 @@ _DESIGNATOR_RE = re.compile(
              |amc\d*|gm\d*|cs)\s+[\w.\-]+""",
     re.IGNORECASE | re.VERBOSE,
 )
+
+# Coded clause identifiers: an uppercase prefix (optionally dotted with more
+# uppercase segments) then a dotted/spaced number, as regulatory paragraphs
+# are labelled — 'EHPS.10 Scope', 'EHPS 480 …', 'ORO.GEN.200',
+# 'CAT.OP.MPA.100'. The trailing digits keep this off plain ALL-CAPS words
+# like 'GENERAL' or 'SCOPE'.
+_CODE_DESIGNATOR_RE = re.compile(r"^\s*[A-Z]{2,}(\.[A-Z]+)*[.\s]\s*\d+")
 
 # Numbering followed by actual title text: '1. Scope', '2.1 Applicability'.
 _NUMBERED_TITLE_RE = re.compile(
@@ -234,8 +254,8 @@ def is_numbered_heading(text):
     raw = str(text or "").strip()
     if not raw or _DATE_RE.match(raw):
         return False
-    return bool(_DESIGNATOR_RE.match(raw) or _NUMBERED_TITLE_RE.match(raw)
-                or _MARKER_RE.match(raw))
+    return bool(_DESIGNATOR_RE.match(raw) or _CODE_DESIGNATOR_RE.match(raw)
+                or _NUMBERED_TITLE_RE.match(raw) or _MARKER_RE.match(raw))
 
 
 def collect_headings(chunks):
@@ -372,12 +392,19 @@ def refine_headings(headings, toc=None, llm=None, log=None):
             log(msg)
 
     toc_entries = (toc or {}).get("entries") or []
-    if toc_entries:
+    with_pages = [e for e in toc_entries if e.get("page") is not None]
+    # Only trust the TOC when it parsed into a real list of entries — a couple
+    # of dot-leader fragments are a mangled TOC, not a section reference.
+    if len(toc_entries) >= MIN_TOC_ENTRIES and len(with_pages) >= MIN_TOC_ENTRIES:
         valid = [e["title"] for e in toc_entries]
         _log(f"Table of Contents found: {len(valid)} entries — using it as "
              "the section reference (no LLM call needed).")
         return {"valid": valid, "source": "toc",
                 "note": f"{len(valid)} TOC entries"}
+    if toc_entries:
+        _log(f"A Table of Contents was detected but only {len(toc_entries)} "
+             "usable entrie(s) parsed (Docling likely mangled it) — its pages "
+             "are skipped but headings are validated another way.")
 
     if llm and headings:
         _log(f"No Table of Contents — asking the LLM to validate "
@@ -462,7 +489,10 @@ def triage_chunks(chunks, valid_headings=None, toc=None, boilerplate=None):
         action = heading_out = reason = None
         confidence = "high"
 
-        if i in toc_indices:
+        if labels and any(lbl in INDEX_LABELS for lbl in labels):
+            action, heading_out = "skip", heading
+            reason = "Table of Contents / index entry"
+        elif i in toc_indices:
             action, heading_out = "skip", heading
             reason = "Table of Contents page (used as the section reference)"
         elif not norm:
