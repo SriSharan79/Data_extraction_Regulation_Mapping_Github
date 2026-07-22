@@ -215,6 +215,25 @@ def list_available_models(service: str) -> list:
     raise ValueError(f"Unknown service '{service}'.")
 
 
+def probe_available_services() -> list:
+    """The services that are usable RIGHT NOW: an API key is stored **and**
+    the live model list answers. Returns ``[(label, [model ids])]`` with
+    **BlaBla first** (the preferred service). Makes network calls — run it
+    off the UI thread."""
+    out = []
+    for label, key_name in (("BlaBla", "BlaBla Door"),
+                            ("DLR Ollama", "DLR Ollama")):
+        try:
+            if not get_stored_api_key(key_name):
+                continue
+            models = list_available_models(label)
+        except Exception:  # noqa: BLE001 - an unreachable service is just absent
+            models = []
+        if models:
+            out.append((label, models))
+    return out
+
+
 def select_model_interactive(service: str) -> str:
     """
     Fetch the live list of available models for a service, show it to the user,

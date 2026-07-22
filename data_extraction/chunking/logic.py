@@ -63,8 +63,29 @@ class ExtractionLauncherUI:
         ttk.Button(frame_src, text="Browse...",
                    command=self.browse_storage).grid(row=2, column=2)
 
+        # LLM used by the triage's heading validation (only needed when the
+        # document has no usable Table of Contents). Populated by a
+        # background probe: a service appears ONLY when its API key is
+        # stored AND its live model list answers — BlaBla first.
+        ttk.Label(frame_src, text="LLM (heading check):").grid(row=3, column=0, sticky="w")
+        llm_row = ttk.Frame(frame_src)
+        llm_row.grid(row=3, column=1, pady=(2, 0), sticky="w")
+        self.llm_service = ttk.Combobox(llm_row, state="readonly", width=12,
+                                        values=[])
+        self.llm_service.pack(side="left")
+        self.llm_service.bind("<<ComboboxSelected>>", self._llm_service_picked)
+        ttk.Label(llm_row, text="Model:").pack(side="left", padx=(8, 0))
+        self.llm_model = ttk.Combobox(llm_row, state="readonly", width=42,
+                                      values=[])
+        self.llm_model.pack(side="left", padx=4)
+        ttk.Button(llm_row, text="↻", width=3,
+                   command=self._probe_llm_services).pack(side="left")
+        self.llm_hint = ttk.Label(llm_row, foreground="#666666",
+                                  text="checking services…")
+        self.llm_hint.pack(side="left", padx=(8, 0))
+
         btn_box = ttk.Frame(frame_src)
-        btn_box.grid(row=3, column=1, pady=8, sticky="w")
+        btn_box.grid(row=4, column=1, pady=8, sticky="w")
         self.btn_run = ttk.Button(btn_box, text="▶ Run Extraction & Review",
                                   command=self.run_extraction_review)
         self.btn_run.pack(side="left")
@@ -80,7 +101,7 @@ class ExtractionLauncherUI:
                   "validated heading list) — review, adjust, Accept & save."),
             foreground="#666666",
             justify="left",
-        ).grid(row=4, column=1, sticky="w", pady=(2, 0))
+        ).grid(row=5, column=1, sticky="w", pady=(2, 0))
         frame_src.columnconfigure(1, weight=1)
 
         # -- Embedded triage review ------------------------------------------
@@ -106,6 +127,77 @@ class ExtractionLauncherUI:
         # Status line for background-task feedback.
         self.status_label = ttk.Label(root, text="", foreground="#2c3e50", anchor="w")
         self.status_label.pack(fill="x", padx=12, pady=(0, 8))
+
+        # Which LLM services are usable (probed in the background at start).
+        self._llm_avail = {}
+        try:
+            self.root.after(300, self._probe_llm_services)
+        except tk.TclError:
+            pass
+
+    # --- LLM service/model picker (for the triage heading check) ----------- #
+    def _probe_llm_services(self):
+        """Check in the background which services have a stored API key AND
+        an answering model list; only those become pickable (BlaBla first)."""
+        try:
+            self.llm_hint.config(text="checking services…")
+        except tk.TclError:
+            pass
+
+        def work():
+            try:
+                from data_extraction.ai_utils import llm_utils as _lu
+                probe = getattr(_lu, "probe_available_services", None)
+                avail = probe() if probe else []
+            except Exception:  # noqa: BLE001 - offline just means none usable
+                avail = []
+            try:
+                self.root.after(0, lambda a=avail: self._apply_llm_services(a))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_llm_services(self, avail):
+        self._llm_avail = {label: models for label, models in (avail or [])}
+        if not self._llm_avail:
+            self.llm_service.configure(values=[])
+            self.llm_service.set("")
+            self.llm_model.configure(values=[])
+            self.llm_model.set("")
+            self.llm_hint.config(
+                text="no usable LLM service (API key missing / models "
+                     "unreachable) — triage uses the TOC / rules")
+            return
+        labels = list(self._llm_avail)          # probe returns BlaBla first
+        self.llm_service.configure(values=labels)
+        self.llm_service.set("BlaBla" if "BlaBla" in labels else labels[0])
+        self.llm_hint.config(text="")
+        self._llm_service_picked()
+
+    def _llm_service_picked(self, _event=None):
+        """Fill the model picker from the probed list of the chosen service."""
+        label = self.llm_service.get().strip()
+        models = self._llm_avail.get(label) or []
+        self.llm_model.configure(values=models)
+        current = ""
+        try:
+            from data_extraction.ai_utils.llm_utils import get_selected_model
+            current = get_selected_model(label) or ""
+        except Exception:  # noqa: BLE001
+            pass
+        self.llm_model.set(current if current in models
+                           else (models[0] if models else ""))
+
+    def _selected_triage_llm(self, logger):
+        """The llm callable for the triage from the tab's pickers, or None
+        when no usable service is selected (TOC/rules only)."""
+        label = self.llm_service.get().strip()
+        if not label or label not in self._llm_avail:
+            return None
+        code = "o" if label == "DLR Ollama" else "b"
+        model = self.llm_model.get().strip() or None
+        return _triage_llm(logger, code, model)
 
     # --- Background-task helpers ------------------------------------------- #
     def _set_busy(self, busy, message=""):
@@ -373,7 +465,7 @@ class ExtractionLauncherUI:
             output_file_name=paths["output_file"],
             logger=logger,
             on_complete_callback=self._open_section_review,
-            llm=_triage_llm(logger),
+            llm=self._selected_triage_llm(logger),
             prior_history=prior_history,
             prior_path=prior_path,
             version_on_change=True,
@@ -565,10 +657,12 @@ def generate_and_cache_document(pdf_path, paths, logger):
         return []
 
 
-def _triage_llm(logger):
+def _triage_llm(logger, service_code="b", model=None):
     """An ``llm(prompt, system_prompt)`` callable for the triage's heading
     check, or None when the LLM layer is unavailable — the triage then falls
-    back to the Table of Contents / deterministic rules on its own."""
+    back to the Table of Contents / deterministic rules on its own.
+    ``service_code`` is 'b' (BlaBla, the preferred default) or 'o'
+    (DLR Ollama); ``model`` overrides the service's selected model."""
     try:
         from data_extraction.ai_utils.llm_utils import (get_selected_model,
                                                         llm_call)
@@ -576,13 +670,16 @@ def _triage_llm(logger):
         logger.info(f"Triage runs without an LLM ({exc}).")
         return None
 
+    label = "DLR Ollama" if str(service_code).lower() == "o" else "BlaBla"
+
     def call(prompt, system_prompt):
-        service = "o"
-        try:
-            model = get_selected_model(service)
-        except Exception:  # noqa: BLE001
-            model = None
-        return llm_call(prompt, system_prompt, service, model)
+        m = model
+        if not m:
+            try:
+                m = get_selected_model(label)
+            except Exception:  # noqa: BLE001
+                m = None
+        return llm_call(prompt, system_prompt, service_code, m)
 
     return call
 

@@ -264,6 +264,7 @@ class AIReviewMixin:
         self._col_rerun = False       # current run re-does failed rows only
         self._col_run_ctx = {}        # settings snapshot for "Re-run failed"
         self._ai_last_output = None   # latest result file (Open results)
+        self._llm_avail = {}          # probed {service label: [model ids]}
         self._eval_busy = False       # an evaluation is running
         self._uniq_busy = False       # a manual unique-elements run is in progress
         self._uniq_col_vars = {}      # {column name: BooleanVar} for the Uniques tab
@@ -299,8 +300,11 @@ class AIReviewMixin:
         llm_frame.pack(fill="x", padx=10, pady=5)
 
         ttk.Label(llm_frame, text="LLM Processing Service Engine:").pack(side="left", padx=5)
-        self.llm_choice_an = ttk.Combobox(llm_frame, values=["O", "B"], width=5, state="readonly")
-        self.llm_choice_an.set("O")
+        # BlaBla is the preferred service, listed and selected first; a
+        # background probe (started at the end of the build) prunes this to
+        # the services whose API key is stored AND whose model list answers.
+        self.llm_choice_an = ttk.Combobox(llm_frame, values=["B", "O"], width=5, state="readonly")
+        self.llm_choice_an.set("B")
         self.llm_choice_an.pack(side="left", padx=5)
         self.llm_choice_an.bind("<<ComboboxSelected>>", self._llm_service_changed)
 
@@ -419,6 +423,14 @@ class AIReviewMixin:
         self._ui_state_load()
         self._llm_update_chip()
 
+        # Probe which LLM services are actually usable (API key stored AND
+        # the model list answers) and prune the pickers to them — BlaBla
+        # first. Runs in the background so the page opens instantly.
+        try:
+            self.root.after(300, self._llm_probe_services)
+        except tk.TclError:
+            pass
+
         # Keyboard shortcuts: Ctrl/Cmd+Return = Analyze queued,
         # Ctrl/Cmd+P = Pause/Resume, Ctrl/Cmd+. = Stop.
         top = self.root.winfo_toplevel()
@@ -449,6 +461,62 @@ class AIReviewMixin:
     def _llm_service_label(self):
         return "DLR Ollama" if self.llm_choice_an.get().upper() == "O" else "BlaBla"
 
+    def _llm_probe_services(self):
+        """Background check of which services are usable (key stored + model
+        list answering) — the pickers are then pruned via
+        :meth:`_llm_apply_services`."""
+        def work():
+            try:
+                from . import llm_utils as _lu
+                probe = getattr(_lu, "probe_available_services", None)
+                avail = probe() if probe else []
+            except Exception:  # noqa: BLE001 - offline is not an error here
+                avail = []
+            try:
+                self.root.after(0, lambda a=avail: self._llm_apply_services(a))
+            except (RuntimeError, tk.TclError):
+                pass  # app closing / no mainloop
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _llm_apply_services(self, avail):
+        """Apply a service probe: only usable services stay pickable, BlaBla
+        (the preferred service) is selected when present, and the probed
+        model lists pre-fill the model pickers. With NOTHING usable the
+        pickers are left as they are (so keys can be added and retried) and
+        the chip warns instead."""
+        self._llm_avail = {label: models for label, models in (avail or [])}
+        if not self._llm_avail:
+            self.llm_active_lbl.configure(
+                text="⚠ no LLM service usable — add API keys (API keys…) ")
+            self._ai_log("⚠ No LLM service usable: API key missing or the "
+                         "model list did not answer (BlaBla / DLR Ollama).")
+            return
+        codes = ["B" if label == "BlaBla" else "O" for label in self._llm_avail]
+        self.llm_choice_an.configure(values=codes)
+        # BlaBla is ALWAYS the first choice when it is usable.
+        self.llm_choice_an.set("B" if "B" in codes else codes[0])
+        label = self._llm_service_label()
+        models = self._llm_avail.get(label) or []
+        if models:
+            self.llm_model_combo.configure(values=models)
+            current = get_selected_model(label)
+            if current not in models:
+                current = models[0]
+                set_selected_model(label, current)
+            self.llm_model_combo.set(current)
+        # the Evaluation tab's embedding-service picker follows availability
+        try:
+            labels = list(self._llm_avail)
+            self.eval_embed_service.configure(values=labels)
+            if self.eval_embed_service.get() not in labels:
+                self.eval_embed_service.set(labels[0])
+        except (AttributeError, tk.TclError):
+            pass
+        self._llm_update_chip()
+        self._ai_log("LLM services usable: " + ", ".join(self._llm_avail)
+                     + f" — active: {self._llm_service_label()}")
+
     def _llm_update_chip(self):
         """Show what a run started NOW would use (service + model)."""
         label = self._llm_service_label()
@@ -461,7 +529,9 @@ class AIReviewMixin:
         self.llm_model_combo.set(current)
 
     def _llm_service_changed(self, _event=None):
-        self.llm_model_combo.configure(values=[])
+        # pre-fill from the availability probe's model list when we have it
+        models = getattr(self, "_llm_avail", {}).get(self._llm_service_label())
+        self.llm_model_combo.configure(values=models or [])
         self._llm_update_chip()
         self._ui_state_save()
 
@@ -2778,8 +2848,8 @@ class AIReviewMixin:
         srow.pack(fill="x", pady=(4, 0))
         ttk.Label(srow, text="Service:").pack(side="left")
         self.eval_embed_service = ttk.Combobox(
-            srow, state="readonly", width=14, values=["DLR Ollama", "BlaBla"])
-        self.eval_embed_service.set("DLR Ollama")
+            srow, state="readonly", width=14, values=["BlaBla", "DLR Ollama"])
+        self.eval_embed_service.set("BlaBla")
         self.eval_embed_service.pack(side="left", padx=4)
         self.eval_embed_service.bind(
             "<<ComboboxSelected>>",

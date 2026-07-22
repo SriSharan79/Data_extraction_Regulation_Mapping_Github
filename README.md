@@ -193,7 +193,14 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     uniques/entities sheet) with the system's default app. The LLM row
     hosts an **inline model picker** (↻ loads the live list in the
     background) plus an *Active: service · model* chip showing exactly
-    what the next run uses. Every Evaluation-tab metric checkbox has a
+    what the next run uses. **Blablador is the first and default
+    service**, and a background **availability probe** at startup only
+    offers a service when its **API key is stored and its live model
+    list answers** (with nothing usable, the chip warns and points to
+    *API keys…*); the probed model lists pre-fill the pickers. The same
+    gated **service + model picker sits on the PDF Extraction tab** for
+    the triage's LLM heading check (used only when the document has no
+    usable Table of Contents). Every Evaluation-tab metric checkbox has a
     **hover tooltip** explaining the metric and its direction
     (higher/lower is better). The page uses the *clam* ttk theme and
     keyboard shortcuts: **Ctrl/Cmd+Return** = Analyze queued,
