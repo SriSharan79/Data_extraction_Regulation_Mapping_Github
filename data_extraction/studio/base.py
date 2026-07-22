@@ -561,6 +561,17 @@ class _BaseStudio:
         root.geometry(self.GEOMETRY)
         root.minsize(*self.MINSIZE)
 
+        # Apply the clam ttk theme for the whole studio right at startup.
+        # Previously only the AI Review page set it (review_panel), so the
+        # app looked different until that tab was first opened; tabs load
+        # lazily, so the theme must be set here, not in a tab builder.
+        try:
+            style = ttk.Style(root)
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+        except tk.TclError:
+            pass
+
         self._review_launcher = self._make_review_launcher()
 
         if self.HEADER:
