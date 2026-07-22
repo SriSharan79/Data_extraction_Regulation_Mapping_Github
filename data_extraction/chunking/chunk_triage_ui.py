@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -37,7 +38,9 @@ class ChunkTriageApp:
     """Bulk review of Docling chunks with automatic triage proposals."""
 
     def __init__(self, root, chunks_data, output_file_name, logger,
-                 on_complete_callback=None, llm=None, prior_history=None):
+                 on_complete_callback=None, llm=None, prior_history=None,
+                 prior_path=None, version_on_change=False,
+                 destroy_on_accept=True):
         self.root = root
         self.chunks_data = list(chunks_data or [])
         self.output_file_name = output_file_name
@@ -49,6 +52,19 @@ class ChunkTriageApp:
         # fresh triage proposals on resume, so earlier accepts/skips/edits
         # survive closing the window.
         self._prior_history = list(prior_history or [])
+        # Where that history came from, plus its fingerprint: with
+        # ``version_on_change`` an accept that changed nothing keeps the
+        # existing review file, while real changes are written to a NEW file
+        # (timestamped when the target already exists) instead of
+        # overwriting the earlier review.
+        self._prior_path = prior_path
+        self._prior_fp = (self._history_fingerprint(self._prior_history)
+                          if self._prior_history else None)
+        self.version_on_change = version_on_change
+        # False when the review lives inside a tab (the extraction tab):
+        # accepting saves and stays, rather than destroying the host.
+        self.destroy_on_accept = destroy_on_accept
+        self.saved_path = None       # where the last accept actually wrote
 
         self.proposals = []          # engine output, edited in place
         self.result = None           # analyze_chunks() result
@@ -62,6 +78,25 @@ class ChunkTriageApp:
 
         self._build_ui()
         self._run_triage()
+
+    @staticmethod
+    def _history_fingerprint(entries):
+        """Canonical form of the *meaningful* review state — per chunk: kept
+        or skipped, its heading and its text. Used to decide whether the
+        reviewer actually changed anything compared to the prior review
+        (bookkeeping fields like triage_reason are deliberately excluded)."""
+        out = []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            heading = entry.get("heading")
+            if isinstance(heading, list):
+                heading = ", ".join(str(h) for h in heading if str(h).strip())
+            out.append((str(entry.get("chunk_index")),
+                        str(entry.get("status") or "") == "skipped",
+                        str(heading or ""),
+                        str(entry.get("chunk_text") or "")))
+        return tuple(sorted(out))
 
     # ----------------------------------------------------------------- UI -- #
     def _build_ui(self):
@@ -452,7 +487,13 @@ class ChunkTriageApp:
         ttk.Button(frm, text="Close", command=dlg.destroy).pack(anchor="e")
 
     def _accept(self):
-        """Write the review output — once, not per chunk."""
+        """Write the review output — once, not per chunk.
+
+        With ``version_on_change``: when a prior review was pre-applied and
+        the reviewer changed nothing, the existing file is kept as-is; when
+        anything changed, the review is written as a NEW file (a timestamped
+        name when the target already exists) so the earlier review survives.
+        """
         payload = build_output_payload(self.proposals)
         sections = payload["merged_headings"]
         kept = sum(1 for p in self.proposals if p["action"] != "skip")
@@ -462,23 +503,61 @@ class ChunkTriageApp:
                 f"{still} chunk(s) are still marked 'Review'. They will be "
                 "kept under the heading shown (or with none).\n\nSave anyway?"):
             return
-        try:
-            with open(self.output_file_name, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=4, ensure_ascii=False)
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"[ERROR] could not write {self.output_file_name}: {exc}")
-            messagebox.showerror("Save failed", str(exc))
-            return
-        self._log(f"Triage accepted: {kept} chunk(s) kept in "
-                  f"{len(sections)} section(s) → {self.output_file_name}")
-        messagebox.showinfo(
-            "Review saved",
-            f"{kept} chunk(s) kept in {len(sections)} section(s).\n\n"
-            f"Written to {self.output_file_name}\n\nProceeding to Section "
-            "Review…")
-        self.root.destroy()
+
+        fp_new = self._history_fingerprint(payload["raw_session_history"])
+        unchanged = (self.version_on_change and self._prior_fp is not None
+                     and fp_new == self._prior_fp and self._prior_path
+                     and os.path.exists(self._prior_path))
+        if unchanged:
+            self.saved_path = self._prior_path
+            self._log("Triage accepted with no changes — existing review "
+                      f"kept: {self._prior_path}")
+            messagebox.showinfo(
+                "No changes",
+                f"Nothing was changed compared to the existing review —\n"
+                f"{self._prior_path}\n\nis kept as it is. Proceeding to "
+                "Section Review…")
+        else:
+            target = self.output_file_name
+            if self.version_on_change and os.path.exists(target):
+                stem, ext = os.path.splitext(target)
+                target = f"{stem} {time.strftime('%H.%M.%S')}{ext}"
+                while os.path.exists(target):      # same-second re-save
+                    stem2 = target[: -len(ext)]
+                    target = f"{stem2}b{ext}"
+            try:
+                os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+                with open(target, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=4, ensure_ascii=False)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[ERROR] could not write {target}: {exc}")
+                messagebox.showerror("Save failed", str(exc))
+                return
+            self.saved_path = target
+            as_new = ("" if not self._prior_path
+                      or os.path.abspath(self._prior_path)
+                      == os.path.abspath(target)
+                      else " (saved as a NEW file — the previous review is "
+                           "untouched)")
+            self._log(f"Triage accepted: {kept} chunk(s) kept in "
+                      f"{len(sections)} section(s) → {target}{as_new}")
+            messagebox.showinfo(
+                "Review saved",
+                f"{kept} chunk(s) kept in {len(sections)} section(s).\n\n"
+                f"Written to {target}{as_new}\n\nProceeding to Section "
+                "Review…")
+            # the just-saved state is the new baseline for further accepts
+            self._prior_fp = fp_new
+            self._prior_path = target
+        if self.destroy_on_accept:
+            self.root.destroy()
+        else:
+            self.status_var.set(f"Saved → {os.path.basename(self.saved_path)}")
         if self.on_complete_callback:
-            self.on_complete_callback()
+            try:
+                self.on_complete_callback(self.saved_path)
+            except TypeError:
+                self.on_complete_callback()
 
 
 def unreviewed_headings(proposals):

@@ -1,3 +1,4 @@
+import glob
 import os
 import json
 import re
@@ -22,82 +23,84 @@ from .workspace_config import REGISTRY_FILE
 init(autoreset=True)
 
 class ExtractionLauncherUI:
-    """Launcher screen to customize processing goals and path configurations dynamically."""
+    """PDF extraction + review in ONE page: pick the document and the storage
+    destination, hit Run, and the pre-sorted chunk triage appears right below
+    for review and saving — no separate review window.
+
+    Resume/versioning: when the chosen document + storage match a previous
+    run and a reviewed ``Processed_chunks*.json`` already exists anywhere
+    under that document's storage root, its decisions are pre-applied to the
+    triage; accepting with changes writes a NEW file (the earlier review is
+    never overwritten), accepting without changes keeps the existing one."""
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Docling Automation & Curation Setup Launcher")
-        self.root.geometry("760x460")
+        self.root.title("PDF Extraction & Review")
+        self.root.geometry("1200x800")
 
-        # Section A: Fresh Document Processing
-        frame_pdf = ttk.LabelFrame(
-            root, text=" Pipeline Run: Process PDF Document ", padding=10)
-        frame_pdf.pack(fill="x", padx=10, pady=10)
+        self.triage = None            # the embedded ChunkTriageApp (if any)
 
-        ttk.Label(frame_pdf, text="PDF file:").grid(row=0, column=0, sticky="w")
-        self.entry_pdf = ttk.Entry(frame_pdf, width=78)
+        # -- Source & storage ------------------------------------------------
+        frame_src = ttk.LabelFrame(
+            root, text=" Document & storage ", padding=10)
+        frame_src.pack(fill="x", padx=10, pady=(10, 4))
+
+        ttk.Label(frame_src, text="PDF file:").grid(row=0, column=0, sticky="w")
+        self.entry_pdf = ttk.Entry(frame_src, width=78)
         self.entry_pdf.grid(row=0, column=1, padx=5, pady=3, sticky="we")
-        ttk.Button(frame_pdf, text="Browse...", command=self.browse_pdf).grid(row=0, column=2)
+        ttk.Button(frame_src, text="Browse...",
+                   command=self.browse_pdf).grid(row=0, column=2)
 
-        ttk.Label(frame_pdf, text="Storage destination:").grid(row=1, column=0, sticky="w")
-        self.entry_store_pdf = ttk.Entry(frame_pdf, width=78)
-        self.entry_store_pdf.grid(row=1, column=1, padx=5, pady=3, sticky="we")
-        ttk.Button(frame_pdf, text="Browse...", command=self.browse_storage_pdf).grid(row=1, column=2)
+        ttk.Label(frame_src, text="…or cache JSON:").grid(row=1, column=0, sticky="w")
+        self.entry_cache = ttk.Entry(frame_src, width=78)
+        self.entry_cache.grid(row=1, column=1, padx=5, pady=3, sticky="we")
+        ttk.Button(frame_src, text="Browse...",
+                   command=self.browse_cache).grid(row=1, column=2)
 
-        btn_box = ttk.Frame(frame_pdf)
-        btn_box.grid(row=2, column=1, pady=8, sticky="w")
+        ttk.Label(frame_src, text="Storage destination:").grid(row=2, column=0, sticky="w")
+        self.entry_store = ttk.Entry(frame_src, width=78)
+        self.entry_store.grid(row=2, column=1, padx=5, pady=3, sticky="we")
+        ttk.Button(frame_src, text="Browse...",
+                   command=self.browse_storage).grid(row=2, column=2)
+
+        btn_box = ttk.Frame(frame_src)
+        btn_box.grid(row=3, column=1, pady=8, sticky="w")
+        self.btn_run = ttk.Button(btn_box, text="▶ Run Extraction & Review",
+                                  command=self.run_extraction_review)
+        self.btn_run.pack(side="left")
         self.btn_cache_only = ttk.Button(btn_box, text="Generate Cache Only",
                                          command=self.run_cache_only)
-        self.btn_cache_only.pack(side="left")
-        self.btn_full_pipeline = ttk.Button(btn_box, text="Run Extraction + Review Process",
-                                            command=self.run_full_pipeline)
-        self.btn_full_pipeline.pack(side="left", padx=5)
+        self.btn_cache_only.pack(side="left", padx=5)
         ttk.Label(
-            frame_pdf,
-            text=("Converts the PDF with Docling, then opens the bulk triage "
-                  "review: the chunks arrive pre-sorted against the document's "
-                  "Table of Contents\n(or a validated heading list) and only "
-                  "the uncertain ones need a decision."),
+            frame_src,
+            text=("Give a cache JSON to skip re-extraction (its storage must be "
+                  "the folder the cache was generated with); with only a PDF, "
+                  "Docling converts it first.\nThe chunks then appear below, "
+                  "pre-sorted against the document's Table of Contents (or a "
+                  "validated heading list) — review, adjust, Accept & save."),
             foreground="#666666",
             justify="left",
-        ).grid(row=3, column=1, sticky="w", pady=(2, 0))
-        frame_pdf.columnconfigure(1, weight=1)
+        ).grid(row=4, column=1, sticky="w", pady=(2, 0))
+        frame_src.columnconfigure(1, weight=1)
 
-        # Section B: Independent Review Process from Pre-existing Cache
-        frame_cache = ttk.LabelFrame(
-            root, text=" Curation of the Extracted Chunks (from an existing cache) ", padding=10)
-        frame_cache.pack(fill="x", padx=10, pady=10)
-
-        ttk.Label(frame_cache, text="Cache JSON file:").grid(row=0, column=0, sticky="w")
-        self.entry_cache = ttk.Entry(frame_cache, width=78)
-        self.entry_cache.grid(row=0, column=1, padx=5, pady=3, sticky="we")
-        ttk.Button(frame_cache, text="Browse...", command=self.browse_cache).grid(row=0, column=2)
-
-        ttk.Label(frame_cache, text="Storage destination:").grid(row=1, column=0, sticky="w")
-        self.entry_store_cache = ttk.Entry(frame_cache, width=78)
-        self.entry_store_cache.grid(row=1, column=1, padx=5, pady=3, sticky="we")
-        ttk.Button(frame_cache, text="Browse...", command=self.browse_storage_cache).grid(row=1, column=2)
-
-        ttk.Label(
-            frame_cache,
-            text="Always choose the storage folder that was used to generate the cache file.",
-            foreground="#b3541e",
-        ).grid(row=2, column=1, sticky="w", pady=(4, 0))
-        ttk.Label(
-            frame_cache,
-            text=("Note: raw chunks in the cache JSON are processed into a structured "
-                  "output;\nonly the processed chunks land in Processed_chunks.json "
-                  "inside the dated folder."),
-            foreground="#666666",
-            justify="left",
-        ).grid(row=3, column=1, sticky="w", pady=(2, 0))
-
-        self.btn_review_cache = ttk.Button(frame_cache, text="Launch Chunk Curation Review",
-                                           command=self.run_review_from_cache)
-        self.btn_review_cache.grid(row=4, column=1, pady=8, sticky="w")
-        frame_cache.columnconfigure(1, weight=1)
+        # -- Embedded triage review ------------------------------------------
+        frame_triage = ttk.LabelFrame(
+            root, text=" Chunk triage & review ", padding=4)
+        frame_triage.pack(fill="both", expand=True, padx=10, pady=(4, 4))
+        self.triage_host = ttk.Frame(frame_triage)
+        self.triage_host.pack(fill="both", expand=True)
+        self._triage_placeholder = ttk.Label(
+            self.triage_host, foreground="#666666", justify="left", padding=12,
+            text="No document loaded yet.\n\nPick a PDF (or an existing cache "
+                 "JSON) and the storage destination above, then Run — the "
+                 "pre-sorted chunks appear here.\nIf this document was "
+                 "reviewed before in that storage, the previous decisions are "
+                 "loaded automatically; saving with changes creates a new "
+                 "file, the earlier review stays untouched.")
+        self._triage_placeholder.pack(anchor="nw")
 
         # Buttons disabled while a background conversion is running.
-        self.action_buttons = [self.btn_cache_only, self.btn_full_pipeline, self.btn_review_cache]
+        self.action_buttons = [self.btn_run, self.btn_cache_only]
         self._busy = False
 
         # Status line for background-task feedback.
@@ -156,28 +159,21 @@ class ExtractionLauncherUI:
             self.entry_pdf.delete(0, tk.END)
             self.entry_pdf.insert(0, path)
             # Check for history and automatically fill out destination space
-            self.auto_populate_storage(path, self.entry_store_pdf)
-            
+            self.auto_populate_storage(path, self.entry_store)
+
     def browse_cache(self):
         path = filedialog.askopenfilename(filetypes=[("JSON Cache Files", "*.json")])
         if path:
             self.entry_cache.delete(0, tk.END)
             self.entry_cache.insert(0, path)
             # Check for history and automatically fill out destination space
-            self.auto_populate_storage(path, self.entry_store_cache)
-            
-    def browse_storage_pdf(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.entry_store_pdf.delete(0, tk.END)
-            self.entry_store_pdf.insert(0, path)
+            self.auto_populate_storage(path, self.entry_store)
 
-            
-    def browse_storage_cache(self):
+    def browse_storage(self):
         path = filedialog.askdirectory()
         if path:
-            self.entry_store_cache.delete(0, tk.END)
-            self.entry_store_cache.insert(0, path)
+            self.entry_store.delete(0, tk.END)
+            self.entry_store.insert(0, path)
 
     def resolve_directory_structure(self, storage_path, reference_path):
         """Unified path resolution utility shared across the ecosystem."""
@@ -222,8 +218,8 @@ class ExtractionLauncherUI:
             if not use_older:
                 chosen_dir = filedialog.askdirectory(title="Select New Base Storage Destination Folder")
                 if chosen_dir:
-                    self.entry_store_cache.delete(0, tk.END)
-                    self.entry_store_cache.insert(0, chosen_dir)
+                    self.entry_store.delete(0, tk.END)
+                    self.entry_store.insert(0, chosen_dir)
                     storage_path = chosen_dir
 
         self.save_to_registry(reference_path, storage_path)
@@ -231,7 +227,7 @@ class ExtractionLauncherUI:
 
     def run_cache_only(self):
         pdf_path = self.entry_pdf.get().strip()
-        storage_path = self.entry_store_pdf.get().strip()
+        storage_path = self.entry_store.get().strip()
 
         if not pdf_path or not storage_path:
             messagebox.showerror("Missing input", "Please provide a PDF file and storage destination.")
@@ -263,12 +259,51 @@ class ExtractionLauncherUI:
 
         self._run_in_background(job, on_done, "Generating cache, please wait...")
 
-    def run_full_pipeline(self):
+    def _make_logger(self, paths):
+        logger = logging.getLogger("ExtractionLauncher")
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            fh = logging.FileHandler(paths["log_file"], encoding="utf-8")
+            fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logger.addHandler(fh)
+        return logger
+
+    def run_extraction_review(self):
+        """The ONE run button: extract (or load the cache), then show the
+        pre-sorted triage right below for review and saving."""
         pdf_path = self.entry_pdf.get().strip()
-        storage_path = self.entry_store_pdf.get().strip()
-        
-        if not pdf_path or not storage_path:
-            messagebox.showerror("Missing input", "Please provide a PDF file and storage destination.")
+        cache_path = self.entry_cache.get().strip()
+        storage_path = self.entry_store.get().strip()
+
+        if not storage_path:
+            messagebox.showerror("Missing input", "Please provide a storage destination.")
+            return
+
+        # -- cache route: no conversion needed, show the triage immediately --
+        if cache_path:
+            if not os.path.exists(cache_path):
+                messagebox.showerror("File not found", f"Cache file does not exist:\n{cache_path}")
+                return
+            storage_path = self.validate_and_confirm_storage(storage_path, cache_path)
+            paths = self.resolve_directory_structure(storage_path, cache_path)
+            os.makedirs(paths["dated_folder"], exist_ok=True)
+            logger = self._make_logger(paths)
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+                chunks_data = payload.get("chunks", []) if isinstance(payload, dict) else payload
+            except Exception as e:
+                messagebox.showerror("Cache Parsing Error", f"Failed to parse cache file:\n{e}")
+                return
+            if not chunks_data:
+                messagebox.showerror("Data Error", "No chunks found in cache file.")
+                return
+            self._open_triage(chunks_data, paths, logger)
+            return
+
+        # -- PDF route: Docling conversion on a background thread ------------
+        if not pdf_path:
+            messagebox.showerror("Missing input", "Please provide a PDF file (or a cache JSON).")
             return
         if not os.path.exists(pdf_path):
             messagebox.showerror("File not found", f"PDF file does not exist:\n{pdf_path}")
@@ -278,94 +313,86 @@ class ExtractionLauncherUI:
         def job():
             paths = self.resolve_directory_structure(storage_path, pdf_path)
             os.makedirs(paths["dated_folder"], exist_ok=True)
-
-            logger = logging.getLogger("ExtractionLauncher")
-            logger.setLevel(logging.INFO)
-            if not logger.handlers:
-                fh = logging.FileHandler(paths["log_file"], encoding="utf-8")
-                fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-                logger.addHandler(fh)
-
+            logger = self._make_logger(paths)
             chunks_data = generate_and_cache_document(pdf_path, paths, logger)
             print(Fore.GREEN + f"✓ Extraction complete. {len(chunks_data)} chunks extracted.")
-            return (chunks_data, paths)
+            return (chunks_data, paths, logger)
 
         def on_done(result, error):
             if error:
                 messagebox.showerror("Extraction Error", f"Extraction failed:\n{error}")
                 return
-            
-            chunks_data, paths = result
-            self.root.destroy()
-            launch_review_app(chunks_data, [], set(), paths["output_file"], logging.getLogger("ExtractionLauncher"))
+            chunks_data, paths, logger = result
+            if not chunks_data:
+                messagebox.showerror("Data Error", "Extraction produced no chunks.")
+                return
+            self._open_triage(chunks_data, paths, logger)
 
         self._run_in_background(job, on_done, "Extracting document, please wait...")
 
-    def run_review_from_cache(self):
-        cache_path = self.entry_cache.get().strip()
-        storage_path = self.entry_store_cache.get().strip()
-        
-        if not cache_path or not storage_path or not os.path.exists(cache_path):
-            messagebox.showerror("Error", "Please provide a valid cache file path and base storage folder.")
-            return
-
-        storage_path = self.validate_and_confirm_storage(storage_path, cache_path)
-        paths = self.resolve_directory_structure(storage_path, cache_path)
-        os.makedirs(paths["dated_folder"], exist_ok=True)
-
-        logger = logging.getLogger("ExtractionLauncher")
-        logger.setLevel(logging.INFO)
-        if not logger.handlers:
-            fh = logging.FileHandler(paths["log_file"], encoding="utf-8")
-            fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-            logger.addHandler(fh)
-
-        try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                payload = json.load(f)
-                chunks_data = payload.get("chunks", []) if isinstance(payload, dict) else payload
-        except Exception as e:
-            messagebox.showerror("Cache Parsing Error", f"Failed to parse cache file:\n{e}")
-            return
-
-        if not chunks_data:
-            messagebox.showerror("Data Error", "No chunks found in cache file.")
-            return
-
-        logged_chunks = []
-        processed_indices = set()
-
-        if os.path.exists(paths["output_file"]):
+    def _find_prior_review(self, paths):
+        """The most recent reviewed Processed_chunks*.json anywhere under
+        this document's storage root (reviews live in dated subfolders, so
+        an earlier day's review is found too). Returns (path, history)."""
+        pattern = os.path.join(paths["root"], "*", "Processed_chunks*.json")
+        for candidate in sorted(glob.glob(pattern), key=os.path.getmtime,
+                                reverse=True):
             try:
-                with open(paths["output_file"], 'r', encoding='utf-8') as infile:
-                    existing_data = json.load(infile)
-                    history_records = existing_data.get("raw_session_history", []) if isinstance(existing_data, dict) else existing_data
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                history = (data.get("raw_session_history")
+                           if isinstance(data, dict) else data) or []
+            except Exception:  # noqa: BLE001 - a broken file is just skipped
+                continue
+            if history:
+                return candidate, history
+        return None, []
 
-                    if history_records:
-                        ask_resume = messagebox.askyesno(
-                            "Previous Progress Detected",
-                            f"Found {len(history_records)} completed chunks.\n\nContinue from where you left off?"
-                        )
-                        if ask_resume:
-                            logged_chunks = history_records
-                            for entry in logged_chunks:
-                                if "chunk_index" in entry:
-                                    processed_indices.add(entry["chunk_index"])
-                        else:
-                            with open(paths["output_file"], 'w', encoding='utf-8') as outfile:
-                                json.dump({"merged_headings": [], "raw_session_history": []}, outfile, indent=4, ensure_ascii=False)
-            except Exception as e:
-                logger.warning(f"Error checking existing progress: {e}")
+    def _open_triage(self, chunks_data, paths, logger):
+        """Build the embedded triage review below the inputs. A previous
+        review of this document+storage (if any) is pre-applied; accepting
+        with changes saves a NEW file, unchanged keeps the existing one."""
+        from .chunk_triage_ui import ChunkTriageApp
 
-        if not os.path.exists(paths["output_file"]):
-            try:
-                with open(paths["output_file"], 'w', encoding='utf-8') as outfile:
-                    json.dump({"merged_headings": [], "raw_session_history": []}, outfile, indent=4, ensure_ascii=False)
-            except Exception as e:
-                logger.error(f"Failed to create output file: {e}")
+        prior_path, prior_history = self._find_prior_review(paths)
+        if prior_path:
+            self.status_label.config(
+                text=f"Previous review found — decisions loaded from "
+                     f"{os.path.basename(os.path.dirname(prior_path))}/"
+                     f"{os.path.basename(prior_path)}")
+            logger.info(f"Prior review pre-applied from {prior_path}")
+        else:
+            self.status_label.config(text="No previous review for this "
+                                          "document — fresh triage.")
 
-        self.root.destroy()
-        launch_review_app(chunks_data, logged_chunks, processed_indices, paths["output_file"], logger)
+        for child in self.triage_host.winfo_children():
+            child.destroy()
+        self.triage = ChunkTriageApp(
+            root=self.triage_host,
+            chunks_data=chunks_data,
+            output_file_name=paths["output_file"],
+            logger=logger,
+            on_complete_callback=self._open_section_review,
+            llm=_triage_llm(logger),
+            prior_history=prior_history,
+            prior_path=prior_path,
+            version_on_change=True,
+            destroy_on_accept=False,      # embedded: save and stay
+        )
+
+    def _open_section_review(self, saved_path=None):
+        """Chain into Section Review (modal window) on the file the triage
+        actually saved."""
+        from .section_review_ui import SectionReviewApp
+
+        path = saved_path or (self.triage.saved_path if self.triage else None)
+        if not path or not os.path.exists(path):
+            return
+        top = self.root.winfo_toplevel()
+        win = tk.Toplevel(top)
+        win.transient(top)
+        SectionReviewApp(root=win, output_file_path=path,
+                         logger=logging.getLogger("ExtractionLauncher"))
 
     def auto_populate_storage(self, file_path, entry_widget):
         """Auto-populate storage from registry."""

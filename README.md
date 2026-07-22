@@ -84,19 +84,27 @@ they are only needed when an extraction actually runs.
   section is **Kept** under it; content under a noise heading — or with no
   heading — is folded into the preceding valid section, which is what the
   manual *Use previous heading* click used to do one chunk at a time.
-- **Bulk review** (`chunk_triage_ui.py`): all chunks in one sortable table
-  (decision, heading, page, type, why, preview) filtered to **Needs review** by
-  default, with bulk *Keep* / *Skip* / *Set heading* / *Use heading above*,
-  per-chunk editing, and a merged-section preview. **Nothing is written until
-  you press *Accept & save*** — then the same `merged_headings` /
-  `raw_session_history` payload as before is written **once** (the old tool
-  rewrote the whole file on every click), and chains into **Section Review**.
-  Sections are grouped by *normalised* heading, so `Part 21` and `PART 21 ` no
-  longer become two sections. **Resuming** a document (the "Previous Progress
-  Detected" prompt) pre-applies the earlier session's decisions on top of the
-  fresh triage — accepts, skips, reassigned headings and edited text all come
-  back marked *restored from the previous session*. The original
-  one-chunk-at-a-time tool is still available via
+- **Bulk review, embedded in the tab** (`chunk_triage_ui.py`): the tab is one
+  page — pick the **PDF** (or an existing **cache JSON** to skip
+  re-extraction) and the **storage destination**, press **▶ Run Extraction &
+  Review**, and the triage appears right below: all chunks in one sortable
+  table (decision, heading, page, type, why, preview) filtered to **Needs
+  review** by default, with bulk *Keep* / *Skip* / *Set heading* / *Use
+  heading above*, per-chunk editing, and a merged-section preview. **Nothing
+  is written until you press *Accept & save*** — then the same
+  `merged_headings` / `raw_session_history` payload as before is written
+  **once** (the old tool rewrote the whole file on every click), and **Section
+  Review** opens on the saved file. Sections are grouped by *normalised*
+  heading, so `Part 21` and `PART 21 ` no longer become two sections.
+- **Automatic resume + versioned saves**: when the chosen document + storage
+  match a previous run, the most recent reviewed `Processed_chunks*.json`
+  under that document's storage root (any dated folder) is found and its
+  decisions are **pre-applied automatically** — accepts, skips, reassigned
+  headings and edited text return marked *restored from the previous session*.
+  On *Accept & save*: **no changes → the existing review file is kept as it
+  is**; **any change → the review is written as a NEW file** (a timestamped
+  name when today's file already exists), so an earlier review is never
+  overwritten. The original one-chunk-at-a-time tool remains available via
   `launch_review_app(..., bulk=False)`.
 - The "Curation of the chunks extracted" panel is also the cache launcher (the
   former separate Cache Review tab was folded in here): pick an existing cache
