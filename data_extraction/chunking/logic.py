@@ -3,6 +3,8 @@ import os
 import json
 import re
 import logging
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -50,6 +52,9 @@ class ExtractionLauncherUI:
         self.entry_pdf.grid(row=0, column=1, padx=5, pady=3, sticky="we")
         ttk.Button(frame_src, text="Browse...",
                    command=self.browse_pdf).grid(row=0, column=2)
+        ttk.Button(frame_src, text="Open PDF",
+                   command=self.open_selected_pdf).grid(row=0, column=3,
+                                                        padx=(4, 0))
 
         ttk.Label(frame_src, text="…or cache JSON:").grid(row=1, column=0, sticky="w")
         self.entry_cache = ttk.Entry(frame_src, width=78)
@@ -244,6 +249,22 @@ class ExtractionLauncherUI:
                 self.root.after(120, poll)
 
         self.root.after(120, poll)
+
+    def open_selected_pdf(self):
+        """Open the chosen PDF with the system's default viewer."""
+        path = self.entry_pdf.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showinfo("No PDF", "Pick an existing PDF file first.")
+            return
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            elif os.name == "nt":
+                os.startfile(path)  # noqa: S606 - user-chosen file
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Open PDF", f"Could not open the PDF:\n{exc}")
 
     def browse_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF Documents", "*.pdf")])
@@ -470,6 +491,9 @@ class ExtractionLauncherUI:
             prior_path=prior_path,
             version_on_change=True,
             destroy_on_accept=False,      # embedded: save and stay
+            # with the PDF at hand the TOC is read from the PDF itself and
+            # the chunk headings are verified against it
+            pdf_path=self.entry_pdf.get().strip() or None,
         )
 
     def _open_section_review(self, saved_path=None):

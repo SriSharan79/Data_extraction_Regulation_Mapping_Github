@@ -40,9 +40,13 @@ class ChunkTriageApp:
     def __init__(self, root, chunks_data, output_file_name, logger,
                  on_complete_callback=None, llm=None, prior_history=None,
                  prior_path=None, version_on_change=False,
-                 destroy_on_accept=True):
+                 destroy_on_accept=True, pdf_path=None):
         self.root = root
         self.chunks_data = list(chunks_data or [])
+        # With the source PDF at hand the TOC is read from the PDF itself
+        # (embedded outline / printed TOC text) and headings are verified
+        # against it — the LLM check only runs when the PDF offers none.
+        self.pdf_path = pdf_path
         self.output_file_name = output_file_name
         self.logger = logger
         self.on_complete_callback = on_complete_callback
@@ -129,11 +133,12 @@ class ChunkTriageApp:
         # ---- the table of proposals
         mid = ttk.Frame(self.root, padding=(10, 6))
         mid.pack(fill="both", expand=True)
-        cols = ("action", "heading", "pages", "labels", "reason", "text")
+        cols = ("action", "toc", "heading", "pages", "labels", "reason", "text")
         self.tree = ttk.Treeview(mid, columns=cols, show="tree headings",
                                  selectmode="extended")
         self.tree.heading("#0", text="Chunk")
         self.tree.heading("action", text="Decision")
+        self.tree.heading("toc", text="TOC")
         self.tree.heading("heading", text="Section heading")
         self.tree.heading("pages", text="Page")
         self.tree.heading("labels", text="Type")
@@ -141,6 +146,7 @@ class ChunkTriageApp:
         self.tree.heading("text", text="Text preview")
         self.tree.column("#0", width=70, anchor="w", stretch=False)
         self.tree.column("action", width=70, anchor="w", stretch=False)
+        self.tree.column("toc", width=45, anchor="center", stretch=False)
         self.tree.column("heading", width=210, anchor="w")
         self.tree.column("pages", width=50, anchor="w", stretch=False)
         self.tree.column("labels", width=90, anchor="w", stretch=False)
@@ -200,7 +206,8 @@ class ChunkTriageApp:
         def work():
             try:
                 result = analyze_chunks(self.chunks_data, llm=self._llm,
-                                        log=self._log)
+                                        log=self._log,
+                                        pdf_path=self.pdf_path)
             except Exception as exc:  # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._triage_done(None, e))
             else:
@@ -229,7 +236,14 @@ class ChunkTriageApp:
         ref = result["refinement"]
         where = {"toc": "Table of Contents", "llm": "LLM heading check",
                  "rules": "rule-based"}.get(ref["source"], ref["source"])
-        self.source_var.set(f"sections from: {where} ({ref['note']})")
+        extra = ""
+        if (result.get("toc") or {}).get("entries"):
+            matched = sum(1 for p in self.proposals
+                          if p.get("toc_match") is True)
+            off = sum(1 for p in self.proposals
+                      if p.get("toc_match") is False)
+            extra = f" — TOC-verified: {matched} ✓ / {off} ✗"
+        self.source_var.set(f"sections from: {where} ({ref['note']}){extra}")
         # Land on whatever needs attention; if nothing does, show everything.
         self.filter_var.set("Needs review" if s["review"] else "All")
         self._refresh()
@@ -306,11 +320,12 @@ class ChunkTriageApp:
             tags = [p["action"]]
             if p.get("edited"):
                 tags.append("edited")
+            toc_cell = {True: "✓", False: "✗"}.get(p.get("toc_match"), "")
             iid = self.tree.insert(
                 "", "end", text=str(p["chunk_index"]),
                 values=(_ACTION_LABEL.get(p["action"], p["action"]),
-                        p["heading"] or "—", pages, labels, p["reason"],
-                        preview),
+                        toc_cell, p["heading"] or "—", pages, labels,
+                        p["reason"], preview),
                 tags=tuple(tags))
             self._iid_by_pos[iid] = p
         shown = len(self._iid_by_pos)
@@ -330,6 +345,7 @@ class ChunkTriageApp:
         for p in picked:
             p["action"] = action
             p["edited"] = True
+            p["toc_match"] = None      # reviewer decision, not TOC-verified
             p["reason"] = f"set to '{_ACTION_LABEL[action]}' by reviewer"
         self._log(f"{len(picked)} chunk(s) set to {action} by the reviewer.")
         self._refresh()
@@ -351,6 +367,7 @@ class ChunkTriageApp:
             p["heading"] = value
             p["action"] = "log"
             p["edited"] = True
+            p["toc_match"] = None
             p["reason"] = "heading set by reviewer"
         self._log(f"{len(picked)} chunk(s) assigned heading '{value}'.")
         self._refresh()
@@ -379,6 +396,7 @@ class ChunkTriageApp:
             p["heading"] = heading
             p["action"] = "log"
             p["edited"] = True
+            p["toc_match"] = None
             p["reason"] = f"heading taken from the chunk above ('{heading}')"
         self._refresh()
         if missing:
@@ -447,6 +465,7 @@ class ChunkTriageApp:
                 p["status"] = "logged (edited)"
             p["action"] = action
             p["edited"] = True
+            p["toc_match"] = None
             p["reason"] = "edited by reviewer"
             dlg.destroy()
             self._refresh()

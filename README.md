@@ -73,12 +73,19 @@ they are only needed when an extraction actually runs.
   background thread so the window stays responsive.
 - **Automatic triage before review** (`chunk_triage.py`, modelled on the alr
   pipeline's section processing): the extracted chunks are sorted on their own
-  before anyone looks at them. If the document has a **Table of Contents** it is
-  parsed and used as the authoritative section list (no LLM call needed);
-  otherwise the collected headings are sent to an **LLM that keeps only the
-  valid ones** (numbered/designated headings such as `Part 21`, `AMC1
-  ORO.GEN.200`, `1.2 Scope` are always kept), and failing that deterministic
-  rules apply. Each chunk then gets a proposed decision with a reason: page
+  before anyone looks at them. The **Table of Contents is read from the PDF
+  itself** first — the embedded outline (bookmarks) when present, else the
+  printed TOC parsed from the first pages' text — and the Docling chunk
+  headings are **verified against it**; a document-internal (chunk-level) TOC
+  is the next fallback. Only when the PDF offers no usable TOC are the
+  collected headings sent to an **LLM that keeps only the valid ones**
+  (numbered/designated headings such as `Part 21`, `AMC1 ORO.GEN.200`,
+  `1.2 Scope` are always kept), and failing that deterministic rules apply.
+  Every kept chunk records whether its heading **matched the TOC** — the
+  review table shows it as a **TOC ✓/✗ column** (✗ = kept, e.g. a numbered
+  heading, but absent from the TOC) with a `TOC-verified: n ✓ / m ✗` count in
+  the header; reviewer overrides clear the flag. An **Open PDF** button next
+  to the file picker opens the selected PDF with the system viewer. Each chunk then gets a proposed decision with a reason: page
   headers/footers, repeated running text, the TOC page itself and empty
   fragments are proposed as **Skip**; content whose heading matches a real
   section is **Kept** under it; content under a noise heading — or with no

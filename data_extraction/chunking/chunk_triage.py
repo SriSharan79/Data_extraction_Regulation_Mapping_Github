@@ -341,6 +341,74 @@ def find_toc(chunks):
     return {"entries": unique, "chunk_indices": indices}
 
 
+def toc_from_pdf(pdf_path, max_scan_pages=20):
+    """The Table of Contents straight from the **PDF itself** — more reliable
+    than reassembling it from Docling chunks (which routinely shreds a
+    printed TOC into dot-leader fragments).
+
+    Two sources, in order:
+
+    1. the embedded outline (PDF bookmarks) via PyMuPDF — authoritative when
+       present;
+    2. the printed TOC parsed from the first ``max_scan_pages`` pages' text
+       (a page announcing "Table of Contents"/"Contents" plus the following
+       pages that keep parsing as TOC lines).
+
+    Returns ``{"entries": [{title, page, ...}], "source":
+    "pdf-bookmarks"|"pdf-text"|None}`` — entries ``[]`` when the PDF offers
+    no usable TOC (the caller then falls back to the LLM heading check)."""
+    if not pdf_path:
+        return {"entries": [], "source": None}
+    try:
+        import fitz  # PyMuPDF — optional; without it chunk-level detection remains
+    except Exception:  # noqa: BLE001
+        return {"entries": [], "source": None}
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception:  # noqa: BLE001
+        return {"entries": [], "source": None}
+    try:
+        # 1. embedded outline (bookmarks)
+        try:
+            outline = doc.get_toc() or []
+        except Exception:  # noqa: BLE001
+            outline = []
+        entries = [{"title": str(title).strip(), "page": page, "level": level}
+                   for level, title, page in outline if str(title).strip()]
+        if len(entries) >= MIN_TOC_ENTRIES:
+            return {"entries": entries, "source": "pdf-bookmarks"}
+
+        # 2. printed TOC in the page text
+        page_count = getattr(doc, "page_count", 0) or len(doc)
+        start = None
+        for i in range(min(page_count, max_scan_pages)):
+            lines = (doc[i].get_text() or "").splitlines()
+            if any(_TOC_TITLE_RE.match(line.strip()) for line in lines[:15]):
+                start = i
+                break
+        found = []
+        if start is not None:
+            for i in range(start, min(page_count, start + 10)):
+                parsed = parse_toc_entries(doc[i].get_text() or "")
+                if i > start and len(parsed) < 3:
+                    break     # the TOC ended on the previous page
+                found.extend(parsed)
+        unique, seen = [], set()
+        for entry in found:
+            key = normalize_heading(entry["title"])
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(entry)
+        if len([e for e in unique if e.get("page") is not None]) >= MIN_TOC_ENTRIES:
+            return {"entries": unique, "source": "pdf-text"}
+        return {"entries": [], "source": None}
+    finally:
+        try:
+            doc.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # ------------------------------------------------------ heading refinement -- #
 def parse_llm_list(text):
     """Pull a Python list of strings out of an LLM reply (alr's
@@ -476,9 +544,11 @@ def triage_chunks(chunks, valid_headings=None, toc=None, boilerplate=None):
     valid_headings = list(valid_headings or [])
     boilerplate = boilerplate if boilerplate is not None else find_boilerplate(chunks)
     toc_indices = set((toc or {}).get("chunk_indices") or [])
+    toc_exists = bool((toc or {}).get("entries"))
 
     proposals = []
     current_heading = ""
+    current_from_toc = None    # did the current section's heading match the TOC?
     for i, chunk in enumerate(chunks):
         text = chunk_text(chunk)
         norm = re.sub(r"\s+", " ", text).strip()
@@ -488,6 +558,7 @@ def triage_chunks(chunks, valid_headings=None, toc=None, boilerplate=None):
 
         action = heading_out = reason = None
         confidence = "high"
+        toc_match = None   # True/False only when a TOC exists and we keep
 
         if labels and any(lbl in INDEX_LABELS for lbl in labels):
             action, heading_out = "skip", heading
@@ -514,18 +585,24 @@ def triage_chunks(chunks, valid_headings=None, toc=None, boilerplate=None):
                           if heading and headings_match(heading, v)), None)
             if match:
                 current_heading = match
+                current_from_toc = True if toc_exists else None
                 action, heading_out = "log", match
+                toc_match = True if toc_exists else None
                 reason = ("heading matches the Table of Contents"
-                          if (toc or {}).get("entries")
+                          if toc_exists
                           else "recognised section heading")
             elif heading and is_numbered_heading(heading):
                 # Numbered headings are always valid, even if the TOC/LLM
                 # list missed them (alr's mandatory rule).
                 current_heading = heading
+                current_from_toc = False if toc_exists else None
                 action, heading_out = "log", heading
-                reason = "numbered/designated heading — always valid"
+                toc_match = False if toc_exists else None
+                reason = ("numbered/designated heading — always valid"
+                          + (" (NOT in the TOC)" if toc_exists else ""))
             elif current_heading:
                 action, heading_out = "log", current_heading
+                toc_match = current_from_toc
                 reason = (f"heading '{heading}' is not a section heading — "
                           f"content folded into '{current_heading}'"
                           if heading else
@@ -544,6 +621,7 @@ def triage_chunks(chunks, valid_headings=None, toc=None, boilerplate=None):
             "original_heading": heading,
             "reason": reason,
             "confidence": confidence,
+            "toc_match": toc_match,
             "page_num": chunk_pages(chunk),
             "labels": labels,
             "text": text,
@@ -569,13 +647,32 @@ def triage_summary(proposals):
     }
 
 
-def analyze_chunks(chunks, llm=None, log=None):
+def analyze_chunks(chunks, llm=None, log=None, pdf_path=None):
     """Run the whole triage: headings → TOC → refinement → per-chunk
-    proposals. Returns ``{proposals, summary, toc, refinement, headings}``."""
+    proposals. Returns ``{proposals, summary, toc, refinement, headings}``.
+
+    With ``pdf_path`` the Table of Contents is read from the **PDF itself**
+    first (embedded outline, else the printed TOC text) and the chunk
+    headings are verified against it; only a PDF without any usable TOC
+    falls back to the chunk-level TOC detection and then the LLM heading
+    check."""
     chunks = list(chunks)
     headings = collect_headings(chunks)
-    toc = find_toc(chunks)
+    toc = find_toc(chunks)          # chunk-level: entries + pages to skip
+    pdf_toc = toc_from_pdf(pdf_path)
+    if pdf_toc["entries"]:
+        # The PDF's own TOC is authoritative; the chunk-level detection
+        # still tells us which chunks ARE the printed TOC (to skip them).
+        toc = {"entries": pdf_toc["entries"],
+               "chunk_indices": toc.get("chunk_indices") or [],
+               "source": pdf_toc["source"]}
+        if log:
+            log(f"Table of Contents read from the PDF "
+                f"({pdf_toc['source']}, {len(pdf_toc['entries'])} entries) — "
+                "chunk headings are verified against it.")
     refinement = refine_headings(headings, toc=toc, llm=llm, log=log)
+    if refinement["source"] == "toc" and toc.get("source"):
+        refinement["note"] += f" ({toc['source']})"
     boilerplate = find_boilerplate(chunks)
     if log and boilerplate:
         log(f"{len(boilerplate)} repeated text block(s) detected as running "
