@@ -209,15 +209,23 @@ _PARENTHETICAL = re.compile(r"\([^()]*\)")
 # Rule identifiers ("CS 25.1309", "AMC 25.21", "GM 26.30") are matched by their
 # identifier alone rather than as raw substrings. The prefix is no longer a
 # hard-coded CS/AMC/GM list but any 2-3 **capital letters** ("CS", "AMC", "GM",
-# "SC", "CRI", …), followed by whitespace, a 2-digit book/part number, a dot
-# and a 2-4 digit rule number. Anchored at the
+# "SC", "CRI", …) with an OPTIONAL trailing version digit ("AMC1", "AMC2",
+# "GM1" — EASA numbers its AMC/GM items when several attach to one rule),
+# followed by a 2-digit book/part number, a dot and a 2-4 digit rule number.
+# The whitespace between the prefix and the number is OPTIONAL, so PDF-glued
+# forms ("AMC223.2110", "AMC25.1309") parse the same as the spaced ones
+# ("AMC2 23.2110", "AMC 25.1309"). The number must still start with two digits
+# and a dot, so the prefix's version digit is never swallowed into the number:
+# backtracking picks the split that leaves a valid dd.dddd ("AMC223.2110" ->
+# prefix "AMC2", number "23.2110"; "AMC25.1309" -> prefix "AMC", number
+# "25.1309"). Anchored at the
 # start, so only values that *begin* with such an identifier take this path;
 # anything else (and values that do not fit the digit format, e.g. "GM 21.A.14",
 # whose "A" is not a digit, or "CS 1.5", whose parts are too short) falls back
 # to substring matching. The prefix must genuinely be upper-case — no IGNORECASE
 # here, or ordinary lowercase words ("and 25.21 …") would be taken for rule
 # prefixes. Trailing qualifiers and prose after the identifier are ignored.
-_RULE_ID = re.compile(r"^\s*([A-Z]{2,3})\s+(\d{2})\.(\d{2,4})(?!\d)")
+_RULE_ID = re.compile(r"^\s*([A-Z]{2,3}\d?)\s*(\d{2})\.(\d{2,4})(?!\d)")
 
 # Bare rule identifiers — values that carry no capital-letter prefix but *start*
 # with a rule number: 2 digits, a dot, then everything up to the first '(' or
@@ -231,10 +239,14 @@ _RULE_ID = re.compile(r"^\s*([A-Z]{2,3})\s+(\d{2})\.(\d{2,4})(?!\d)")
 _BARE_RULE_ID = re.compile(r"^\s*(\d{2}\.[^\s(]+)")
 
 # Detects whether the section titles themselves are written with rule prefixes
-# ("AMC 25.1309 System design") or bare ("25.1309 System design"). Same shape as
-# _RULE_ID (2-3 capitals, 2 digits, dot, 2 digits …) but searched anywhere in
-# the title, and likewise case-sensitive on the prefix.
-_RULE_PREFIX_IN_TITLE = re.compile(r"\b([A-Z]{2,3})\s+\d{2}\.\d{2}")
+# ("AMC 25.1309 System design", "AMC1 23.2000 Applicability") or bare
+# ("25.1309 System design"). Same shape as _RULE_ID — 2-3 capitals with an
+# optional version digit ("AMC1", "AMC2") — but searched anywhere in the title,
+# and likewise case-sensitive on the prefix. Whitespace between the prefix and
+# number is required here (unlike _RULE_ID's value parser): titles are the clean
+# side, so keeping \s+ preserves the bare-vs-prefixed distinction and stops a
+# glued caption like "AB12.34" from being read as a rule prefix.
+_RULE_PREFIX_IN_TITLE = re.compile(r"\b([A-Z]{2,3}\d?)\s+\d{2}\.\d{2}")
 
 # When the full identifier ("AMC 25.21") matches no section title, retry with the
 # rule number alone ("25.21") — but only when the titles carry no rule
@@ -1206,12 +1218,16 @@ def strip_parentheticals(text):
 def rule_identifier(text):
     """The rule identifier a reference value **starts with**, or ``None`` when
     it does not begin with one in that format (``_RULE_ID``: 2-3 capital
-    letters, whitespace, a 2-digit book/part number, a dot, 2-4 digits)::
+    letters with an optional trailing version digit, optional whitespace, a
+    2-digit book/part number, a dot, 2-4 digits)::
 
-        "AMC 25.21(g)(a)"        -> ("AMC", "25.21")
-        "CS 25.1309(a) blah"     -> ("CS",  "25.1309")
-        "GM 26.30"               -> ("GM",  "26.30")
-        "SC 23.2005 something"   -> ("SC",  "23.2005")
+        "AMC 25.21(g)(a)"        -> ("AMC",  "25.21")
+        "CS 25.1309(a) blah"     -> ("CS",   "25.1309")
+        "GM 26.30"               -> ("GM",   "26.30")
+        "SC 23.2005 something"   -> ("SC",   "23.2005")
+        "AMC1 23.2000 …"         -> ("AMC1", "23.2000")  # numbered AMC
+        "AMC223.2110 Stall …"    -> ("AMC2", "23.2110")  # no space (PDF-glued)
+        "AMC25.1309"             -> ("AMC",  "25.1309")  # no space, no version
         "GM 21.A.14"             -> None   # "A" is not a digit
         "CS 1.5"                 -> None   # parts too short (need dd.dd)
         "cs 25.1309"             -> None   # prefix must be capital letters
@@ -1389,40 +1405,103 @@ def match_sections(element, references):
     return hits
 
 
-def _reference_section_counts(df, col, references):
+def _ref_section_key(value):
+    """Normalise a reference value for tying a unique value back to the source
+    cells it came from: stripped and case-folded, so casing or leading/trailing
+    whitespace differences between the stored unique value and the raw source
+    item never prevent the lookup."""
+    return str(value or "").strip().lower()
+
+
+def _source_section_map(file_path, source_sheet, columns, section_col="Section"):
+    """Map, per reference column, each generated value to the ordered list of
+    distinct **source section titles** whose cell produced it — i.e. the
+    sections a reference was extracted in. Built from the run sheet (``Section``
+    + the extracted columns) by splitting each cell with :func:`split_items`,
+    the very split that produced the unique values, so the keys line up.
+
+    Returns ``{col: {value key: [section title, ...]}}`` (keys via
+    :func:`_ref_section_key`, sections in first-seen order). Returns ``{}`` when
+    ``source_sheet`` is not supplied, cannot be read, or has no ``Section``
+    column — the Ref Map's ``Section title`` is then left blank, so callers
+    without a per-section source (defaulted ``source_sheet``) are unaffected."""
+    import pandas as pd
+
+    out = {}
+    if not source_sheet:
+        return out
+    try:
+        src = pd.read_excel(file_path, sheet_name=source_sheet, engine="openpyxl")
+    except Exception:  # noqa: BLE001 — a missing/renamed source is non-fatal
+        return out
+    if section_col not in src.columns:
+        return out
+    for col in columns:
+        if not is_reference_column(col) or col not in src.columns:
+            continue
+        mapping = {}
+        for section, cell in zip(src[section_col], src[col]):
+            sec = str(section if section is not None else "").strip()
+            if not sec:
+                continue
+            for item in split_items(cell):
+                sections = mapping.setdefault(_ref_section_key(item), [])
+                if sec not in sections:
+                    sections.append(sec)
+        out[col] = mapping
+    return out
+
+
+def _reference_section_counts(df, col, references, source_sections=None):
     """Match every unique value of one reference column against the section
     titles. Returns ``(counts, map_rows)`` where ``counts`` is
     ``{section title: [occurrences, matched values]}`` — ``occurrences`` sums the
     values' ``Count_<col>`` (how often the reference was actually generated),
     ``matched values`` counts the distinct unique values that hit that section —
     and ``map_rows`` are the per-match audit records for the Ref Map sheet
-    (including the ``(…)``-stripped form each value was matched by)."""
+    (including the ``(…)``-stripped form each value was matched by).
+
+    ``source_sections`` (from :func:`_source_section_map`) maps each value to the
+    source section titles it was generated in. Every audit record then carries a
+    ``Section title`` naming that source section, and a value produced in several
+    sections yields one row **per source section** with the other columns
+    repeated; a value with no known source section gets a single row with a blank
+    ``Section title``. The ``counts`` tally is unaffected — it is still summed
+    once per section match, never once per (match × source section)."""
     ucol, ccol = f"Unique_{col}", f"Count_{col}"
     sub = df[[ucol, ccol]].dropna(subset=[ucol]) if ccol in df.columns \
         else df[[ucol]].dropna(subset=[ucol]).assign(**{ccol: 0})
+    src_map = source_sections or {}
     counts, map_rows = {}, []
     for element, raw_count in zip(sub[ucol], sub[ccol]):
         n = _count_value(raw_count)
+        # Source sections this value was generated in; ``[""]`` (one blank row)
+        # when unknown. The other columns are repeated across each of these.
+        sources = src_map.get(_ref_section_key(element)) or [""]
         hits = match_sections(element, references)
         if not hits:
             rule = rule_identifier(str(element).strip())
             searched = (f"{rule[0]} {rule[1]}" if rule
                         else strip_parentheticals(element))
-            map_rows.append({
-                "Column": col, "Unique value": element, "Count": n,
-                "Matched using": searched,
-                "Matched section": "— no match —", "Match type": "",
-            })
+            for sec in sources:
+                map_rows.append({
+                    "Section title": sec,
+                    "Column": col, "Unique value": element, "Count": n,
+                    "Matched using": searched,
+                    "Matched section": "— no match —", "Match type": "",
+                })
             continue
         for title, how, needle in hits:
             acc = counts.setdefault(title, [0, 0])
-            acc[0] += n
+            acc[0] += n          # tally once per match, not per source section
             acc[1] += 1
-            map_rows.append({
-                "Column": col, "Unique value": element, "Count": n,
-                "Matched using": needle,
-                "Matched section": title, "Match type": how,
-            })
+            for sec in sources:
+                map_rows.append({
+                    "Section title": sec,
+                    "Column": col, "Unique value": element, "Count": n,
+                    "Matched using": needle,
+                    "Matched section": title, "Match type": how,
+                })
     return counts, map_rows
 
 
@@ -1437,7 +1516,7 @@ def ref_map_sheet_name(base):
 
 
 def add_reference_sections(file_path, uniq_sheet, references, columns,
-                           map_sheet=None):
+                           map_sheet=None, source_sheet=None):
     """Match the unique values of every **reference column** in ``uniq_sheet``
     (name contains a ``_REFERENCE_COLUMN_HINTS`` hint) against the reference
     **section titles**. Each value is matched by its ``(…)``-free form
@@ -1452,7 +1531,12 @@ def add_reference_sections(file_path, uniq_sheet, references, columns,
       tally therefore lives in the same sheet as the unique elements.
     * ``map_sheet`` (default :func:`ref_map_sheet_name`) receives one row per
       individual match — which value matched which section and in which
-      direction — including the values that matched nothing.
+      direction — including the values that matched nothing. When ``source_sheet``
+      is given (the run sheet the uniques came from), each row also carries, just
+      before ``Unique value``, a ``Section title`` naming the source section the
+      value was generated in; a value produced in several sections is expanded to
+      one row per source section (:func:`_source_section_map`). Without a
+      ``source_sheet`` that column is present but blank.
 
     Shared by :func:`evaluate_uniques` (the run-sheet pipeline) and the AI
     Review *Unique elements* tab (any workbook/sheet), so both behave alike.
@@ -1462,11 +1546,15 @@ def add_reference_sections(file_path, uniq_sheet, references, columns,
     import pandas as pd
 
     df = pd.read_excel(file_path, sheet_name=uniq_sheet, engine="openpyxl")
+    # Where each reference value was generated (source section titles), so the
+    # Ref Map can name it. Empty {} when no source_sheet -> blank Section title.
+    src_sections = _source_section_map(file_path, source_sheet, columns)
     ref_blocks, ref_map_rows, ref_sections = [], [], {}
     for col in columns:
         if not is_reference_column(col) or f"Unique_{col}" not in df.columns:
             continue
-        counts, map_rows = _reference_section_counts(df, col, references)
+        counts, map_rows = _reference_section_counts(
+            df, col, references, src_sections.get(col))
         ref_map_rows.extend(map_rows)
         if not counts:
             continue
@@ -1488,8 +1576,8 @@ def add_reference_sections(file_path, uniq_sheet, references, columns,
         ref_map_sheet = (map_sheet or ref_map_sheet_name(uniq_sheet))[:31]
         _write_sheet(file_path, ref_map_sheet, pd.DataFrame(
             ref_map_rows,
-            columns=["Column", "Unique value", "Count", "Matched using",
-                     "Matched section", "Match type"]))
+            columns=["Column", "Section title", "Unique value", "Count",
+                     "Matched using", "Matched section", "Match type"]))
     return {"ref_map_sheet": ref_map_sheet, "ref_sections": ref_sections}
 
 
@@ -1513,7 +1601,9 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
     so the section tally lives in the same sheet as the unique elements, sorted
     most-referenced first. Every individual match is also written to a separate
     ``Ref Map <run sheet>`` audit sheet (which value matched which section, and
-    in which direction), including the values that matched nothing.
+    in which direction), including the values that matched nothing; each row
+    names, before ``Unique value``, the source ``Section title`` the value was
+    generated in, with one row per source section when a value spans several.
     """
     import pandas as pd
 
@@ -1534,7 +1624,8 @@ def evaluate_uniques(file_path, run_sheet, references, columns):
     # sheet is regenerated above, so the Section_* columns are re-derived
     # rather than accumulated.
     ref = add_reference_sections(file_path, uniq_sheet, references, columns,
-                                 map_sheet=ref_map_sheet_name(run_sheet))
+                                 map_sheet=ref_map_sheet_name(run_sheet),
+                                 source_sheet=run_sheet)
     ref_map_sheet = ref["ref_map_sheet"]
     ref_sections = ref["ref_sections"]
 

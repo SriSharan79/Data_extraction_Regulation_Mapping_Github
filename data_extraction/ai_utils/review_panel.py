@@ -2329,7 +2329,9 @@ class AIReviewMixin:
                        "new sheet keeps its Unique_/Count_ columns and gains "
                        "Section_<col> / Section_Count_<col> /\nSection_Matches_<col> "
                        "beside them (most-referenced first); every individual match "
-                       "also goes to a separate 'Ref Map …' sheet.").pack(
+                       "also goes to a separate 'Ref Map …' sheet, which names the "
+                       "source Section title each value came from (one row per "
+                       "source section when a value spans several).").pack(
             anchor="w", pady=(2, 0))
         self._uniq_refmap_toggle()
 
@@ -2602,7 +2604,10 @@ class AIReviewMixin:
         written sheet back for the per-column unique counts. When ``ref_json``
         is given, the reference columns' unique values are additionally matched
         against that JSON's section titles (column_evaluator.add_reference_sections
-        — the same pass the run-sheet 'Uniq' pipeline runs). Runs off the main
+        — the same pass the run-sheet 'Uniq' pipeline runs). The picked source
+        ``sheet`` is passed through as ``source_sheet`` so the Ref Map's
+        ``Section title`` column names the source section each value came from
+        (blank when that sheet has no ``Section`` column). Runs off the main
         thread — no widget access here."""
         import pandas as pd
 
@@ -2631,7 +2636,8 @@ class AIReviewMixin:
                     "reference values have no section titles to match against.")
             summary.update(add_reference_sections(
                 path, out_name, references, columns,
-                map_sheet=ref_map_sheet_name(out_name)))
+                map_sheet=ref_map_sheet_name(out_name),
+                source_sheet=sheet))
             summary["ref_json"] = ref_json
             summary["ref_titles"] = len(references)
         return summary
