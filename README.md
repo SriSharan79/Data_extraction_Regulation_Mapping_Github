@@ -92,8 +92,12 @@ they are only needed when an extraction actually runs.
   `raw_session_history` payload as before is written **once** (the old tool
   rewrote the whole file on every click), and chains into **Section Review**.
   Sections are grouped by *normalised* heading, so `Part 21` and `PART 21 ` no
-  longer become two sections. The original one-chunk-at-a-time tool is still
-  available via `launch_review_app(..., bulk=False)`.
+  longer become two sections. **Resuming** a document (the "Previous Progress
+  Detected" prompt) pre-applies the earlier session's decisions on top of the
+  fresh triage — accepts, skips, reassigned headings and edited text all come
+  back marked *restored from the previous session*. The original
+  one-chunk-at-a-time tool is still available via
+  `launch_review_app(..., bulk=False)`.
 - The "Curation of the chunks extracted" panel is also the cache launcher (the
   former separate Cache Review tab was folded in here): pick an existing cache
   JSON + storage, get warned about existing processing footprints (with the

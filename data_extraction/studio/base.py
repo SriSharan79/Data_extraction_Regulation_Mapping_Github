@@ -663,6 +663,7 @@ class _BaseStudio:
                     logger=logger,
                     on_complete_callback=on_chunk_review_complete,
                     llm=_triage_llm(logger),
+                    prior_history=logged_chunks,   # resume pre-applies decisions
                 )
             else:
                 ChunkReviewApp(

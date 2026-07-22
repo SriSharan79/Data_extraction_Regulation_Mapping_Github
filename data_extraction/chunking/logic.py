@@ -584,6 +584,7 @@ def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file
             logger=logger,
             on_complete_callback=on_chunk_review_complete,
             llm=_triage_llm(logger),
+            prior_history=logged_chunks,   # resume: earlier decisions pre-applied
         )
     else:
         app = ChunkReviewApp(

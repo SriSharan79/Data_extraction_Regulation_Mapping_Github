@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .chunk_triage import (analyze_chunks, build_output_payload,
-                           normalize_heading)
+                           normalize_heading, triage_summary)
 
 _ACTION_LABEL = {"log": "Keep", "skip": "Skip", "review": "Review"}
 _ACTION_TAGS = {"log": ("#1f7a1f", ""), "skip": ("#777777", ""),
@@ -37,13 +37,18 @@ class ChunkTriageApp:
     """Bulk review of Docling chunks with automatic triage proposals."""
 
     def __init__(self, root, chunks_data, output_file_name, logger,
-                 on_complete_callback=None, llm=None):
+                 on_complete_callback=None, llm=None, prior_history=None):
         self.root = root
         self.chunks_data = list(chunks_data or [])
         self.output_file_name = output_file_name
         self.logger = logger
         self.on_complete_callback = on_complete_callback
         self._llm = llm
+        # Decisions saved by a previous session (the output file's
+        # raw_session_history, either tool's shape). They are laid over the
+        # fresh triage proposals on resume, so earlier accepts/skips/edits
+        # survive closing the window.
+        self._prior_history = list(prior_history or [])
 
         self.proposals = []          # engine output, edited in place
         self.result = None           # analyze_chunks() result
@@ -178,11 +183,14 @@ class ChunkTriageApp:
             return
         self.result = result
         self.proposals = result["proposals"]
-        s = result["summary"]
+        restored = self._apply_prior_history()
+        s = triage_summary(self.proposals)
         self.summary_var.set(
             f"{s['total']} chunks — {s['log']} to keep, {s['skip']} to skip, "
             f"{s['review']} need review ({s['auto_handled_pct']}% decided "
-            "automatically)")
+            "automatically)"
+            + (f" — {restored} restored from the previous session"
+               if restored else ""))
         ref = result["refinement"]
         where = {"toc": "Table of Contents", "llm": "LLM heading check",
                  "rules": "rule-based"}.get(ref["source"], ref["source"])
@@ -190,6 +198,39 @@ class ChunkTriageApp:
         # Land on whatever needs attention; if nothing does, show everything.
         self.filter_var.set("Needs review" if s["review"] else "All")
         self._refresh()
+
+    def _apply_prior_history(self):
+        """Lay a previous session's saved decisions over the fresh triage
+        proposals (matched by chunk index): action, heading and any edited
+        text are restored, so resuming continues where the reviewer stopped
+        instead of re-deciding everything. Returns how many were restored."""
+        if not self._prior_history:
+            return 0
+        by_index = {p["chunk_index"]: p for p in self.proposals}
+        restored = 0
+        for entry in self._prior_history:
+            if not isinstance(entry, dict):
+                continue
+            p = by_index.get(entry.get("chunk_index"))
+            if p is None:
+                continue
+            heading = entry.get("heading")
+            if isinstance(heading, list):
+                heading = ", ".join(str(h) for h in heading if str(h).strip())
+            status = str(entry.get("status") or "")
+            p["action"] = "skip" if status == "skipped" else "log"
+            p["heading"] = str(heading or "")
+            if entry.get("chunk_text") is not None:
+                p["text"] = entry["chunk_text"]
+            if status:
+                p["status"] = status      # keeps 'logged (edited)' etc.
+            p["edited"] = True
+            p["reason"] = "restored from the previous session"
+            restored += 1
+        if restored:
+            self._log(f"Resume: {restored} decision(s) restored from the "
+                      "previous session.")
+        return restored
 
     def _log(self, msg):
         if self.logger:
