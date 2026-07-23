@@ -14,6 +14,16 @@ Nothing is written until the reviewer accepts: the proposals are shown with
 their reason, can be re-decided individually or in bulk, and *Accept & save*
 produces the same ``merged_headings`` / ``raw_session_history`` payload the
 sequential tool always wrote — so Section Review and AI Review are unchanged.
+
+Besides *Keep* and *Skip* a chunk can be decided **Merge ↑**: its text is
+folded into the chunk above it, which is how a section Docling split across
+two chunks is put back together. Merging asks every time whether the chunk's
+heading should be written as a line before its text — a real sub-heading
+wants that, a paragraph broken mid-sentence must not get one. The decision is
+recorded, not applied destructively, so it stays visible in the table, is
+undone by setting the chunk back to *Keep*, and survives closing and
+resuming the session. It is available from the toolbar (bulk, on the
+selection) and from the *Edit chunk* window (*Save & merge into above*).
 """
 
 from __future__ import annotations
@@ -26,12 +36,18 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .chunk_triage import (analyze_chunks, build_output_payload,
+                           find_merge_target, headings_match,
                            normalize_heading, triage_summary)
 
-_ACTION_LABEL = {"log": "Keep", "skip": "Skip", "review": "Review"}
+_ACTION_LABEL = {"log": "Keep", "skip": "Skip", "review": "Review",
+                 "merge": "Merge ↑"}
 _ACTION_TAGS = {"log": ("#1f7a1f", ""), "skip": ("#777777", ""),
-                "review": ("#b00020", "")}
-_FILTERS = ("Needs review", "All", "Keep", "Skip")
+                "review": ("#b00020", ""), "merge": ("#0b6fa4", "")}
+_FILTERS = ("Needs review", "All", "Keep", "Skip", "Merged")
+
+# Fields a merge decision adds to a proposal — dropped again the moment the
+# chunk is given any other decision, so a stale merge can never be written.
+_MERGE_FIELDS = ("merge_add_heading", "merge_heading_text", "merged_into")
 
 
 class ChunkTriageApp:
@@ -85,10 +101,13 @@ class ChunkTriageApp:
 
     @staticmethod
     def _history_fingerprint(entries):
-        """Canonical form of the *meaningful* review state — per chunk: kept
-        or skipped, its heading and its text. Used to decide whether the
-        reviewer actually changed anything compared to the prior review
-        (bookkeeping fields like triage_reason are deliberately excluded)."""
+        """Canonical form of the *meaningful* review state — per chunk: kept,
+        skipped or merged into the chunk above (and whether its heading goes
+        into the merged text), its heading and its text. Used to decide
+        whether the reviewer actually changed anything compared to the prior
+        review (bookkeeping fields like triage_reason are deliberately
+        excluded). Reviews written before merging existed simply have the
+        merge fields absent, which reads back as 'not merged'."""
         out = []
         for entry in entries or []:
             if not isinstance(entry, dict):
@@ -96,8 +115,12 @@ class ChunkTriageApp:
             heading = entry.get("heading")
             if isinstance(heading, list):
                 heading = ", ".join(str(h) for h in heading if str(h).strip())
+            status = str(entry.get("status") or "")
             out.append((str(entry.get("chunk_index")),
-                        str(entry.get("status") or "") == "skipped",
+                        status == "skipped",
+                        status.startswith("merged"),
+                        bool(entry.get("merge_add_heading")),
+                        str(entry.get("merge_heading_text") or ""),
                         str(heading or ""),
                         str(entry.get("chunk_text") or "")))
         return tuple(sorted(out))
@@ -145,7 +168,7 @@ class ChunkTriageApp:
         self.tree.heading("reason", text="Why")
         self.tree.heading("text", text="Text preview")
         self.tree.column("#0", width=70, anchor="w", stretch=False)
-        self.tree.column("action", width=70, anchor="w", stretch=False)
+        self.tree.column("action", width=82, anchor="w", stretch=False)
         self.tree.column("toc", width=45, anchor="center", stretch=False)
         self.tree.column("heading", width=210, anchor="w")
         self.tree.column("pages", width=50, anchor="w", stretch=False)
@@ -169,6 +192,8 @@ class ChunkTriageApp:
         ttk.Button(act, text="Skip",
                    command=lambda: self._set_action("skip")).pack(side="left",
                                                                   padx=4)
+        ttk.Button(act, text="Merge into above ↑",
+                   command=self._merge_into_above).pack(side="left", padx=4)
         ttk.Button(act, text="Set heading…",
                    command=self._set_heading).pack(side="left", padx=4)
         ttk.Button(act, text="Use heading above",
@@ -231,6 +256,7 @@ class ChunkTriageApp:
             f"{s['total']} chunks — {s['log']} to keep, {s['skip']} to skip, "
             f"{s['review']} need review ({s['auto_handled_pct']}% decided "
             "automatically)"
+            + (f", {s['merge']} merged upwards" if s.get("merge") else "")
             + (f" — {restored} restored from the previous session"
                if restored else ""))
         ref = result["refinement"]
@@ -267,14 +293,29 @@ class ChunkTriageApp:
             if isinstance(heading, list):
                 heading = ", ".join(str(h) for h in heading if str(h).strip())
             status = str(entry.get("status") or "")
-            p["action"] = "skip" if status == "skipped" else "log"
+            self._clear_merge(p)
+            if status == "skipped":
+                p["action"] = "skip"
+            elif status.startswith("merged"):
+                # The history keeps each chunk's own text, so re-applying the
+                # merge on accept reproduces exactly the previous output.
+                p["action"] = "merge"
+                p["merge_add_heading"] = bool(entry.get("merge_add_heading"))
+                if entry.get("merge_heading_text"):
+                    p["merge_heading_text"] = entry["merge_heading_text"]
+                if entry.get("merged_into") is not None:
+                    p["merged_into"] = entry["merged_into"]
+            else:
+                p["action"] = "log"
             p["heading"] = str(heading or "")
             if entry.get("chunk_text") is not None:
                 p["text"] = entry["chunk_text"]
-            if status:
+            if status and not status.startswith("merged"):
                 p["status"] = status      # keeps 'logged (edited)' etc.
             p["edited"] = True
-            p["reason"] = "restored from the previous session"
+            p["reason"] = ("merged into the chunk above — restored from the "
+                           "previous session" if p["action"] == "merge"
+                           else "restored from the previous session")
             restored += 1
         if restored:
             self._log(f"Resume: {restored} decision(s) restored from the "
@@ -299,6 +340,8 @@ class ChunkTriageApp:
             if choice == "Keep" and p["action"] != "log":
                 continue
             if choice == "Skip" and p["action"] != "skip":
+                continue
+            if choice == "Merged" and p["action"] != "merge":
                 continue
             if needle and needle not in (
                     f"{p['heading']} {p['reason']} {p['text']}".casefold()):
@@ -329,13 +372,30 @@ class ChunkTriageApp:
                 tags=tuple(tags))
             self._iid_by_pos[iid] = p
         shown = len(self._iid_by_pos)
-        self.status_var.set(f"{shown} row(s) shown of {len(self.proposals)}")
+        merged = sum(1 for p in self.proposals if p["action"] == "merge")
+        self.status_var.set(
+            f"{shown} row(s) shown of {len(self.proposals)}"
+            + (f" · {merged} merged into the chunk above" if merged else ""))
 
     def _selected(self):
         return [self._iid_by_pos[i] for i in self.tree.selection()
                 if i in self._iid_by_pos]
 
     # ----------------------------------------------------------- editing -- #
+    @staticmethod
+    def _clear_merge(proposal):
+        """Drop any merge state from a proposal — called whenever it is given
+        a different decision, so 'Keep' after 'Merge ↑' really is a keep."""
+        for field in _MERGE_FIELDS:
+            proposal.pop(field, None)
+        if str(proposal.get("status") or "").startswith("merged"):
+            proposal.pop("status", None)
+
+    def _positions(self):
+        """Map from proposal identity to its position in document order —
+        what 'the chunk above' is resolved against."""
+        return {id(p): i for i, p in enumerate(self.proposals)}
+
     def _set_action(self, action):
         picked = self._selected()
         if not picked:
@@ -344,6 +404,7 @@ class ChunkTriageApp:
             return
         for p in picked:
             p["action"] = action
+            self._clear_merge(p)
             p["edited"] = True
             p["toc_match"] = None      # reviewer decision, not TOC-verified
             p["reason"] = f"set to '{_ACTION_LABEL[action]}' by reviewer"
@@ -366,6 +427,7 @@ class ChunkTriageApp:
         for p in picked:
             p["heading"] = value
             p["action"] = "log"
+            self._clear_merge(p)
             p["edited"] = True
             p["toc_match"] = None
             p["reason"] = "heading set by reviewer"
@@ -395,6 +457,7 @@ class ChunkTriageApp:
                 continue
             p["heading"] = heading
             p["action"] = "log"
+            self._clear_merge(p)
             p["edited"] = True
             p["toc_match"] = None
             p["reason"] = f"heading taken from the chunk above ('{heading}')"
@@ -404,6 +467,171 @@ class ChunkTriageApp:
                 "No heading above",
                 f"{missing} of the selected chunks have no kept chunk with a "
                 "heading before them, so they were left unchanged.")
+
+    # ------------------------------------------------------------ merging -- #
+    def _merge_into_above(self):
+        """Fold the selected chunks into the chunk above them.
+
+        'Above' is the nearest preceding chunk that is kept in its own right:
+        skipped chunks and chunks that are themselves merged are passed over,
+        so selecting a whole run of fragments merges all of them into the one
+        section that starts the run. The reviewer is asked once whether the
+        heading should be written into the merged text — a section split
+        across two chunks usually wants it, a paragraph split mid-sentence
+        never does. Nothing is written until *Accept & save*, and setting the
+        chunk back to Keep undoes the merge."""
+        picked = self._selected()
+        if not picked:
+            messagebox.showinfo("Nothing selected",
+                                "Select one or more rows first.")
+            return
+        pos = self._positions()
+        picked = sorted(picked, key=lambda p: pos.get(id(p), 0))
+
+        first_target = None
+        for p in picked:
+            first_target = find_merge_target(self.proposals, pos[id(p)])
+            if first_target is not None:
+                break
+        if first_target is None:
+            messagebox.showinfo(
+                "Nothing above",
+                "There is no kept chunk above the selected chunk(s), so there "
+                "is nothing to merge into. Nothing was changed.")
+            return
+
+        options = self._ask_merge_options(picked, first_target)
+        if options is None:
+            return
+
+        merged = orphaned = 0
+        for p in picked:
+            # Resolved chunk by chunk, after the previous ones were marked:
+            # a run of consecutive merges therefore all lands in the same
+            # chunk instead of chaining into each other.
+            target = find_merge_target(self.proposals, pos[id(p)])
+            if target is None:
+                orphaned += 1
+                continue
+            self._apply_merge(p, target, options)
+            merged += 1
+        self._log(f"{merged} chunk(s) merged into the chunk above "
+                  f"({'with' if options['add_heading'] else 'without'} the "
+                  "heading in the text).")
+        self._refresh()
+        if orphaned:
+            messagebox.showinfo(
+                "Partly applied",
+                f"{orphaned} of the selected chunks have no kept chunk above "
+                "them, so they were left unchanged.")
+
+    def _apply_merge(self, proposal, target, options):
+        """Mark one chunk as merged into ``target`` with the chosen heading
+        handling. Purely a decision — the text is folded when the review is
+        built, which is what keeps it reversible."""
+        add = bool(options.get("add_heading"))
+        override = (options.get("heading_text") or "").strip()
+        proposal["action"] = "merge"
+        proposal["edited"] = True
+        proposal["toc_match"] = None
+        proposal["merge_add_heading"] = add
+        if add and override:
+            proposal["merge_heading_text"] = override
+        else:
+            proposal.pop("merge_heading_text", None)
+        proposal["merged_into"] = target.get("chunk_index")
+        shown = override or str(proposal.get("heading") or "").strip()
+        proposal["reason"] = (
+            f"merged into chunk {target.get('chunk_index')}"
+            + (f" — heading '{shown}' added to the text" if add and shown
+               else " — text only"))
+        if str(proposal.get("status") or "").startswith("merged"):
+            proposal.pop("status", None)
+
+    def _ask_merge_options(self, picked, target, parent=None):
+        """Ask whether the merged text gets the chunk's heading in front of
+        it. Returns ``{"add_heading": bool, "heading_text": str|None}`` or
+        None when the reviewer cancels."""
+        single = len(picked) == 1
+        own_heading = (str(picked[0].get("heading") or "").strip()
+                       if single else "")
+        target_heading = str((target or {}).get("heading") or "").strip()
+        # Proposed answer: add the heading when this chunk carries one of its
+        # own that is not already the heading of the chunk it goes into
+        # (that would just repeat it). Bulk merges default to text only.
+        default_add = bool(single and own_heading and not (
+            target_heading and headings_match(own_heading, target_heading)))
+
+        host = parent or self.root
+        dlg = tk.Toplevel(host)
+        dlg.title("Merge into the chunk above")
+        dlg.transient(host.winfo_toplevel())
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        if single:
+            headline = (f"Chunk {picked[0].get('chunk_index')} will be merged "
+                        f"into chunk {(target or {}).get('chunk_index')}"
+                        + (f" — {target_heading}" if target_heading else ""))
+        else:
+            headline = (f"{len(picked)} chunks will be merged into the kept "
+                        "chunk above each of them.")
+        ttk.Label(frm, text=headline, wraplength=470, justify="left",
+                  font=("Arial", 10, "bold")).pack(anchor="w")
+        ttk.Label(frm, wraplength=470, justify="left", foreground="#555555",
+                  text="Their text is appended to that chunk, so they stop "
+                       "being separate chunks in the saved review.").pack(
+            anchor="w", pady=(2, 12))
+
+        ttk.Label(frm, text="Add the heading to the merged text?",
+                  font=("Arial", 10, "bold")).pack(anchor="w")
+        add_var = tk.BooleanVar(value=default_add)
+        ttk.Radiobutton(
+            frm, variable=add_var, value=True,
+            text="Yes — write the heading as a line before the text").pack(
+            anchor="w", pady=(2, 0))
+        ttk.Radiobutton(
+            frm, variable=add_var, value=False,
+            text="No — append the text only").pack(anchor="w")
+
+        entry = None
+        if single:
+            ttk.Label(frm, text="Heading to write:").pack(anchor="w",
+                                                          pady=(10, 0))
+            entry = ttk.Entry(frm, width=58)
+            entry.insert(0, own_heading)
+            entry.pack(fill="x")
+            ttk.Label(frm, foreground="#555555", wraplength=470,
+                      justify="left",
+                      text="(only used when 'Yes' is selected)").pack(
+                anchor="w")
+        else:
+            ttk.Label(frm, foreground="#555555", wraplength=470,
+                      justify="left",
+                      text="Each chunk's own heading is used; chunks without "
+                           "one contribute their text only.").pack(
+                anchor="w", pady=(10, 0))
+
+        out = {"value": None}
+
+        def ok():
+            out["value"] = {
+                "add_heading": bool(add_var.get()),
+                "heading_text": (entry.get().strip()
+                                 if entry is not None else None),
+            }
+            dlg.destroy()
+
+        row = ttk.Frame(frm)
+        row.pack(fill="x", pady=(14, 0))
+        ttk.Button(row, text="Merge", command=ok).pack(side="left")
+        ttk.Button(row, text="Cancel",
+                   command=dlg.destroy).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda _e: ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
+        host.wait_window(dlg)
+        return out["value"]
 
     def _ask_heading(self, initial, known):
         """Small modal: type a heading or pick one already used."""
@@ -448,6 +676,13 @@ class ChunkTriageApp:
         ttk.Label(frm, foreground="#555555",
                   text=f"Page {p['page_num']} · {', '.join(p['labels']) or 'n/a'}"
                        f" · {p['reason']}").pack(anchor="w")
+        state = _ACTION_LABEL.get(p["action"], p["action"])
+        if p["action"] == "merge":
+            state += (f" into chunk {p.get('merged_into')}"
+                      + (" · heading written into the text"
+                         if p.get("merge_add_heading") else " · text only"))
+        ttk.Label(frm, foreground="#555555",
+                  text=f"Current decision: {state}").pack(anchor="w")
         ttk.Label(frm, text="Heading:").pack(anchor="w", pady=(8, 0))
         head = ttk.Entry(frm)
         head.insert(0, p["heading"])
@@ -463,10 +698,28 @@ class ChunkTriageApp:
             if new_text != p["text"]:
                 p["text"] = new_text
                 p["status"] = "logged (edited)"
-            p["action"] = action
-            p["edited"] = True
-            p["toc_match"] = None
-            p["reason"] = "edited by reviewer"
+            if action == "merge":
+                # Same decision as the toolbar button, with the edits above
+                # already applied — so the heading typed here is the one
+                # offered for the merged text.
+                target = find_merge_target(self.proposals,
+                                           self._positions()[id(p)])
+                if target is None:
+                    messagebox.showinfo(
+                        "Nothing above",
+                        "There is no kept chunk above this one, so there is "
+                        "nothing to merge into.", parent=dlg)
+                    return                      # keep the editor open
+                options = self._ask_merge_options([p], target, parent=dlg)
+                if options is None:
+                    return                      # cancelled — keep editing
+                self._apply_merge(p, target, options)
+            else:
+                p["action"] = action
+                self._clear_merge(p)
+                p["edited"] = True
+                p["toc_match"] = None
+                p["reason"] = "edited by reviewer"
             dlg.destroy()
             self._refresh()
 
@@ -474,8 +727,10 @@ class ChunkTriageApp:
         row.pack(fill="x", pady=(8, 0))
         ttk.Button(row, text="Save & keep",
                    command=lambda: save("log")).pack(side="left")
+        ttk.Button(row, text="Save & merge into above ↑",
+                   command=lambda: save("merge")).pack(side="left", padx=6)
         ttk.Button(row, text="Save & skip",
-                   command=lambda: save("skip")).pack(side="left", padx=6)
+                   command=lambda: save("skip")).pack(side="left", padx=(0, 6))
         ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left")
         dlg.grab_set()
         self.root.wait_window(dlg)
@@ -515,7 +770,9 @@ class ChunkTriageApp:
         """
         payload = build_output_payload(self.proposals)
         sections = payload["merged_headings"]
-        kept = sum(1 for p in self.proposals if p["action"] != "skip")
+        kept = sum(1 for p in self.proposals
+                   if p["action"] not in ("skip", "merge"))
+        merged = sum(1 for p in self.proposals if p["action"] == "merge")
         still = sum(1 for p in self.proposals if p["action"] == "review")
         if still and not messagebox.askyesno(
                 "Unreviewed chunks",
@@ -558,11 +815,15 @@ class ChunkTriageApp:
                       == os.path.abspath(target)
                       else " (saved as a NEW file — the previous review is "
                            "untouched)")
+            merged_note = (f" ({merged} merged into the chunk above)"
+                           if merged else "")
             self._log(f"Triage accepted: {kept} chunk(s) kept in "
-                      f"{len(sections)} section(s) → {target}{as_new}")
+                      f"{len(sections)} section(s){merged_note} → "
+                      f"{target}{as_new}")
             messagebox.showinfo(
                 "Review saved",
-                f"{kept} chunk(s) kept in {len(sections)} section(s).\n\n"
+                f"{kept} chunk(s) kept in {len(sections)} "
+                f"section(s){merged_note}.\n\n"
                 f"Written to {target}{as_new}\n\nProceeding to Section "
                 "Review…")
             # the just-saved state is the new baseline for further accepts

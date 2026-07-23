@@ -85,7 +85,10 @@ they are only needed when an extraction actually runs.
   review table shows it as a **TOC ✓/✗ column** (✗ = kept, e.g. a numbered
   heading, but absent from the TOC) with a `TOC-verified: n ✓ / m ✗` count in
   the header; reviewer overrides clear the flag. An **Open PDF** button next
-  to the file picker opens the selected PDF with the system viewer. Each chunk then gets a proposed decision with a reason: page
+  to the file picker opens the selected PDF with the system viewer, and a
+  **View TOC** button shows exactly the TOC the triage reads from the PDF via
+  PyMuPDF (entries, pages, source: embedded outline vs. printed text) — or
+  explains the LLM fallback when the PDF has none. Each chunk then gets a proposed decision with a reason: page
   headers/footers, repeated running text, the TOC page itself and empty
   fragments are proposed as **Skip**; content whose heading matches a real
   section is **Kept** under it; content under a noise heading — or with no
@@ -97,7 +100,15 @@ they are only needed when an extraction actually runs.
   Review**, and the triage appears right below: all chunks in one sortable
   table (decision, heading, page, type, why, preview) filtered to **Needs
   review** by default, with bulk *Keep* / *Skip* / *Set heading* / *Use
-  heading above*, per-chunk editing, and a merged-section preview. **Nothing
+  heading above*, per-chunk editing, and a merged-section preview. The
+  triage's proposal is shown as the **LLM decision**; a separate **User
+  decision** column offers a per-row dropdown (click the cell) with **Keep /
+  Merge with above / Skip / Need review** — *Merge with above* folds the
+  chunk into the nearest preceding kept section. The preview shows both
+  variants side by side (**LLM suggested** and **user decided** tabs), and
+  when User decisions exist *Accept & save* first asks **which variant to
+  write** (user-decided rows are marked `logged (user)` in the output).
+  **Nothing
   is written until you press *Accept & save*** — then the same
   `merged_headings` / `raw_session_history` payload as before is written
   **once** (the old tool rewrote the whole file on every click), and **Section

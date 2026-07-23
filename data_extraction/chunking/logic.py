@@ -55,6 +55,9 @@ class ExtractionLauncherUI:
         ttk.Button(frame_src, text="Open PDF",
                    command=self.open_selected_pdf).grid(row=0, column=3,
                                                         padx=(4, 0))
+        ttk.Button(frame_src, text="View TOC",
+                   command=self.show_pdf_toc).grid(row=0, column=4,
+                                                   padx=(2, 0))
 
         ttk.Label(frame_src, text="…or cache JSON:").grid(row=1, column=0, sticky="w")
         self.entry_cache = ttk.Entry(frame_src, width=78)
@@ -265,6 +268,76 @@ class ExtractionLauncherUI:
                 subprocess.Popen(["xdg-open", path])
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Open PDF", f"Could not open the PDF:\n{exc}")
+
+    def show_pdf_toc(self):
+        """Show the Table of Contents the triage would read from the chosen
+        PDF via PyMuPDF (embedded outline, else the printed TOC text) —
+        exactly the section reference the chunk headings get verified
+        against. Read in the background; a PDF without one gets the
+        fallback explanation instead."""
+        path = self.entry_pdf.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showinfo("No PDF", "Pick an existing PDF file first.")
+            return
+        self.status_label.config(text="Reading the TOC from the PDF…")
+
+        def work():
+            try:
+                from .chunk_triage import toc_from_pdf
+                toc = toc_from_pdf(path)
+            except Exception as exc:  # noqa: BLE001
+                toc = {"entries": [], "source": None, "error": str(exc)}
+            try:
+                self.root.after(0, lambda t=toc: self._show_toc_dialog(path, t))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_toc_dialog(self, path, toc):
+        self.status_label.config(text="")
+        entries = toc.get("entries") or []
+        if not entries:
+            extra = (f"\n\n(error: {toc['error']})" if toc.get("error") else "")
+            messagebox.showinfo(
+                "No TOC in the PDF",
+                f"{os.path.basename(path)} has no usable Table of Contents "
+                "(no embedded outline, and no printed TOC parsed from the "
+                "first pages).\n\nThe triage will fall back to the "
+                "chunk-level TOC detection and then the LLM heading check."
+                + extra)
+            return
+        source = {"pdf-bookmarks": "embedded outline (bookmarks)",
+                  "pdf-text": "printed TOC parsed from the page text"}.get(
+            toc.get("source"), toc.get("source") or "?")
+        dlg = tk.Toplevel(self.root.winfo_toplevel())
+        dlg.title(f"TOC of {os.path.basename(path)}")
+        dlg.transient(self.root.winfo_toplevel())
+        dlg.geometry("680x560")
+        frm = ttk.Frame(dlg, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, font=("Arial", 10, "bold"),
+                  text=f"{len(entries)} entries — source: {source}").pack(anchor="w")
+        ttk.Label(frm, foreground="#666666", justify="left",
+                  text="This is the section reference the triage verifies the "
+                       "Docling chunk headings against\n(the LLM heading check "
+                       "only runs when a PDF offers no usable TOC).").pack(
+            anchor="w", pady=(2, 6))
+        wrap = ttk.Frame(frm)
+        wrap.pack(fill="both", expand=True)
+        box = tk.Text(wrap, wrap="none", font=("Consolas", 11))
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=box.yview)
+        box.configure(yscrollcommand=vsb.set)
+        box.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        for entry in entries:
+            indent = "    " * max(0, int(entry.get("level") or 1) - 1)
+            page = entry.get("page")
+            box.insert("end", f"{('p.' + str(page)).rjust(7) if page is not None else '      —'}"
+                              f"  {indent}{entry['title']}\n")
+        box.configure(state="disabled")
+        ttk.Button(frm, text="Close", command=dlg.destroy).pack(anchor="e",
+                                                                pady=(6, 0))
 
     def browse_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF Documents", "*.pdf")])

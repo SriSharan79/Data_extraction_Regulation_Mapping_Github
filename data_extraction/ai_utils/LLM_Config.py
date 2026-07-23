@@ -19,6 +19,7 @@ API_keys_config= os.path.join(ALR_main_folder, "API_keys_config.json")
 KEY_ENV_NAMES = {
     'DLR Ollama': "Ollama_DLR_API_Key",
     'BlaBla Door': "BlaBla_API_Key",
+    'Chat AI': "ChatAI_API_Key",
 }
 
 
@@ -126,6 +127,8 @@ PREFERRED_BLABLADOR_MODELS = [
     "GPT-OSS-120b", "Llama-3.1-70B-Instruct", "Llama-3.1-8B-Instruct",
     "Mistral-Large-Instruct-2407", "Mistral-7B-Instruct-v0.3"
 ]
+
+CHATAI_BASE_URL = "https://chat-ai.academiccloud.de/v1"
 
 # DLR Ollama OpenAI-compatible endpoint (base; specific paths are appended).
 OLLAMA_BASE_URL = "http://ollama.nimbus.dlr.de/api"

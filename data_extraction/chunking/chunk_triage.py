@@ -23,7 +23,11 @@ almost always carry:
    ``SYSTEM_PROMPT_Heading_identifier`` approach), else deterministic rules.
 4. :func:`triage_chunks` — per chunk propose ``log`` / ``skip`` / ``review``
    with the heading to use and a human-readable reason.
-5. :func:`build_merged_sections` — the ``merged_headings`` payload the rest of
+5. :func:`resolve_merges` — apply the reviewer's ``merge`` decisions: a chunk
+   marked ``merge`` is folded into the text of the chunk above it (the
+   nearest preceding chunk that is kept in its own right), optionally with
+   its own heading written as a line before the text.
+6. :func:`build_merged_sections` — the ``merged_headings`` payload the rest of
    the pipeline (Section Review, AI Review) already consumes.
 
 Nothing here touches Tkinter and the LLM is injected as a callable, so the
@@ -537,6 +541,11 @@ def triage_chunks(chunks, valid_headings=None, toc=None, boilerplate=None):
     * ``log``    — keep, under ``heading``;
     * ``review`` — needs a human (no heading could be determined).
 
+    A fourth action, ``merge``, exists but is never *proposed* here: it is
+    set by the reviewer to fold a chunk's text into the chunk above it (see
+    :func:`resolve_merges`), because only a human can tell that a section was
+    split across two chunks.
+
     A chunk whose own heading is not a valid section heading is **not**
     thrown away: its content is logged under the last valid heading, which is
     what the reviewer used to do by hand with *Use Prev Heading* and what
@@ -634,15 +643,17 @@ def triage_summary(proposals):
     'you only have to look at N of M chunks'."""
     counts = Counter(p["action"] for p in proposals)
     total = len(proposals)
+    decided = (counts.get("log", 0) + counts.get("skip", 0)
+               + counts.get("merge", 0))
     return {
         "total": total,
         "log": counts.get("log", 0),
         "skip": counts.get("skip", 0),
         "review": counts.get("review", 0),
+        "merge": counts.get("merge", 0),
         "low_confidence": sum(1 for p in proposals
                               if p["confidence"] == "low"),
-        "auto_handled_pct": (round(100.0 * (counts.get("log", 0)
-                                            + counts.get("skip", 0)) / total, 1)
+        "auto_handled_pct": (round(100.0 * decided / total, 1)
                              if total else 0.0),
     }
 
@@ -688,26 +699,137 @@ def analyze_chunks(chunks, llm=None, log=None, pdf_path=None):
             "refinement": refinement, "headings": headings}
 
 
+# ---------------------------------------------------------------- merging -- #
+# What separates a merged chunk's text from the text it is appended to.
+MERGE_SEPARATOR = "\n\n"
+
+
+def merge_block_text(entry):
+    """The text a chunk marked ``merge`` contributes to the chunk above it.
+
+    ``merge_add_heading`` decides whether the chunk's heading is written as a
+    line before its text — the reviewer is asked this every time a merge is
+    made, because a split paragraph must NOT get a heading inserted in the
+    middle of it while a genuine sub-section usually must.
+    ``merge_heading_text`` optionally overrides which heading is written."""
+    body = str(entry.get("text") or "").rstrip()
+    if not entry.get("merge_add_heading"):
+        return body
+    heading = str(entry.get("merge_heading_text")
+                  or entry.get("heading") or "").strip()
+    if not heading:
+        return body
+    return f"{heading}\n{body}" if body else heading
+
+
+def find_merge_target(decisions, index):
+    """The decision a chunk at list position ``index`` merges into, or None.
+
+    That is the nearest preceding chunk that survives on its own: ``skip``
+    chunks are passed over (they are not written at all) and so are other
+    ``merge`` chunks (they are themselves folded further up), which is what
+    makes a run of consecutive merges land in one and the same chunk."""
+    for i in range(int(index) - 1, -1, -1):
+        entry = decisions[i]
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("action") in ("skip", "merge"):
+            continue
+        return entry
+    return None
+
+
+def resolve_merges(decisions):
+    """Apply every ``merge`` decision, without touching the input.
+
+    Returns ``(resolved, merged_into)``: ``resolved`` is a copy of
+    ``decisions`` in which each merge target has absorbed the text, labels
+    and page numbers of the chunks merged into it (their indices land in its
+    ``merged_from``), and ``merged_into`` maps the chunk index of every
+    merged chunk to the chunk index it went into.
+
+    Merged chunks stay in ``resolved`` — marked, with their own text intact —
+    so the session history can record what the reviewer did and a resumed
+    session re-applies the merge instead of duplicating the text. A chunk
+    marked ``merge`` with nothing above it to merge into is kept as its own
+    chunk rather than dropped, so no text is ever lost."""
+    resolved, merged_into = [], {}
+    target = None
+    for entry in decisions:
+        if not isinstance(entry, dict):
+            continue
+        current = dict(entry)
+        # Own the mutable fields: the caller's proposals must not change.
+        current["labels"] = list(entry.get("labels") or [])
+        current["page_num"] = list(entry.get("page_num") or [])
+        current["merged_from"] = list(entry.get("merged_from") or [])
+        action = current.get("action")
+
+        if action == "merge":
+            if target is None:
+                current["action"] = "log"
+                current["merged_into"] = None
+                current["merge_unresolved"] = True
+                current["reason"] = ("marked to merge, but no kept chunk "
+                                     "precedes it — left as its own chunk")
+                resolved.append(current)
+                target = current
+                continue
+            piece = merge_block_text(current)
+            if piece.strip():
+                base = str(target.get("text") or "").rstrip()
+                target["text"] = (base + MERGE_SEPARATOR + piece
+                                  if base else piece)
+            for label in current["labels"]:
+                if label not in target["labels"]:
+                    target["labels"].append(label)
+            for page in current["page_num"]:
+                if page not in target["page_num"]:
+                    target["page_num"].append(page)
+            index = current.get("chunk_index")
+            if index is not None and index not in target["merged_from"]:
+                target["merged_from"].append(index)
+            current["merged_into"] = target.get("chunk_index")
+            merged_into[index] = target.get("chunk_index")
+            resolved.append(current)
+            continue
+
+        resolved.append(current)
+        if action != "skip":
+            target = current
+    return resolved, merged_into
+
+
 # ------------------------------------------------------------- the output -- #
-def build_merged_sections(decisions):
+def build_merged_sections(decisions, resolve=True):
     """Build the ``merged_headings`` payload from accepted decisions.
 
     ``decisions`` are proposal dicts (possibly edited by the reviewer) with an
     ``action``; ``skip`` entries are excluded, exactly as the manual review
-    does. Grouping is by **normalised** heading, which is what stops
-    'Part 21' and 'Part 21 ' becoming two sections — the original spelling of
-    the first occurrence is kept for display."""
+    does, and ``merge`` entries are excluded too because their text has
+    already been folded into the chunk above them. Grouping is by
+    **normalised** heading, which is what stops 'Part 21' and 'Part 21 '
+    becoming two sections — the original spelling of the first occurrence is
+    kept for display.
+
+    ``resolve`` runs :func:`resolve_merges` first; pass ``False`` when the
+    decisions were already resolved by the caller, so the merged text is not
+    appended twice."""
+    if resolve:
+        decisions, _ = resolve_merges(decisions)
     merged, order = {}, []
     for entry in decisions:
-        if entry.get("action") == "skip":
+        if entry.get("action") in ("skip", "merge"):
             continue
         heading = entry.get("heading") or ""
         key = normalize_heading(heading)
+        indices = ([entry.get("chunk_index")]
+                   + list(entry.get("merged_from") or []))
         if key not in merged:
             merged[key] = {
                 "heading": [heading] if heading else [],
                 "merged_text": entry.get("text", ""),
-                "chunk_indices": [entry.get("chunk_index")],
+                "chunk_indices": indices,
                 "types_of_docitem": list(entry.get("labels") or []),
                 "page_nums": list(entry.get("page_num") or []),
             }
@@ -715,7 +837,7 @@ def build_merged_sections(decisions):
         else:
             target = merged[key]
             target["merged_text"] += "\n\n" + entry.get("text", "")
-            target["chunk_indices"].append(entry.get("chunk_index"))
+            target["chunk_indices"].extend(indices)
             for label in entry.get("labels") or []:
                 if label not in target["types_of_docitem"]:
                     target["types_of_docitem"].append(label)
@@ -729,18 +851,40 @@ def build_output_payload(decisions):
     """The full review-output payload: ``merged_headings`` (what Section
     Review and AI Review read) plus ``raw_session_history`` in the shape the
     manual review has always written, so resuming and the existing readers
-    keep working."""
+    keep working.
+
+    The history stays a faithful **per-chunk** record: a merged chunk keeps
+    its own text under the status ``merged`` and the chunk it went into keeps
+    its own pre-merge text. Only ``merged_headings`` carries the combined
+    text — that is what makes resuming a session idempotent (restoring the
+    history and accepting again re-applies the merge instead of appending
+    the same text a second time)."""
+    resolved, merged_into = resolve_merges(decisions)
     history = []
     for entry in decisions:
-        history.append({
+        if not isinstance(entry, dict):
+            continue
+        action = entry.get("action")
+        if action == "skip":
+            status = "skipped"
+        elif action == "merge":
+            status = "merged"
+        else:
+            status = entry.get("status") or "logged (auto)"
+        item = {
             "chunk_index": entry.get("chunk_index"),
-            "status": ("skipped" if entry.get("action") == "skip"
-                       else entry.get("status") or "logged (auto)"),
+            "status": status,
             "heading": [entry["heading"]] if entry.get("heading") else [],
             "chunk_text": entry.get("text", ""),
             "type_of_docitem": list(entry.get("labels") or []),
             "page_num": list(entry.get("page_num") or []),
             "triage_reason": entry.get("reason", ""),
-        })
-    return {"merged_headings": build_merged_sections(decisions),
+        }
+        if action == "merge":
+            item["merged_into"] = merged_into.get(entry.get("chunk_index"))
+            item["merge_add_heading"] = bool(entry.get("merge_add_heading"))
+            if entry.get("merge_heading_text"):
+                item["merge_heading_text"] = entry["merge_heading_text"]
+        history.append(item)
+    return {"merged_headings": build_merged_sections(resolved, resolve=False),
             "raw_session_history": history}
