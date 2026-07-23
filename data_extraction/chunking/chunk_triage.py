@@ -15,9 +15,23 @@ almost always carry:
 
 1. :func:`collect_headings` — the ordered, unique heading list (alr's
    ``unique_headings_list``).
-2. :func:`find_toc` / :func:`parse_toc_entries` — locate a Table of Contents
-   among the chunks and parse its entries. When one exists it is the
-   authoritative list of sections, so no LLM call is needed at all.
+2. :func:`resolve_toc` — the Table of Contents, taken from the first source
+   that yields a usable one:
+
+   a. the PDF's embedded outline (bookmarks) — :func:`toc_from_pdf`;
+   b. the printed TOC parsed from the PDF's page text — :func:`toc_from_pdf`;
+   c. the TOC reassembled from the Docling chunks — :func:`find_toc`;
+   d. the TOC read from an **extracted table** sitting on the contents pages
+      — :func:`toc_pages_from_chunks` + :func:`toc_from_tables`. Regulatory
+      documents very often lay their contents out as a table, which Docling
+      then extracts as a table rather than as text; the table is only trusted
+      when it passes :func:`table_looks_like_toc` (enough rows carrying a page
+      number, page numbers running forwards, titles that read like titles);
+   e. the LLM asked to pull the TOC out of the contents chunks —
+      :func:`toc_from_llm`.
+
+   When a TOC exists it is the authoritative list of sections, so the LLM
+   heading check below is not needed at all.
 3. :func:`refine_headings` — decide the valid headings, in order of
    preference: the TOC, else an LLM pass over the heading list (alr's
    ``SYSTEM_PROMPT_Heading_identifier`` approach), else deterministic rules.
@@ -38,6 +52,8 @@ whole engine runs (and is tested) headless. Every decision carries a
 from __future__ import annotations
 
 import ast
+import json
+import os
 import re
 from collections import Counter
 from difflib import SequenceMatcher
@@ -71,6 +87,24 @@ MIN_CONTENT_CHARS = 25
 # printed TOC into a handful of dot-leader fragments; below this it is
 # rejected and heading refinement falls through to the LLM / rules.
 MIN_TOC_ENTRIES = 4
+
+# An extracted table is only accepted as the Table of Contents when at least
+# this share of its non-empty rows yields a title AND a page number. A table
+# that Docling shredded (merged cells, split columns, OCR noise) falls below
+# this and is reported as "did not extract cleanly" rather than used.
+MIN_TOC_TABLE_ROW_RATIO = 0.6
+
+# ... and its page numbers must run forwards: at least this share of
+# consecutive pairs must be non-decreasing. A real contents list always does;
+# a data table of unrelated numbers almost never does.
+MIN_TOC_TABLE_ORDER_RATIO = 0.8
+
+# How far into the document the contents pages are looked for when the chunks
+# do not announce a Table of Contents themselves.
+MAX_TOC_SCAN_PAGE = 25
+
+# How much contents text is sent to the LLM in the last-resort TOC pass.
+MAX_TOC_LLM_CHARS = 12000
 
 # Identical text repeated on at least this many pages is running furniture.
 BOILERPLATE_REPEAT_PAGES = 4
@@ -168,6 +202,43 @@ SYSTEM_PROMPT_HEADING_IDENTIFIER = (
     "Input: ['1. Scope', 'Page 4 of 88', '2. Applicability', "
     "'Doc. No. EASA-2021-04', 'Definitions']\n"
     "Output: ['1. Scope', '2. Applicability', 'Definitions']"
+)
+
+# The system prompt for the last-resort TOC pass: the reader is given the raw
+# text of the pages that look like the contents and has to return the entries.
+# Kept separate from the heading check above because the task is different —
+# this one reads a contents list, it does not judge a list of headings.
+SYSTEM_PROMPT_TOC_EXTRACTOR = (
+    "You are a Professional Document Structure Analyst specializing in "
+    "regulatory, legal and technical publications (EASA, FAA, ICAO, ISO, "
+    "RTCA and similar).\n"
+    "You are given the raw extracted text of the pages that appear to hold a "
+    "document's Table of Contents. The extraction is imperfect: dot leaders, "
+    "column breaks and page numbers may be mangled or split across lines.\n"
+    "Your task is to reconstruct the Table of Contents entries.\n\n"
+
+    "### Rules:\n"
+    "- Return ONE entry per section listed in the contents, in the order they "
+    "appear.\n"
+    "- Keep the section numbering / regulatory designator as part of the "
+    "title (e.g. '1.2 Scope', 'Subpart A - General', 'AMC1 ORO.GEN.200').\n"
+    "- 'page' is the page number printed next to the entry; use null when the "
+    "entry has none. Never invent a page number.\n"
+    "- Repair obvious extraction damage (a title split over two lines is ONE "
+    "entry), but never invent entries that are not in the text.\n"
+    "- Do NOT include the words 'Table of Contents'/'Contents' themselves, "
+    "running headers/footers, document or revision identifiers, or page "
+    "numbers on their own.\n"
+    "- If the text is not a table of contents at all, return an empty list.\n\n"
+
+    "### Strict Formatting Instructions:\n"
+    "- DO NOT use markdown code blocks (no ```).\n"
+    "- DO NOT include commentary, explanations or variable names.\n"
+    "- Output Format: your response must be ONLY a valid JSON array of "
+    "objects, each with exactly the keys \"title\" and \"page\".\n"
+    "- Example of desired output: "
+    "[{\"title\": \"1. Scope\", \"page\": 4}, "
+    "{\"title\": \"2. Applicability\", \"page\": 7}]"
 )
 
 
@@ -413,6 +484,554 @@ def toc_from_pdf(pdf_path, max_scan_pages=20):
             pass
 
 
+# ------------------------------------------- toc from the extracted tables -- #
+def toc_is_usable(entries, source=None):
+    """Whether a parsed TOC is solid enough to be *the* section reference.
+
+    Page numbers are what separates a real contents list from a handful of
+    dot-leader fragments, so they are required — except for sources that are
+    structural rather than parsed (the PDF's own bookmarks) or that have
+    already reconstructed the list (the LLM pass), where a contents list
+    without printed page numbers is still a contents list."""
+    entries = entries or []
+    if len(entries) < MIN_TOC_ENTRIES:
+        return False
+    if str(source or "") in ("pdf-bookmarks", "llm"):
+        return True
+    with_pages = [e for e in entries if e.get("page") is not None]
+    return len(with_pages) >= MIN_TOC_ENTRIES
+
+
+def toc_pages_from_chunks(chunks, toc=None, max_page=MAX_TOC_SCAN_PAGE):
+    """The document pages the printed Table of Contents sits on, worked out
+    from the chunks — which is what makes it possible to go and look at the
+    **tables** that were extracted from exactly those pages.
+
+    Two signals: the pages of the chunks :func:`find_toc` identified as the
+    contents run, and the pages of chunks Docling labelled ``document_index``.
+    The label alone is not trusted deep into a document (a back-of-book index
+    carries it too), so without an announced contents run only the first
+    ``max_page`` pages are considered."""
+    chunk_list = list(chunks or [])
+    if not chunk_list:
+        return []
+    toc = toc if toc is not None else find_toc(chunk_list)
+
+    pages = set()
+    for i in toc.get("chunk_indices") or []:
+        if 0 <= i < len(chunk_list):
+            pages.update(p for p in chunk_pages(chunk_list[i]) if p is not None)
+
+    labelled = set()
+    for chunk in chunk_list:
+        labels = chunk_labels(chunk)
+        if labels and any(lbl in INDEX_LABELS for lbl in labels):
+            labelled.update(p for p in chunk_pages(chunk) if p is not None)
+    if pages:
+        # Keep only index pages that continue the announced contents run.
+        low, high = min(pages), max(pages)
+        pages.update(p for p in labelled if low - 1 <= p <= high + 2)
+    else:
+        pages.update(p for p in labelled
+                     if isinstance(p, int) and p <= max_page)
+    return sorted(p for p in pages if p is not None)
+
+
+def _rows_from_workbook(path):
+    """Rows of a saved table file (the .xlsx the extractor writes, or a CSV).
+    Used when the cache entry carries no inline ``data``."""
+    if not path or not os.path.exists(str(path)):
+        return []
+    try:
+        import pandas as pd          # heavy; only needed for this fallback
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        if str(path).lower().endswith((".xlsx", ".xlsm", ".xls")):
+            frame = pd.read_excel(path, header=None, dtype=str)
+        else:
+            frame = pd.read_csv(path, header=None, dtype=str)
+    except Exception:  # noqa: BLE001
+        return []
+    return [["" if value is None else str(value) for value in row]
+            for row in frame.values.tolist()]
+
+
+def table_rows(table):
+    """The rows of an extracted table as lists of strings.
+
+    Reads the ``data`` records the extractor cached (``df.to_dict('records')``)
+    and falls back to the saved workbook. The column names are offered as a
+    first row too — but only when they read as a contents entry *with a page
+    number*: that is how a first data line that got promoted into the header
+    ('1. Scope | 4') is told apart from a genuine header line ('Section |
+    Title') or from positional column indices."""
+    if not isinstance(table, dict):
+        return []
+    rows = []
+    records = table.get("data")
+    if isinstance(records, list) and records:
+        first = next((r for r in records if isinstance(r, dict)), None)
+        if first is not None:
+            header = [str(key) for key in first.keys()]
+            entry = toc_entry_from_cells(header)
+            if entry and entry.get("page") is not None:
+                rows.append(header)
+            for record in records:
+                if isinstance(record, dict):
+                    rows.append(["" if v is None else str(v)
+                                 for v in record.values()])
+        else:
+            for record in records:
+                if isinstance(record, (list, tuple)):
+                    rows.append(["" if v is None else str(v) for v in record])
+                elif record is not None:
+                    rows.append([str(record)])
+    if rows:
+        return rows
+    return _rows_from_workbook(table.get("csv_path") or table.get("path")
+                               or table.get("table_path"))
+
+
+def _clean_cell(value):
+    """A table cell as comparable text; empties and pandas NaNs drop out."""
+    text = re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
+    return "" if text.lower() in ("", "nan", "none", "null", "-", "—") else text
+
+
+def _page_from_cell(value):
+    """The page number a cell holds, or None — tolerates '14.', 'p. 14'."""
+    text = _clean_cell(value)
+    if not text:
+        return None
+    text = re.sub(r"^(page|p\.?|pg\.?|seite)\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip(" .·•_-")
+    return int(text) if re.fullmatch(r"\d{1,4}", text) else None
+
+
+def toc_entry_from_cells(cells):
+    """One Table-of-Contents entry from one table row, or None.
+
+    Handles the layouts a contents table actually comes in: ``['1.2 Scope',
+    '14']``, ``['1.2', 'Scope', '14']`` and the single-cell ``'1.2 Scope
+    ......... 14'``. The last cell is the page when it is a bare number;
+    everything before it is the title.
+
+    A row that fills several columns must carry a page number — that is what
+    tells a real entry apart from a header line like ``['Section', 'Title']``.
+    A row with only one filled cell may go without one, because that is how a
+    spanning group row ('PART A — GENERAL') and a wrapped line look. Every
+    title has to contain a letter, so column indices and stray numbers never
+    become sections."""
+    cells = [_clean_cell(c) for c in (cells or [])]
+    cells = [c for c in cells if c]
+    if not cells:
+        return None
+
+    if len(cells) == 1:
+        match = _TOC_ENTRY_RE.match(cells[0])
+        if match:
+            title, page = match.group("title"), int(match.group("page"))
+        elif is_numbered_heading(cells[0]) and len(cells[0]) <= 200:
+            title, page = cells[0], None
+        else:
+            return None
+    else:
+        page = _page_from_cell(cells[-1])
+        if page is not None:
+            title = " ".join(cells[:-1])
+        else:
+            # The page can still be glued to the title with dot leaders.
+            match = _TOC_ENTRY_RE.match(" ".join(cells))
+            if not match:
+                return None
+            title, page = match.group("title"), int(match.group("page"))
+
+    title = title.strip(" .·•_-\t")
+    if not title or _TOC_TITLE_RE.match(title):
+        return None
+    if not re.search(r"[A-Za-z]", title):
+        return None
+    return {"title": title, "page": page}
+
+
+def table_looks_like_toc(rows, min_entries=MIN_TOC_ENTRIES):
+    """Did this table extract cleanly enough to be used as the contents?
+
+    Returns ``(ok, entries, note)``. Three things have to hold, and the note
+    says which one failed so the reviewer is told *why* a contents table was
+    rejected instead of it silently not being used:
+
+    1. enough rows turn into a title with a page number, and they are the
+       majority of the rows — a table Docling shredded fails here;
+    2. the page numbers run forwards — a contents list always does, a table
+       of unrelated numbers does not;
+    3. the titles read like titles rather than like measurements."""
+    rows = list(rows or [])
+    entries, non_empty = [], 0
+    for row in rows:
+        if not any(_clean_cell(c) for c in row):
+            continue
+        non_empty += 1
+        entry = toc_entry_from_cells(row)
+        if entry:
+            entries.append(entry)
+    with_pages = [e for e in entries if e["page"] is not None]
+
+    if not non_empty:
+        return False, entries, "the table is empty"
+    if len(with_pages) < min_entries:
+        return False, entries, (f"only {len(with_pages)} of {non_empty} row(s) "
+                                "gave a title with a page number — the table "
+                                "did not extract cleanly")
+    ratio = len(with_pages) / float(non_empty)
+    if ratio < MIN_TOC_TABLE_ROW_RATIO:
+        return False, entries, (f"only {round(100 * ratio)}% of the rows gave a "
+                                "title with a page number — the table did not "
+                                "extract cleanly")
+    pages = [e["page"] for e in with_pages]
+    pairs = len(pages) - 1
+    if pairs > 0:
+        forward = sum(1 for a, b in zip(pages, pages[1:]) if b >= a)
+        if forward / float(pairs) < MIN_TOC_TABLE_ORDER_RATIO:
+            return False, entries, ("the page numbers do not run forwards — "
+                                    "this is not a contents table")
+    titled = sum(1 for e in with_pages
+                 if re.search(r"[A-Za-z]", e["title"]) and len(e["title"]) >= 4)
+    if titled < 0.5 * len(with_pages):
+        return False, entries, ("the first column does not read like section "
+                                "titles — this is not a contents table")
+    return True, entries, (f"{len(with_pages)} entries from {non_empty} rows")
+
+
+def toc_from_tables(tables, pages=None, max_page=MAX_TOC_SCAN_PAGE):
+    """The Table of Contents read from the **extracted tables**.
+
+    Regulatory documents very often typeset their contents as a table, and
+    Docling then hands it over as a table rather than as text — which is why
+    the text-level parsers above come back empty on exactly the documents
+    that have the tidiest contents list. ``pages`` are the contents pages
+    worked out by :func:`toc_pages_from_chunks`; without them only tables on
+    the first ``max_page`` pages are looked at.
+
+    Returns ``{"entries": [...], "source": "tables"|None, "tables": [report]}``
+    where the report says, per table, whether it was used and why not."""
+    report, collected = [], []
+    wanted = {int(p) for p in (pages or []) if isinstance(p, int)}
+    for i, table in enumerate(tables or []):
+        if not isinstance(table, dict):
+            continue
+        raw_page = table.get("page_no")
+        try:
+            page_no = int(raw_page)
+        except (TypeError, ValueError):
+            page_no = None
+        if wanted:
+            if page_no not in wanted:
+                continue
+        elif page_no is None or page_no > max_page:
+            continue
+
+        rows = table_rows(table)
+        if not rows:
+            report.append({"table_index": table.get("table_index", i),
+                           "page_no": raw_page, "used": False, "entries": 0,
+                           "note": "the table holds no readable rows"})
+            continue
+        ok, entries, note = table_looks_like_toc(rows)
+        report.append({"table_index": table.get("table_index", i),
+                       "page_no": raw_page, "used": ok,
+                       "entries": sum(1 for e in entries
+                                      if e["page"] is not None),
+                       "note": note,
+                       "path": table.get("csv_path")})
+        if ok:
+            collected.extend(entries)
+
+    unique, seen = [], set()
+    for entry in collected:
+        key = normalize_heading(entry["title"])
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(entry)
+    return {"entries": unique, "source": "tables" if unique else None,
+            "tables": report}
+
+
+# ---------------------------------------------------------- toc from an llm -- #
+def _as_page(value):
+    """A TOC page number from whatever the LLM put in the field."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if 0 < value < 10000 else None
+    text = str(value).strip()
+    return int(text) if re.fullmatch(r"\d{1,4}", text) else None
+
+
+def parse_llm_toc(text):
+    """Pull TOC entries out of an LLM reply: a JSON array of
+    ``{"title", "page"}`` objects (what the prompt asks for), a Python list
+    literal, or a plain list of contents lines — all three are accepted so a
+    model that ignores the format instruction is still usable."""
+    raw = str(text or "")
+    match = re.search(r"(\[.*\])", raw, re.DOTALL)
+    candidate = match.group(1).strip() if match else raw.strip()
+    value = None
+    try:
+        value = json.loads(candidate)
+    except Exception:  # noqa: BLE001
+        try:
+            value = ast.literal_eval(candidate)
+        except (ValueError, SyntaxError):
+            value = None
+    if not isinstance(value, (list, tuple)):
+        # Not a list at all: fall back to reading the reply as contents lines.
+        return parse_toc_entries(raw)
+
+    entries = []
+    for item in value:
+        if isinstance(item, dict):
+            title = ""
+            for key in ("title", "heading", "section", "name", "entry"):
+                if str(item.get(key) or "").strip():
+                    title = str(item[key]).strip()
+                    break
+            if not title:
+                continue
+            page = None
+            for key in ("page", "page_no", "page_number", "pageNo"):
+                if key in item:
+                    page = _as_page(item.get(key))
+                    if page is not None:
+                        break
+            title = title.strip(" .·•_-\t")
+            if title and not _TOC_TITLE_RE.match(title):
+                entries.append({"title": title, "page": page})
+        elif isinstance(item, str) and item.strip():
+            parsed = parse_toc_entries(item)
+            if parsed:
+                entries.extend(parsed)
+            else:
+                title = item.strip().strip(" .·•_-\t")
+                if title and not _TOC_TITLE_RE.match(title):
+                    entries.append({"title": title, "page": None})
+    return entries
+
+
+def toc_chunk_text(chunks, toc=None, max_chars=MAX_TOC_LLM_CHARS):
+    """The raw text of the chunks that look like the contents — what the LLM
+    is asked to reconstruct the TOC from.
+
+    Everything sitting on a contents page is taken, not only the chunks
+    :func:`find_toc` managed to string together: the run detection stops at
+    the first chunk that no longer parses as TOC lines, which on a badly
+    extracted contents page is the second chunk — exactly the case this stage
+    exists for. Falls back to the opening chunks of the document, since a
+    contents list is always at the front."""
+    chunk_list = list(chunks or [])
+    if not chunk_list:
+        return ""
+    toc = toc if toc is not None else find_toc(chunk_list)
+
+    picked = set(i for i in (toc.get("chunk_indices") or [])
+                 if 0 <= i < len(chunk_list))
+    pages = set(toc_pages_from_chunks(chunk_list, toc=toc))
+    for i, chunk in enumerate(chunk_list):
+        if any(lbl in INDEX_LABELS for lbl in chunk_labels(chunk)):
+            picked.add(i)
+        elif pages and pages.intersection(chunk_pages(chunk)):
+            picked.add(i)
+    if not picked:
+        picked = set(range(min(20, len(chunk_list))))
+
+    out, size = [], 0
+    for i in sorted(picked):
+        text = chunk_text(chunk_list[i]).strip()
+        if not text:
+            continue
+        out.append(text)
+        size += len(text) + 2
+        if size >= max_chars:
+            break
+    return "\n\n".join(out)[:max_chars]
+
+
+def toc_from_llm(chunks, llm, toc=None, log=None):
+    """Last resort: hand the contents text to the LLM and let it reconstruct
+    the Table of Contents. Never raises — a failing model just returns no
+    entries and the caller carries on with the heading-based refinement."""
+    if not llm:
+        return {"entries": [], "source": None,
+                "note": "no LLM available for the TOC pass"}
+    text = toc_chunk_text(chunks, toc=toc)
+    if not text.strip():
+        return {"entries": [], "source": None,
+                "note": "no contents text to send"}
+    if log:
+        log(f"No Table of Contents from the PDF, the chunks or the extracted "
+            f"tables — asking the LLM to read it out of {len(text)} "
+            "characters of contents text.")
+    try:
+        reply = llm(f"Contents text:\n{text}", SYSTEM_PROMPT_TOC_EXTRACTOR)
+    except Exception as exc:  # noqa: BLE001 - never break the triage
+        if log:
+            log(f"[WARN] LLM TOC extraction failed ({exc}).")
+        return {"entries": [], "source": None, "note": f"LLM failed: {exc}"}
+    entries = parse_llm_toc(reply)
+    unique, seen = [], set()
+    for entry in entries:
+        key = normalize_heading(entry["title"])
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(entry)
+    return {"entries": unique, "source": "llm" if unique else None,
+            "note": f"{len(unique)} entries reconstructed by the LLM"}
+
+
+# ------------------------------------------------------------ toc cascade -- #
+TOC_SOURCE_LABEL = {
+    "pdf-bookmarks": "the PDF's embedded outline (bookmarks)",
+    "pdf-text": "the printed TOC parsed from the PDF page text",
+    "chunks": "the TOC reassembled from the Docling chunks",
+    "tables": "an extracted table on the contents pages",
+    "llm": "the LLM reading the contents pages",
+}
+
+
+def resolve_toc(pdf_path=None, chunks=None, tables=None, llm=None, log=None,
+                use_llm=True):
+    """The document's Table of Contents, from the first source that yields a
+    usable one — this is the single place the cascade is defined, so the
+    triage and the *View TOC* button always agree.
+
+    Order: the PDF's bookmarks, the printed TOC in the PDF text, the TOC
+    reassembled from the chunks, an extracted **table** sitting on the
+    contents pages, and finally the LLM asked to read the contents text.
+
+    Returns the usual TOC dict — ``entries``, ``source`` and the
+    ``chunk_indices`` of the chunks that ARE the printed contents (so they
+    can be skipped) — plus ``note``, ``attempts`` (what every stage produced,
+    for the log and the TOC viewer) and ``tables`` (per-table report of the
+    table stage). When nothing is usable the richest partial result is
+    returned, so the caller can still say 'a TOC was detected but it did not
+    parse'."""
+    chunk_list = list(chunks or [])
+    chunk_toc = (find_toc(chunk_list) if chunk_list
+                 else {"entries": [], "chunk_indices": []})
+    chunk_indices = chunk_toc.get("chunk_indices") or []
+    attempts, candidates = [], []
+
+    def _stage(source, entries, note="", skipped=False):
+        """Record one stage and say whether it settled the question."""
+        entries = list(entries or [])
+        usable = bool(entries) and toc_is_usable(entries, source)
+        attempts.append({
+            "source": source,
+            "label": TOC_SOURCE_LABEL.get(source, source),
+            "entries": len(entries),
+            "with_pages": sum(1 for e in entries
+                              if e.get("page") is not None),
+            "usable": usable,
+            "skipped": bool(skipped),
+            "note": note,
+        })
+        if entries:
+            candidates.append((source, entries))
+        return usable
+
+    def _log(msg):
+        if log:
+            log(msg)
+
+    # a/b — the PDF itself.
+    pdf_toc = toc_from_pdf(pdf_path) if pdf_path else {"entries": [],
+                                                       "source": None}
+    pdf_source = pdf_toc.get("source") or "pdf-text"
+    if _stage(pdf_source, pdf_toc.get("entries"),
+              "" if pdf_path else "no PDF given", skipped=not pdf_path):
+        _log(f"Table of Contents read from {TOC_SOURCE_LABEL.get(pdf_source, pdf_source)} "
+             f"({len(pdf_toc['entries'])} entries) — chunk headings are "
+             "verified against it.")
+        return {"entries": pdf_toc["entries"], "chunk_indices": chunk_indices,
+                "source": pdf_source, "note": "read from the PDF",
+                "attempts": attempts, "tables": []}
+
+    # c — the chunks.
+    if _stage("chunks", chunk_toc.get("entries"),
+              "" if chunk_list else "no chunks given",
+              skipped=not chunk_list):
+        _log(f"Table of Contents reassembled from the chunks "
+             f"({len(chunk_toc['entries'])} entries).")
+        return {"entries": chunk_toc["entries"],
+                "chunk_indices": chunk_indices, "source": "chunks",
+                "note": "reassembled from the chunks", "attempts": attempts,
+                "tables": []}
+
+    # d — an extracted table on the contents pages.
+    toc_pages = toc_pages_from_chunks(chunk_list, toc=chunk_toc)
+    table_toc = {"entries": [], "tables": []}
+    if tables:
+        table_toc = toc_from_tables(tables, pages=toc_pages)
+        note = (f"contents pages {toc_pages}" if toc_pages
+                else f"no contents page identified — scanned tables on the "
+                     f"first {MAX_TOC_SCAN_PAGE} pages")
+        used = [t for t in table_toc["tables"] if t.get("used")]
+        rejected = [t for t in table_toc["tables"] if not t.get("used")]
+        if rejected:
+            note += "; rejected: " + "; ".join(
+                f"table {t['table_index']} on page {t['page_no']} "
+                f"({t['note']})" for t in rejected[:4])
+        settled = _stage("tables", table_toc["entries"], note)
+        for t in used:
+            _log(f"Contents table accepted: table {t['table_index']} on page "
+                 f"{t['page_no']} — {t['note']}.")
+        for t in rejected:
+            _log(f"Contents table rejected: table {t['table_index']} on page "
+                 f"{t['page_no']} — {t['note']}.")
+    else:
+        settled = _stage("tables", [], "no extracted tables available",
+                         skipped=True)
+    if settled:
+        _log(f"Table of Contents read from an extracted table on the contents "
+             f"pages ({len(table_toc['entries'])} entries).")
+        return {"entries": table_toc["entries"],
+                "chunk_indices": chunk_indices, "source": "tables",
+                "note": (f"from the table(s) on page(s) "
+                         f"{toc_pages or 'scanned at the front'}"),
+                "attempts": attempts, "tables": table_toc["tables"]}
+
+    # e — the LLM.
+    llm_toc = {"entries": [], "note": ""}
+    if use_llm and llm and chunk_list:
+        llm_toc = toc_from_llm(chunk_list, llm, toc=chunk_toc, log=log)
+        settled = _stage("llm", llm_toc.get("entries"),
+                         llm_toc.get("note", ""))
+    else:
+        settled = _stage("llm", [],
+                         "no LLM selected" if not llm else "no chunks given",
+                         skipped=True)
+    if settled:
+        _log(f"Table of Contents reconstructed by the LLM "
+             f"({len(llm_toc['entries'])} entries).")
+        return {"entries": llm_toc["entries"], "chunk_indices": chunk_indices,
+                "source": "llm", "note": "reconstructed by the LLM",
+                "attempts": attempts, "tables": table_toc.get("tables") or []}
+
+    # Nothing usable: hand back the richest partial so the caller can report
+    # 'a TOC was detected but it did not parse' and fall back to headings.
+    best_source, best_entries = "", []
+    for source, entries in candidates:
+        if len(entries) > len(best_entries):
+            best_source, best_entries = source, entries
+    _log("No usable Table of Contents from the PDF, the chunks, the extracted "
+         "tables or the LLM — the heading list is validated instead.")
+    return {"entries": best_entries, "chunk_indices": chunk_indices,
+            "source": best_source or None,
+            "note": "no usable Table of Contents", "attempts": attempts,
+            "tables": table_toc.get("tables") or []}
+
+
 # ------------------------------------------------------ heading refinement -- #
 def parse_llm_list(text):
     """Pull a Python list of strings out of an LLM reply (alr's
@@ -464,13 +1083,13 @@ def refine_headings(headings, toc=None, llm=None, log=None):
             log(msg)
 
     toc_entries = (toc or {}).get("entries") or []
-    with_pages = [e for e in toc_entries if e.get("page") is not None]
+    toc_source = (toc or {}).get("source")
     # Only trust the TOC when it parsed into a real list of entries — a couple
     # of dot-leader fragments are a mangled TOC, not a section reference.
-    if len(toc_entries) >= MIN_TOC_ENTRIES and len(with_pages) >= MIN_TOC_ENTRIES:
+    if toc_is_usable(toc_entries, toc_source):
         valid = [e["title"] for e in toc_entries]
         _log(f"Table of Contents found: {len(valid)} entries — using it as "
-             "the section reference (no LLM call needed).")
+             "the section reference (no LLM heading check needed).")
         return {"valid": valid, "source": "toc",
                 "note": f"{len(valid)} TOC entries"}
     if toc_entries:
@@ -658,29 +1277,25 @@ def triage_summary(proposals):
     }
 
 
-def analyze_chunks(chunks, llm=None, log=None, pdf_path=None):
-    """Run the whole triage: headings → TOC → refinement → per-chunk
-    proposals. Returns ``{proposals, summary, toc, refinement, headings}``.
+def analyze_chunks(chunks, llm=None, log=None, pdf_path=None, tables=None,
+                   toc=None):
+    """Run the whole triage: TOC → heading refinement → per-chunk proposals.
+    Returns ``{proposals, summary, toc, refinement, headings}``.
 
-    With ``pdf_path`` the Table of Contents is read from the **PDF itself**
-    first (embedded outline, else the printed TOC text) and the chunk
-    headings are verified against it; only a PDF without any usable TOC
-    falls back to the chunk-level TOC detection and then the LLM heading
-    check."""
+    The Table of Contents is resolved by :func:`resolve_toc`, which tries, in
+    order: the PDF's embedded outline, the printed TOC in the PDF text, the
+    TOC reassembled from the chunks, an extracted **table** on the contents
+    pages (``tables`` — the extractor's table records from the cache), and
+    finally the LLM reading the contents text. Only a document that offers no
+    Table of Contents at all falls through to the LLM heading check.
+
+    ``toc`` short-circuits the cascade with an already-resolved TOC (the UI
+    passes the one the reviewer looked at, so nothing is read twice)."""
     chunks = list(chunks)
     headings = collect_headings(chunks)
-    toc = find_toc(chunks)          # chunk-level: entries + pages to skip
-    pdf_toc = toc_from_pdf(pdf_path)
-    if pdf_toc["entries"]:
-        # The PDF's own TOC is authoritative; the chunk-level detection
-        # still tells us which chunks ARE the printed TOC (to skip them).
-        toc = {"entries": pdf_toc["entries"],
-               "chunk_indices": toc.get("chunk_indices") or [],
-               "source": pdf_toc["source"]}
-        if log:
-            log(f"Table of Contents read from the PDF "
-                f"({pdf_toc['source']}, {len(pdf_toc['entries'])} entries) — "
-                "chunk headings are verified against it.")
+    if toc is None:
+        toc = resolve_toc(pdf_path=pdf_path, chunks=chunks, tables=tables,
+                          llm=llm, log=log)
     refinement = refine_headings(headings, toc=toc, llm=llm, log=log)
     if refinement["source"] == "toc" and toc.get("source"):
         refinement["note"] += f" ({toc['source']})"

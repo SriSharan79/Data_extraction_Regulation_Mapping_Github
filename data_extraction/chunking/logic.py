@@ -71,11 +71,13 @@ class ExtractionLauncherUI:
         ttk.Button(frame_src, text="Browse...",
                    command=self.browse_storage).grid(row=2, column=2)
 
-        # LLM used by the triage's heading validation (only needed when the
-        # document has no usable Table of Contents). Populated by a
-        # background probe: a service appears ONLY when its API key is
+        # LLM used by the triage as the LAST resort: it is asked to read the
+        # Table of Contents out of the contents pages only when the PDF, the
+        # chunks and the extracted tables all fail to give one, and to
+        # validate the heading list when there is no TOC at all. Populated by
+        # a background probe: a service appears ONLY when its API key is
         # stored AND its live model list answers — BlaBla first.
-        ttk.Label(frame_src, text="LLM (heading check):").grid(row=3, column=0, sticky="w")
+        ttk.Label(frame_src, text="LLM (TOC / heading check):").grid(row=3, column=0, sticky="w")
         llm_row = ttk.Frame(frame_src)
         llm_row.grid(row=3, column=1, pady=(2, 0), sticky="w")
         self.llm_service = ttk.Combobox(llm_row, state="readonly", width=12,
@@ -105,8 +107,10 @@ class ExtractionLauncherUI:
             text=("Give a cache JSON to skip re-extraction (its storage must be "
                   "the folder the cache was generated with); with only a PDF, "
                   "Docling converts it first.\nThe chunks then appear below, "
-                  "pre-sorted against the document's Table of Contents (or a "
-                  "validated heading list) — review, adjust, Accept & save."),
+                  "pre-sorted against the document's Table of Contents — read "
+                  "from the PDF, else the chunks, else a contents table, else "
+                  "the LLM — or against a validated heading list.\nReview, "
+                  "adjust, Accept & save."),
             foreground="#666666",
             justify="left",
         ).grid(row=5, column=1, sticky="w", pady=(2, 0))
@@ -269,24 +273,79 @@ class ExtractionLauncherUI:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Open PDF", f"Could not open the PDF:\n{exc}")
 
+    def _cache_payload_for_toc(self):
+        """The cached extraction for the chosen document as
+        ``(chunks, tables)``, or ``([], [])`` when there is none.
+
+        The chunk-, table- and LLM-based TOC fallbacks all need the
+        extraction; without a cache the TOC viewer can only read the PDF
+        itself. Looked for in the cache JSON the user picked, then in the
+        cache this document+storage would have written."""
+        candidates = []
+        cache_path = self.entry_cache.get().strip()
+        if cache_path:
+            candidates.append(cache_path)
+        pdf_path = self.entry_pdf.get().strip()
+        storage = self.entry_store.get().strip()
+        if pdf_path and storage:
+            try:
+                candidates.append(self.resolve_directory_structure(
+                    storage, pdf_path)["cache_file"])
+            except Exception:  # noqa: BLE001 - a bad path is just no cache
+                pass
+        for path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            except Exception:  # noqa: BLE001 - a broken cache is skipped
+                continue
+            if isinstance(payload, dict):
+                return (payload.get("chunks") or [],
+                        payload.get("tables") or [])
+            if isinstance(payload, list):
+                return payload, []
+        return [], []
+
     def show_pdf_toc(self):
-        """Show the Table of Contents the triage would read from the chosen
-        PDF via PyMuPDF (embedded outline, else the printed TOC text) —
-        exactly the section reference the chunk headings get verified
-        against. Read in the background; a PDF without one gets the
-        fallback explanation instead."""
+        """Show the Table of Contents the triage will actually use, resolved
+        through the whole cascade: the PDF's embedded outline, the printed
+        TOC in the PDF text, the TOC reassembled from the chunks, an
+        extracted table sitting on the contents pages, and finally the LLM
+        reading the contents pages.
+
+        The last three need an extraction, so the cache (the picked JSON, or
+        the one this document+storage wrote) is loaded when available.
+        Resolved in the background — the LLM stage only runs if every earlier
+        stage came back empty and a service is selected."""
         path = self.entry_pdf.get().strip()
-        if not path or not os.path.exists(path):
-            messagebox.showinfo("No PDF", "Pick an existing PDF file first.")
+        has_pdf = bool(path) and os.path.exists(path)
+        chunks, tables = self._cache_payload_for_toc()
+        if not has_pdf and not chunks:
+            messagebox.showinfo(
+                "Nothing to read",
+                "Pick an existing PDF file — or a cache JSON from an earlier "
+                "extraction — first.")
             return
-        self.status_label.config(text="Reading the TOC from the PDF…")
+
+        logger = logging.getLogger("ExtractionLauncher")
+        llm = self._selected_triage_llm(logger)
+        self.status_label.config(text="Resolving the Table of Contents…")
 
         def work():
+            lines = []
             try:
-                from .chunk_triage import toc_from_pdf
-                toc = toc_from_pdf(path)
+                from .chunk_triage import resolve_toc
+                toc = resolve_toc(pdf_path=path if has_pdf else None,
+                                  chunks=chunks, tables=tables, llm=llm,
+                                  log=lines.append)
             except Exception as exc:  # noqa: BLE001
-                toc = {"entries": [], "source": None, "error": str(exc)}
+                toc = {"entries": [], "source": None, "attempts": [],
+                       "error": str(exc)}
+            toc["log"] = lines
+            toc["counts"] = {"chunks": len(chunks), "tables": len(tables),
+                             "llm": bool(llm)}
             try:
                 self.root.after(0, lambda t=toc: self._show_toc_dialog(path, t))
             except (RuntimeError, tk.TclError):
@@ -295,34 +354,72 @@ class ExtractionLauncherUI:
         threading.Thread(target=work, daemon=True).start()
 
     def _show_toc_dialog(self, path, toc):
+        """The TOC viewer: which source won, what every stage produced (and
+        why a contents table was rejected), then the entries themselves."""
+        from .chunk_triage import TOC_SOURCE_LABEL
+
         self.status_label.config(text="")
         entries = toc.get("entries") or []
-        if not entries:
-            extra = (f"\n\n(error: {toc['error']})" if toc.get("error") else "")
-            messagebox.showinfo(
-                "No TOC in the PDF",
-                f"{os.path.basename(path)} has no usable Table of Contents "
-                "(no embedded outline, and no printed TOC parsed from the "
-                "first pages).\n\nThe triage will fall back to the "
-                "chunk-level TOC detection and then the LLM heading check."
-                + extra)
-            return
-        source = {"pdf-bookmarks": "embedded outline (bookmarks)",
-                  "pdf-text": "printed TOC parsed from the page text"}.get(
-            toc.get("source"), toc.get("source") or "?")
+        source = toc.get("source")
+        title = os.path.basename(path) if path else "the cached extraction"
+
         dlg = tk.Toplevel(self.root.winfo_toplevel())
-        dlg.title(f"TOC of {os.path.basename(path)}")
+        dlg.title(f"Table of Contents — {title}")
         dlg.transient(self.root.winfo_toplevel())
-        dlg.geometry("680x560")
+        dlg.geometry("760x640")
         frm = ttk.Frame(dlg, padding=10)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, font=("Arial", 10, "bold"),
-                  text=f"{len(entries)} entries — source: {source}").pack(anchor="w")
-        ttk.Label(frm, foreground="#666666", justify="left",
-                  text="This is the section reference the triage verifies the "
-                       "Docling chunk headings against\n(the LLM heading check "
-                       "only runs when a PDF offers no usable TOC).").pack(
-            anchor="w", pady=(2, 6))
+
+        if entries:
+            headline = (f"{len(entries)} entries — from "
+                        f"{TOC_SOURCE_LABEL.get(source, source or '?')}")
+        else:
+            headline = "No usable Table of Contents"
+        ttk.Label(frm, font=("Arial", 10, "bold"), text=headline).pack(
+            anchor="w")
+        ttk.Label(frm, foreground="#666666", justify="left", wraplength=720,
+                  text=("This is the section reference the triage verifies the "
+                        "Docling chunk headings against. Without one, the "
+                        "extracted heading list is validated instead (by the "
+                        "LLM when a service is selected, else by rules).")
+                  ).pack(anchor="w", pady=(2, 6))
+
+        # -- what each stage of the cascade produced ------------------------
+        attempts = toc.get("attempts") or []
+        if attempts or toc.get("error"):
+            box = ttk.LabelFrame(frm, text=" How this was resolved ",
+                                 padding=6)
+            box.pack(fill="x", pady=(0, 8))
+            for att in attempts:
+                if att.get("usable"):
+                    mark, colour = "✓", "#1f7a1f"
+                elif att.get("skipped"):
+                    mark, colour = "–", "#888888"
+                else:
+                    mark, colour = "✗", "#b00020"
+                detail = f"{att.get('entries', 0)} entries"
+                if att.get("entries"):
+                    detail += f" ({att.get('with_pages', 0)} with a page)"
+                if att.get("note"):
+                    detail += f" — {att['note']}"
+                ttk.Label(box, foreground=colour, justify="left",
+                          wraplength=700,
+                          text=f"{mark}  {att.get('label', att.get('source'))}"
+                               f": {detail}").pack(anchor="w")
+            counts = toc.get("counts") or {}
+            if counts:
+                ttk.Label(box, foreground="#666666",
+                          text=(f"(from {counts.get('chunks', 0)} cached "
+                                f"chunks and {counts.get('tables', 0)} "
+                                f"extracted tables; LLM "
+                                f"{'selected' if counts.get('llm') else 'not selected'})")
+                          ).pack(anchor="w", pady=(4, 0))
+            if toc.get("error"):
+                ttk.Label(box, foreground="#b00020", wraplength=700,
+                          justify="left",
+                          text=f"error: {toc['error']}").pack(anchor="w")
+
+        # -- the entries ----------------------------------------------------
         wrap = ttk.Frame(frm)
         wrap.pack(fill="both", expand=True)
         box = tk.Text(wrap, wrap="none", font=("Consolas", 11))
@@ -330,11 +427,26 @@ class ExtractionLauncherUI:
         box.configure(yscrollcommand=vsb.set)
         box.pack(side="left", fill="both", expand=True)
         vsb.pack(side="left", fill="y")
-        for entry in entries:
-            indent = "    " * max(0, int(entry.get("level") or 1) - 1)
-            page = entry.get("page")
-            box.insert("end", f"{('p.' + str(page)).rjust(7) if page is not None else '      —'}"
-                              f"  {indent}{entry['title']}\n")
+        if entries:
+            for entry in entries:
+                indent = "    " * max(0, int(entry.get("level") or 1) - 1)
+                page = entry.get("page")
+                stamp = (("p." + str(page)).rjust(7) if page is not None
+                         else "      —")
+                box.insert("end", f"{stamp}  {indent}{entry['title']}\n")
+        else:
+            box.insert("end",
+                       "No Table of Contents could be resolved.\n\n"
+                       "The lines above say what each stage found. The usual "
+                       "reasons:\n"
+                       "  • the PDF carries no bookmarks and no printed "
+                       "contents page;\n"
+                       "  • the contents pages have not been extracted yet — "
+                       "run the extraction first;\n"
+                       "  • the contents table did not extract cleanly (the "
+                       "note above says so);\n"
+                       "  • no LLM service is selected for the last-resort "
+                       "pass.\n")
         box.configure(state="disabled")
         ttk.Button(frm, text="Close", command=dlg.destroy).pack(anchor="e",
                                                                 pady=(6, 0))
@@ -477,14 +589,18 @@ class ExtractionLauncherUI:
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     payload = json.load(f)
-                chunks_data = payload.get("chunks", []) if isinstance(payload, dict) else payload
+                is_dict = isinstance(payload, dict)
+                chunks_data = payload.get("chunks", []) if is_dict else payload
+                # The extracted tables travel with the chunks: a contents
+                # table is one of the sources the TOC is resolved from.
+                tables_data = payload.get("tables", []) if is_dict else []
             except Exception as e:
                 messagebox.showerror("Cache Parsing Error", f"Failed to parse cache file:\n{e}")
                 return
             if not chunks_data:
                 messagebox.showerror("Data Error", "No chunks found in cache file.")
                 return
-            self._open_triage(chunks_data, paths, logger)
+            self._open_triage(chunks_data, paths, logger, tables=tables_data)
             return
 
         # -- PDF route: Docling conversion on a background thread ------------
@@ -534,12 +650,18 @@ class ExtractionLauncherUI:
                 return candidate, history
         return None, []
 
-    def _open_triage(self, chunks_data, paths, logger):
+    def _open_triage(self, chunks_data, paths, logger, tables=None):
         """Build the embedded triage review below the inputs. A previous
         review of this document+storage (if any) is pre-applied; accepting
-        with changes saves a NEW file, unchanged keeps the existing one."""
+        with changes saves a NEW file, unchanged keeps the existing one.
+
+        ``tables`` are the extractor's table records; they are read back from
+        the cache when not supplied, because a contents table is one of the
+        sources the Table of Contents is resolved from."""
         from .chunk_triage_ui import ChunkTriageApp
 
+        if tables is None:
+            tables = load_cached_tables(paths.get("cache_file"))
         prior_path, prior_history = self._find_prior_review(paths)
         if prior_path:
             self.status_label.config(
@@ -565,8 +687,10 @@ class ExtractionLauncherUI:
             version_on_change=True,
             destroy_on_accept=False,      # embedded: save and stay
             # with the PDF at hand the TOC is read from the PDF itself and
-            # the chunk headings are verified against it
+            # the chunk headings are verified against it; the tables let the
+            # cascade fall back to a contents table when it is not
             pdf_path=self.entry_pdf.get().strip() or None,
+            tables=tables,
         )
 
     def _open_section_review(self, saved_path=None):
@@ -611,6 +735,24 @@ class ExtractionLauncherUI:
                 json.dump(reg, f, indent=4, ensure_ascii=False)
         except Exception:
             pass
+
+
+def load_cached_tables(cache_file):
+    """The extractor's table records from a cache file, or ``[]``.
+
+    The triage needs them so a Table of Contents that was typeset as a table
+    (and therefore extracted as a table rather than as text) can still be
+    used as the section reference."""
+    if not cache_file or not os.path.exists(cache_file):
+        return []
+    try:
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except Exception:  # noqa: BLE001 - a broken cache just means no tables
+        return []
+    if isinstance(payload, dict):
+        return payload.get("tables") or []
+    return []
 
 
 def load_existing_progress_log(output_file_name, logger):
@@ -782,7 +924,7 @@ def _triage_llm(logger, service_code="b", model=None):
 
 
 def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file,
-                      logger, bulk=True):
+                      logger, bulk=True, tables=None, pdf_path=None):
     """
     Launch chunk review with automatic section review continuation.
     When chunk review completes, section review launches automatically.
@@ -791,6 +933,10 @@ def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file
     automatically against the document's Table of Contents (or an LLM-checked
     heading list) and only the uncertain ones need attention. Pass
     ``bulk=False`` for the original one-chunk-at-a-time tool.
+
+    ``tables`` (the extractor's table records) and ``pdf_path`` widen the TOC
+    cascade: with them the TOC can come from the PDF itself or from a
+    contents table, not only from the chunks.
     """
     def on_chunk_review_complete():
         """Callback when chunk review finishes - auto-launch section review."""
@@ -815,6 +961,8 @@ def launch_review_app(chunks_data, logged_chunks, processed_indices, output_file
             on_complete_callback=on_chunk_review_complete,
             llm=_triage_llm(logger),
             prior_history=logged_chunks,   # resume: earlier decisions pre-applied
+            pdf_path=pdf_path,
+            tables=tables,                 # lets a contents TABLE serve as the TOC
         )
     else:
         app = ChunkReviewApp(

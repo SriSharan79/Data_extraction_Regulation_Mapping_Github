@@ -35,9 +35,9 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from .chunk_triage import (analyze_chunks, build_output_payload,
-                           find_merge_target, headings_match,
-                           normalize_heading, triage_summary)
+from .chunk_triage import (TOC_SOURCE_LABEL, analyze_chunks,
+                           build_output_payload, find_merge_target,
+                           headings_match, normalize_heading, triage_summary)
 
 _ACTION_LABEL = {"log": "Keep", "skip": "Skip", "review": "Review",
                  "merge": "Merge ↑"}
@@ -56,13 +56,17 @@ class ChunkTriageApp:
     def __init__(self, root, chunks_data, output_file_name, logger,
                  on_complete_callback=None, llm=None, prior_history=None,
                  prior_path=None, version_on_change=False,
-                 destroy_on_accept=True, pdf_path=None):
+                 destroy_on_accept=True, pdf_path=None, tables=None):
         self.root = root
         self.chunks_data = list(chunks_data or [])
         # With the source PDF at hand the TOC is read from the PDF itself
         # (embedded outline / printed TOC text) and headings are verified
-        # against it — the LLM check only runs when the PDF offers none.
+        # against it. When the PDF offers none, the cascade carries on with
+        # the chunks, then with the tables extracted from the contents pages
+        # (``tables`` — the extractor's records from the cache), and only
+        # then asks the LLM.
         self.pdf_path = pdf_path
+        self.tables = list(tables or [])
         self.output_file_name = output_file_name
         self.logger = logger
         self.on_complete_callback = on_complete_callback
@@ -232,7 +236,8 @@ class ChunkTriageApp:
             try:
                 result = analyze_chunks(self.chunks_data, llm=self._llm,
                                         log=self._log,
-                                        pdf_path=self.pdf_path)
+                                        pdf_path=self.pdf_path,
+                                        tables=self.tables)
             except Exception as exc:  # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._triage_done(None, e))
             else:
@@ -262,6 +267,11 @@ class ChunkTriageApp:
         ref = result["refinement"]
         where = {"toc": "Table of Contents", "llm": "LLM heading check",
                  "rules": "rule-based"}.get(ref["source"], ref["source"])
+        if ref["source"] == "toc":
+            # Say WHICH of the five TOC sources the cascade settled on.
+            src = (result.get("toc") or {}).get("source")
+            where = ("Table of Contents — "
+                     + TOC_SOURCE_LABEL.get(src, src or "unknown source"))
         extra = ""
         if (result.get("toc") or {}).get("entries"):
             matched = sum(1 for p in self.proposals
