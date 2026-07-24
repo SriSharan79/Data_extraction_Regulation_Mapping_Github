@@ -232,6 +232,10 @@ def _excel_utils():
 class AIReviewMixin:
     """Complete AI Review page; see module docstring for the host contract."""
 
+    # Document type used when persisting AI-review rows to the workspace store;
+    # the EASA review app overrides this to "easa".
+    AI_DOC_TYPE = "pdf"
+
     def _init_ai_state(self):
         self._ai_batch = []           # queued (title, text) sections for looped AI runs
         self._ai_results = []         # accumulated free-form AI results for export
@@ -2074,6 +2078,9 @@ class AIReviewMixin:
                         self._ai_note_output(self._col_store_path)
                     self.status_var.set(done + ".")
                     self._ai_log(done + ".")
+                    # Persist the finished batch to the workspace SQLite store
+                    # (best-effort; never blocks the analysis).
+                    self._persist_ai_reviews_to_db()
                     # Rows were evaluated as they were saved; finish up.
                     self._col_eval_finish()
                     self._col_rerun = False
@@ -2219,6 +2226,44 @@ class AIReviewMixin:
                 cell.alignment = wrap
         wb.save(path)
         return ws.title
+
+    def _persist_ai_reviews_to_db(self):
+        """Best-effort: record the finished column-analysis batch (rows +
+        provenance + parsed entities) in the workspace SQLite store. The
+        workspace is the folder holding the storage workbook (or the loaded
+        document's folder). Never raises — a DB problem must not break the
+        analysis. Skipped when there are no rows or no workspace to key on."""
+        if not self._col_results:
+            return
+        try:
+            from data_extraction.db import facade
+        except Exception:  # noqa: BLE001 - DB layer optional
+            return
+        store_path = getattr(self, "_col_store_path", None)
+        json_path = getattr(self, "json_path", None)
+        base = store_path or json_path
+        if not base:
+            return
+        workspace = os.path.dirname(base)
+        doc_name = Path(json_path).stem if json_path else (
+            Path(store_path).stem if store_path else None)
+        entity_column = next((c for c in self._col_table_cols
+                              if _is_entity_column(c)), None)
+        label = self._llm_service_label()
+        model = get_selected_model(label)
+
+        def work():
+            ws = facade.open_workspace(workspace)
+            run_id = facade.persist_ai_reviews_for(
+                ws, source_path=json_path, doc_name=doc_name,
+                doc_type=self.AI_DOC_TYPE, rows=list(self._col_results),
+                mode="column", service_requested=label, model_requested=model,
+                entity_column=entity_column)
+            if run_id:
+                self._ai_log(f"Saved {len(self._col_results)} AI-review row(s) "
+                             f"to the workspace database (run {run_id}).")
+
+        facade.safe(work)
 
     def _col_save_row(self, row):
         """Write one finished section to the storage file immediately: the file

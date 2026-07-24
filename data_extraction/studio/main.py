@@ -23,6 +23,7 @@ class DataExtractionStudio(_BaseStudio):
         ("PDF Extraction & Review", "_build_extraction_tab"),
         ("Section Review", "_build_section_review_tab"),
         ("AI Review", "_build_chunk_ai_tab"),
+        ("Data & Analysis", "_build_data_analysis_tab"),
         ("PDF -> Markdown", "_build_markdown_tab"),
     ]
 

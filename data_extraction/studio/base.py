@@ -723,3 +723,7 @@ class _BaseStudio:
 
     def _build_markdown_tab(self, frame):
         _MarkdownTab(frame)
+
+    def _build_data_analysis_tab(self, frame):
+        from data_extraction.studio.data_analysis_tab import DataAnalysisTab
+        DataAnalysisTab(frame)

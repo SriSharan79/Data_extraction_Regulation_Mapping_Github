@@ -56,6 +56,11 @@ def main(src_path: str, storage_base: str, build_cosmograph: bool = False) -> li
         output_json = paths["output_json"]
         produced.append(output_json)
 
+        # Best-effort: record the document + its nodes in the workspace's
+        # SQLite store (the storage base is the workspace). Never fatal —
+        # a DB problem must not abort the extraction of the remaining files.
+        _persist_easa_to_db(zip_path, storage_base, output_json)
+
         if build_cosmograph:
             try:
                 export_to_cosmograph_csv(output_json)
@@ -64,6 +69,33 @@ def main(src_path: str, storage_base: str, build_cosmograph: bool = False) -> li
 
     print(f"\nDone. Produced {len(produced)} structured JSON file(s).")
     return produced
+
+
+def _persist_easa_to_db(zip_path: str, storage_base: str, output_json: str) -> None:
+    """Record one extracted EASA document + its hierarchy nodes in the
+    workspace SQLite store. Best-effort: any failure is printed and swallowed
+    so it never interrupts the extraction run."""
+    import json as _json
+    import os as _os
+
+    try:
+        from data_extraction.db import facade
+    except Exception as exc:  # noqa: BLE001 - DB layer optional
+        print(f"[db] SQL persistence unavailable: {exc}")
+        return
+    try:
+        if not output_json or not _os.path.exists(output_json):
+            return
+        with open(output_json, "r", encoding="utf-8") as f:
+            structured = _json.load(f)
+        ws = facade.open_workspace(storage_base)
+        doc_uuid = facade.persist_easa_document(
+            ws, source_path=zip_path, storage_root=_os.path.dirname(output_json),
+            structured_data=structured, review_path=output_json)
+        if doc_uuid:
+            print(f"[db] Recorded EASA document in workspace store (doc {doc_uuid}).")
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+        print(f"[db] Skipped DB persistence for {zip_path}: {exc}")
 
 
 if __name__ == "__main__":

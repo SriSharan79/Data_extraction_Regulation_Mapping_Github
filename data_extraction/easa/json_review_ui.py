@@ -42,6 +42,9 @@ def _open_externally(path: str):
 
 
 class EASAJsonReviewApp(AIReviewMixin):
+    # AI-review rows from this app persist as EASA documents.
+    AI_DOC_TYPE = "easa"
+
     def __init__(self, root, json_path: str = None, logger=None):
         self.root = root
         self.logger = logger

@@ -675,12 +675,19 @@ class ExtractionLauncherUI:
 
         for child in self.triage_host.winfo_children():
             child.destroy()
+        # Persist the reviewed document + sections to the workspace DB, then
+        # chain into Section Review. Persistence is best-effort — a DB problem
+        # never blocks the review (see facade.safe).
+        def on_saved(saved_path=None):
+            self._persist_pdf_review(saved_path, paths, logger)
+            self._open_section_review(saved_path)
+
         self.triage = ChunkTriageApp(
             root=self.triage_host,
             chunks_data=chunks_data,
             output_file_name=paths["output_file"],
             logger=logger,
-            on_complete_callback=self._open_section_review,
+            on_complete_callback=on_saved,
             llm=self._selected_triage_llm(logger),
             prior_history=prior_history,
             prior_path=prior_path,
@@ -692,6 +699,38 @@ class ExtractionLauncherUI:
             pdf_path=self.entry_pdf.get().strip() or None,
             tables=tables,
         )
+
+    def _persist_pdf_review(self, saved_path, paths, logger):
+        """Best-effort: record the reviewed document + its merged sections in
+        the workspace's SQLite store (the storage destination is the
+        workspace). Never raises — a DB problem must not break the review."""
+        try:
+            from data_extraction.db import facade
+        except Exception as exc:  # noqa: BLE001 - DB layer optional
+            logger.info(f"SQL persistence unavailable ({exc}).")
+            return
+        workspace = self.entry_store.get().strip()
+        path = saved_path or (self.triage.saved_path if self.triage else None)
+        if not workspace or not path or not os.path.exists(path):
+            return
+        source_path = (self.entry_pdf.get().strip()
+                       or self.entry_cache.get().strip() or None)
+
+        def work():
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            ws = facade.open_workspace(workspace)
+            doc_uuid = facade.persist_pdf_review(
+                ws, source_path=source_path, storage_root=paths.get("root"),
+                payload=payload, review_path=path,
+                doc_name=(os.path.splitext(os.path.basename(source_path))[0]
+                          if source_path else None),
+                logger=logger)
+            if doc_uuid:
+                logger.info(f"Review persisted to workspace DB (doc {doc_uuid}).")
+                self._persisted_doc = (workspace, doc_uuid)
+
+        facade.safe(work, logger)
 
     def _open_section_review(self, saved_path=None):
         """Chain into Section Review (modal window) on the file the triage

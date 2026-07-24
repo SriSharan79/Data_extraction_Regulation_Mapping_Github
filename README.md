@@ -363,11 +363,57 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
   `get_last_call_info()` reports which service/model actually answered the
   most recent call (and whether it was a fallback) for provenance records.
 
+### Data & Analysis
+`data_extraction/studio/data_analysis_tab.py`
+
+A read-across view of everything the extraction and AI-review flows persisted
+to SQLite (see *SQLite persistence* below), present in both studios. Open one
+workspace's database (or **Scan all workspaces** to list documents across every
+project from the global registry), pick a document, and browse its stored
+**Sections**, **AI Reviews** (with Service / Model / Fallback provenance) and
+**Entities**. The **Cross-document AI analysis** panel builds a corpus from the
+workspace's documents (all, or PDF-only / EASA-only), runs it through a gated
+LLM picker (BlaBla first), shows the answer, and stores it — *Past analyses…*
+lists everything recorded. Additive: it only reads what the other tabs wrote.
+
 ### PDF → Markdown
 `data_extraction/markdown/converter.py`
 
 Batch-converts PDFs to Markdown via **MarkItDown** (file or folder), one `.md`
 per PDF. Threaded with a live log.
+
+## SQLite persistence (`data_extraction/db/`)
+
+Alongside the JSON/Excel outputs, every extraction and AI review is also
+recorded in SQLite so the data can be reviewed in the tool and reused for
+downstream AI analysis. Persistence is **best-effort** — a database problem is
+logged and swallowed, never blocking a review or an extraction.
+
+Two tiers:
+
+- **Per-workspace data DB** — `<workspace>/extraction_index.db` holds the heavy
+  data: `documents`, `sections` (PDF merged headings *and* EASA hierarchy nodes,
+  flattened with parent/level), `ai_runs`, `ai_reviews` (with the
+  Service/Model/Fallback provenance kept in their own columns), `entities`
+  (parsed Specific-entities chains), and `analysis_results` (cross-document AI
+  analysis output). The *workspace* is the storage destination you already pick
+  for a run.
+- **Global registry DB** — `~/.data_extraction/registry.db` (override with
+  `DATA_EXTRACTION_HOME`) indexes which workspaces exist and mirrors each
+  document, so the tool can list everything across projects.
+
+The facade (`db/facade.py`) is the one entry point: `open_workspace(dir)` plus
+mappers `persist_pdf_review`, `persist_easa_document`, `persist_ai_reviews_for`.
+Migrations only ever ADD columns, and `upsert_document` preserves review/analysis
+columns with COALESCE, so re-extracting a document never wipes its review data.
+AI-review batches attach to the already-extracted document by name.
+
+**Cross-document analysis** (`db/analysis.py`): `run_cross_document_analysis`
+builds one corpus from many stored documents (size-guarded), asks an injected
+LLM a question, records the answer + provenance + scope in `analysis_results`,
+and returns it. The LLM is injected as a `llm(prompt, system_prompt)` callable
+(`default_llm('b'|'c'|'o', model)` builds one from `llm_call`), so it tests
+headless.
 
 ## How the launchers host the tools
 
