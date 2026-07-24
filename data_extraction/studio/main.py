@@ -19,13 +19,15 @@ class DataExtractionStudio(_BaseStudio):
 
     WINDOW_TITLE = "Data Extraction Studio"
     HEADER = "Data Extraction Studio — pick a tab to begin."
+    # NOTE: "Section Review" and "PDF -> Markdown" are intentionally not shown
+    # (Section Review is reachable inside the unified Extract & Review tab).
+    # Their tab builders remain on _BaseStudio, so re-adding a line here brings
+    # either tab back with no other change.
     TAB_SPECS = [
         ("Extract & Review", "_build_extract_review_tab"),
         ("PDF Extraction & Review", "_build_extraction_tab"),
-        ("Section Review", "_build_section_review_tab"),
         ("AI Review", "_build_chunk_ai_tab"),
         ("Data & Analysis", "_build_data_analysis_tab"),
-        ("PDF -> Markdown", "_build_markdown_tab"),
     ]
 
 
