@@ -554,6 +554,11 @@ class _BaseStudio:
     GEOMETRY = "1320x880"
     MINSIZE = (1000, 640)
     TAB_SPECS = []  # [(label, builder_method_name), ...] — set by subclasses
+    # Tabs that are always shown and cannot be closed. Every other tab starts
+    # hidden and is opened on demand from the "＋" tab (browser-style), and can
+    # be closed again (right-click the tab → Hide). Labels must match TAB_SPECS.
+    PINNED_TABS = ("Extract & Review", "Data & Analysis")
+    PLUS_LABEL = "  ＋  "
 
     def __init__(self, root):
         self.root = root
@@ -585,33 +590,133 @@ class _BaseStudio:
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self._tabs = []
+        # Build every tab's frame up front (still lazily *populated* on first
+        # view). Pinned tabs are shown now; the rest stay detached until opened
+        # from the "＋" tab. self._tabs maps the frame's widget id to its info.
+        self._tabs = {}
+        self._order = []                 # tab labels in TAB_SPECS order
         for label, builder_name in self.TAB_SPECS:
-            self._add_tab(label, getattr(self, builder_name))
+            frame = ttk.Frame(self.nb)
+            info = {"label": label, "frame": frame,
+                    "builder": getattr(self, builder_name), "built": False,
+                    "pinned": label in self.PINNED_TABS}
+            self._tabs[str(frame)] = info
+            self._order.append(label)
+            if info["pinned"]:
+                self.nb.add(frame, text=label)
+
+        # The "＋" tab acts as a button: selecting it opens a menu of the
+        # currently-hidden tabs and immediately bounces back to the real tab.
+        self._plus_frame = ttk.Frame(self.nb)
+        self.nb.add(self._plus_frame, text=self.PLUS_LABEL)
+        self._last_real_tab = None
 
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        # Right-click (or Control-click / middle-click on macOS) a closable tab
+        # to hide it again.
+        for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            self.nb.bind(seq, self._on_tab_right_click)
         # Build the initially-selected tab once the loop is running.
         self.root.after(50, self._on_tab_changed)
 
     # -- lazy tab machinery -------------------------------------------------- #
-    def _add_tab(self, title, builder):
-        frame = ttk.Frame(self.nb)
-        self.nb.add(frame, text=title)
-        self._tabs.append({"frame": frame, "builder": builder, "built": False})
+    def _info_for(self, tabid):
+        return self._tabs.get(str(tabid))
+
+    def _is_shown(self, label):
+        shown = set(self.nb.tabs())
+        return any(str(i["frame"]) in shown for i in self._tabs.values()
+                   if i["label"] == label)
 
     def _on_tab_changed(self, event=None):
         try:
-            idx = self.nb.index(self.nb.select())
+            current = self.nb.select()
         except tk.TclError:
             return
-        tab = self._tabs[idx]
-        if tab["built"]:
+        # The "＋" tab is a button, not a real page: bounce back to the last
+        # real tab and open the add-menu.
+        if current == str(self._plus_frame):
+            target = (self._last_real_tab
+                      if self._last_real_tab and self._last_real_tab in self.nb.tabs()
+                      else None)
+            if target is None:
+                # fall back to the first non-plus tab
+                for t in self.nb.tabs():
+                    if t != str(self._plus_frame):
+                        target = t
+                        break
+            if target is not None:
+                self.nb.select(target)
+            self.root.after(1, self._show_add_menu)
             return
-        tab["built"] = True
+
+        self._last_real_tab = current
+        info = self._info_for(current)
+        if info and not info["built"]:
+            info["built"] = True
+            try:
+                info["builder"](info["frame"])
+            except Exception as exc:  # noqa: BLE001 - render into the failing tab
+                self._render_error(info["frame"], exc)
+
+    # -- "＋" open / hide ---------------------------------------------------- #
+    def _show_add_menu(self):
+        """Popup listing every tab not currently shown; picking one opens it."""
+        menu = tk.Menu(self.nb, tearoff=0)
+        hidden = [lbl for lbl in self._order
+                  if lbl not in self.PINNED_TABS and not self._is_shown(lbl)]
+        if not hidden:
+            menu.add_command(label="All tabs are open", state="disabled")
+        else:
+            for lbl in hidden:
+                menu.add_command(label=lbl,
+                                 command=lambda l=lbl: self._show_tab(l))
         try:
-            tab["builder"](tab["frame"])
-        except Exception as exc:  # noqa: BLE001 - render into the failing tab
-            self._render_error(tab["frame"], exc)
+            menu.tk_popup(self.nb.winfo_pointerx(), self.nb.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _show_tab(self, label):
+        """Reveal a hidden tab just before the "＋" tab and select it."""
+        info = next((i for i in self._tabs.values() if i["label"] == label), None)
+        if info is None or self._is_shown(label):
+            return
+        plus_index = self.nb.index(self._plus_frame)
+        self.nb.insert(plus_index, info["frame"], text=label)
+        self.nb.select(info["frame"])   # triggers a lazy build via _on_tab_changed
+
+    def _on_tab_right_click(self, event):
+        try:
+            idx = self.nb.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return
+        try:
+            tabid = self.nb.tabs()[idx]
+        except (IndexError, tk.TclError):
+            return
+        if tabid == str(self._plus_frame):
+            return
+        info = self._info_for(tabid)
+        if not info or info["pinned"]:
+            return   # pinned tabs can't be hidden
+        menu = tk.Menu(self.nb, tearoff=0)
+        menu.add_command(label=f"Hide “{info['label']}”",
+                         command=lambda: self._hide_tab(info))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _hide_tab(self, info):
+        """Detach a tab from the bar (its frame + built content are kept, so
+        reopening it from "＋" is instant)."""
+        if self.nb.select() == str(info["frame"]):
+            self._last_real_tab = None
+        try:
+            self.nb.forget(info["frame"])
+        except tk.TclError:
+            pass
 
     def _render_error(self, frame, err):
         for child in frame.winfo_children():

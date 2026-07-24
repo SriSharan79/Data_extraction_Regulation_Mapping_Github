@@ -20,11 +20,13 @@ class EASAStudio(_BaseStudio):
     WINDOW_TITLE = "EASA Studio — Extraction & Review"
     HEADER = "EASA XML extraction and structured-JSON review."
     GEOMETRY = "1280x820"
+    # Extract & Review and Data & Analysis are pinned; the EASA-specific tabs
+    # start hidden and open on demand from the "＋" tab.
     TAB_SPECS = [
         ("Extract & Review", "_build_extract_review_tab"),
+        ("Data & Analysis", "_build_data_analysis_tab"),
         ("EASA XML Extraction", "_build_easa_tab"),
         ("EASA JSON Review", "_build_easa_review_tab"),
-        ("Data & Analysis", "_build_data_analysis_tab"),
     ]
 
 
