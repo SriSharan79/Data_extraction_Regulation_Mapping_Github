@@ -742,6 +742,8 @@ class ChunkTriageApp:
         ttk.Button(row, text="Save & skip",
                    command=lambda: save("skip")).pack(side="left", padx=(0, 6))
         ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left")
+        dlg.deiconify()           # Ensure the window is shown
+        dlg.update_idletasks()    # Force Tkinter to draw the window before grabbing
         dlg.grab_set()
         self.root.wait_window(dlg)
 
