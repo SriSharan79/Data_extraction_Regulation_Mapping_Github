@@ -559,7 +559,7 @@ _EMB = "unchecked"           # embedding_metrics module, None if unusable
 _EMB_CFG = {
     "enabled": False,
     "backend": "api",         # "api" (remote /embeddings) or "local" (HF model)
-    "service": None,          # "BlaBla" / "DLR Ollama" for the api backend
+    "service": None,          # "BlaBla" / "Chat AI" / "DLR Ollama" for the api backend
     "model": None,            # explicit embedding model id (optional)
     "api_key": None,          # optional explicit key override
     "bertscore_granularity": None,  # None -> token for local, item for api
@@ -1758,10 +1758,10 @@ def main(argv=None):
                         default="api",
                         help="backend for the embedding_cosine / bertscore "
                              "metrics (default: api)")
-    parser.add_argument("--embed-service", choices=("BlaBla", "DLR Ollama"),
-                        default="DLR Ollama",
+    parser.add_argument("--embed-service", choices=("BlaBla", "Chat AI", "DLR Ollama"),
+                        default="BlaBla",
                         help="remote service for --embed-backend api "
-                             "(default: DLR Ollama)")
+                             "(default: BlaBla)")
     parser.add_argument("--embed-model",
                         help="explicit embedding model id (optional; otherwise "
                              "the service's default embedding model)")

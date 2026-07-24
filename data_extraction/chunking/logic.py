@@ -207,7 +207,7 @@ class ExtractionLauncherUI:
         label = self.llm_service.get().strip()
         if not label or label not in self._llm_avail:
             return None
-        code = "o" if label == "DLR Ollama" else "b"
+        code = {"DLR Ollama": "o", "Chat AI": "c"}.get(label, "b")
         model = self.llm_model.get().strip() or None
         return _triage_llm(logger, code, model)
 
@@ -900,8 +900,8 @@ def _triage_llm(logger, service_code="b", model=None):
     """An ``llm(prompt, system_prompt)`` callable for the triage's heading
     check, or None when the LLM layer is unavailable — the triage then falls
     back to the Table of Contents / deterministic rules on its own.
-    ``service_code`` is 'b' (BlaBla, the preferred default) or 'o'
-    (DLR Ollama); ``model`` overrides the service's selected model."""
+    ``service_code`` is 'b' (BlaBla, the preferred default), 'c' (Chat AI)
+    or 'o' (DLR Ollama); ``model`` overrides the service's selected model."""
     try:
         from data_extraction.ai_utils.llm_utils import (get_selected_model,
                                                         llm_call)
@@ -909,7 +909,7 @@ def _triage_llm(logger, service_code="b", model=None):
         logger.info(f"Triage runs without an LLM ({exc}).")
         return None
 
-    label = "DLR Ollama" if str(service_code).lower() == "o" else "BlaBla"
+    label = {"o": "DLR Ollama", "c": "Chat AI"}.get(str(service_code).lower(), "BlaBla")
 
     def call(prompt, system_prompt):
         m = model

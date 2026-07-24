@@ -129,6 +129,13 @@ PREFERRED_BLABLADOR_MODELS = [
 ]
 
 CHATAI_BASE_URL = "https://chat-ai.academiccloud.de/v1"
+PREFERRED_CHATAI_MODELS = [
+    "openai-gpt-oss-120b", "llama-3.3-70b-instruct", "meta-llama-3.1-8b-instruct",
+    "qwen3-32b",
+]
+# Chat AI's embedding model ids don't contain 'embed' (e.g. e5-mistral), so the
+# preferred default is named here explicitly.
+DEFAULT_CHATAI_EMBEDDING_MODEL = "e5-mistral-7b-instruct"
 
 # DLR Ollama OpenAI-compatible endpoint (base; specific paths are appended).
 OLLAMA_BASE_URL = "http://ollama.nimbus.dlr.de/api"
@@ -138,6 +145,7 @@ OLLAMA_BASE_URL = "http://ollama.nimbus.dlr.de/api"
 # out of the box; interactive selection can override them per session.
 DEFAULT_BLABLADOR_MODEL = "01 - GPT-OSS-120b - an open model released by OpenAI in August 2025"
 DEFAULT_OLLAMA_MODEL = "gpt-oss:20b"
+DEFAULT_CHATAI_MODEL = "openai-gpt-oss-120b"
 
 if __name__ == "__main__":
     

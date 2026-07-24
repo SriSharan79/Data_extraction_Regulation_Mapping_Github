@@ -59,7 +59,8 @@ _LLM_UTILS = None
 _INJECTED_LLM_UTILS = None
 
 # Default remote service used when backend="api" and no service is given.
-DEFAULT_REMOTE_SERVICE = "DLR Ollama"
+# BlaBla is the preferred service everywhere (then Chat AI, then DLR Ollama).
+DEFAULT_REMOTE_SERVICE = "BlaBla"
 
 
 def set_llm_utils(module):

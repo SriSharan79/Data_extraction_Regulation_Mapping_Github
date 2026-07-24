@@ -60,7 +60,11 @@ _AI_PRESETS = {
 }
 
 # UI service label -> llm_call service code
-_AI_SERVICES = {"Blablador": "b", "DLR Ollama": "o", "Local model": "l"}
+_AI_SERVICES = {"Blablador": "b", "Chat AI": "c", "DLR Ollama": "o", "Local model": "l"}
+
+# Picker code <-> service label (preference order: BlaBla → Chat AI → Ollama)
+_CODE_TO_LABEL = {"B": "BlaBla", "C": "Chat AI", "O": "DLR Ollama"}
+_LABEL_TO_CODE = {label: code for code, label in _CODE_TO_LABEL.items()}
 
 # Answer-format label -> directive appended to the LLM prompt ("" = free-form)
 _AI_OUTPUT_FORMATS = {
@@ -238,6 +242,12 @@ class AIReviewMixin:
         ]
         self._col_results = []        # column-analysis rows (dicts) for export
         self._col_table_cols = []     # column names currently shown in the table
+        # Provenance columns appended to every saved file (never shown in the
+        # table and never fed to the entity/evaluation logic, which read
+        # _col_table_cols): they record which service/model actually answered
+        # each row, from llm_utils.get_last_call_info(), so a silent
+        # cross-service fallback is traceable in the output.
+        self._col_prov_cols = ["Service Used", "Model Used", "Fallback?"]
         self._col_uniq_checked = {name for name, _ in self._ai_columns}
         self._col_analyze_checked = {name for name, _ in self._ai_columns}
         self._col_load_columns()      # restore the previous session's columns
@@ -303,7 +313,7 @@ class AIReviewMixin:
         # BlaBla is the preferred service, listed and selected first; a
         # background probe (started at the end of the build) prunes this to
         # the services whose API key is stored AND whose model list answers.
-        self.llm_choice_an = ttk.Combobox(llm_frame, values=["B", "O"], width=5, state="readonly")
+        self.llm_choice_an = ttk.Combobox(llm_frame, values=["B", "C", "O"], width=5, state="readonly")
         self.llm_choice_an.set("B")
         self.llm_choice_an.pack(side="left", padx=5)
         self.llm_choice_an.bind("<<ComboboxSelected>>", self._llm_service_changed)
@@ -459,7 +469,7 @@ class AIReviewMixin:
 
     # -------------------------------------------- inline LLM model picker -- #
     def _llm_service_label(self):
-        return "DLR Ollama" if self.llm_choice_an.get().upper() == "O" else "BlaBla"
+        return _CODE_TO_LABEL.get(self.llm_choice_an.get().upper(), "BlaBla")
 
     def _llm_probe_services(self):
         """Background check of which services are usable (key stored + model
@@ -490,9 +500,9 @@ class AIReviewMixin:
             self.llm_active_lbl.configure(
                 text="⚠ no LLM service usable — add API keys (API keys…) ")
             self._ai_log("⚠ No LLM service usable: API key missing or the "
-                         "model list did not answer (BlaBla / DLR Ollama).")
+                         "model list did not answer (BlaBla / Chat AI / DLR Ollama).")
             return
-        codes = ["B" if label == "BlaBla" else "O" for label in self._llm_avail]
+        codes = [_LABEL_TO_CODE.get(label, "B") for label in self._llm_avail]
         self.llm_choice_an.configure(values=codes)
         # BlaBla is ALWAYS the first choice when it is usable.
         self.llm_choice_an.set("B" if "B" in codes else codes[0])
@@ -1091,8 +1101,8 @@ class AIReviewMixin:
 
         # Dynamically map the modern engine panel to active session choices
         provider_code = self.llm_choice_an.get().upper()
-        service = "o" if provider_code == "O" else "b"
-        service_label = "DLR Ollama" if provider_code == "O" else "BlaBla"
+        service_label = _CODE_TO_LABEL.get(provider_code, "BlaBla")
+        service = _LABEL_TO_CODE[service_label].lower()
         model = get_selected_model(service_label)
         
         fmt = self.ai_format.get() or "Plain text"
@@ -1130,16 +1140,24 @@ class AIReviewMixin:
                             f"({len(text or '')} chars): {self._ai_preview(text)}")
             self._ai_log_bg(f"→ Sent to LLM ({len(prompt)} chars): "
                             f"{self._ai_preview(prompt)}")
+            prov = self._new_provenance()
             try:
                 self._ai_call_count += 1
                 resp = llm_call(prompt, None, service, model)
+                self._track_provenance(prov)
             except Exception as exc:  # noqa: BLE001
                 resp = f"[ERROR] {exc}"
             self._ai_log_bg(f"← Response ({len(str(resp or ''))} chars): "
                             f"{self._ai_preview(resp)}")
+            # What actually answered (may differ from the requested service on
+            # a cross-service fallback); the requested pick stays in "service".
+            used_service = "; ".join(sorted(prov["services"])) or service_label
+            used_model = "; ".join(sorted(prov["models"])) or (model or "")
             self._ai_q.put(("result", {
                 "title": title, "instruction": instruction, "response": resp,
                 "service": service_label, "model": model or "", "format": fmt,
+                "service_used": used_service, "model_used": used_model,
+                "fallback": "yes" if prov["fallback"] else "",
             }))
         self._ai_q.put(None)
 
@@ -1203,7 +1221,8 @@ class AIReviewMixin:
     def _write_ai_results(path, results):
         """Write free-form results; the extension picks the format. Raises on failure."""
         ext = os.path.splitext(path)[1].lower()
-        columns = ["title", "service", "model", "format", "instruction", "response"]
+        columns = ["title", "service", "model", "service_used", "model_used",
+                   "fallback", "format", "instruction", "response"]
         if ext == ".json":
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
@@ -1259,10 +1278,10 @@ class AIReviewMixin:
     def _choose_model_action(self, provider_code):
         """
         Fetch the live list of available models for the selected provider
-        ('O' = DLR Ollama, 'B' = Blablador), let the user pick one, and store
-        it as the session model used by all subsequent LLM calls.
+        ('B' = Blablador, 'C' = Chat AI, 'O' = DLR Ollama), let the user pick
+        one, and store it as the session model used by all subsequent LLM calls.
         """
-        service = "DLR Ollama" if str(provider_code).upper() == "O" else "BlaBla"
+        service = _CODE_TO_LABEL.get(str(provider_code).upper(), "BlaBla")
 
         print(f"Fetching available {service} models...")
         try:
@@ -1353,7 +1372,7 @@ class AIReviewMixin:
                 "store_path": self._col_store_path,
                 "llm_choice": self.llm_choice_an.get(),
                 "models": {lbl: get_selected_model(lbl)
-                           for lbl in ("BlaBla", "DLR Ollama")},
+                           for lbl in ("BlaBla", "Chat AI", "DLR Ollama")},
                 "eval_auto": bool(self.eval_auto_var.get()),
                 "col_eval_choices": {k: bool(v) for k, v
                                      in self._col_eval_choices.items()},
@@ -1386,10 +1405,10 @@ class AIReviewMixin:
             return
         if isinstance(state.get("store_path"), str) and state["store_path"]:
             self._col_store_path = state["store_path"]
-        if state.get("llm_choice") in ("O", "B"):
+        if state.get("llm_choice") in ("B", "C", "O"):
             self.llm_choice_an.set(state["llm_choice"])
         models = state.get("models") or {}
-        for lbl in ("BlaBla", "DLR Ollama"):
+        for lbl in ("BlaBla", "Chat AI", "DLR Ollama"):
             if isinstance(models.get(lbl), str) and models[lbl]:
                 try:
                     set_selected_model(lbl, models[lbl])
@@ -1697,8 +1716,8 @@ class AIReviewMixin:
 
         # Dynamically map modern engine panel values to active session configurations
         provider_code = self.llm_choice_an.get().upper()
-        service = "o" if provider_code == "O" else "b"
-        service_label = "DLR Ollama" if provider_code == "O" else "BlaBla"
+        service_label = _CODE_TO_LABEL.get(provider_code, "BlaBla")
+        service = _LABEL_TO_CODE[service_label].lower()
         model = get_selected_model(service_label)
 
         # New run: rebuild the table for the current column set.
@@ -1840,6 +1859,41 @@ class AIReviewMixin:
             'Use "" if the section does not contain it.\n'
             'Use ";" for multiple values the section does contain.')
 
+    @staticmethod
+    def _new_provenance():
+        """A fresh per-row accumulator for what actually served each call."""
+        return {"services": set(), "models": set(), "fallback": False}
+
+    @staticmethod
+    def _track_provenance(acc):
+        """Fold llm_utils.get_last_call_info() (the most recent llm_call) into
+        the accumulator. Call it right after every llm_call. Safe if the
+        provenance API is unavailable (older llm_utils)."""
+        try:
+            from data_extraction.ai_utils.llm_utils import get_last_call_info
+            info = get_last_call_info() or {}
+        except Exception:  # noqa: BLE001
+            return
+        su, mu = info.get("service_used"), info.get("model_used")
+        if su:
+            acc["services"].add(str(su))
+        if mu:
+            acc["models"].add(str(mu))
+        if info.get("fallback_used"):
+            acc["fallback"] = True
+
+    @staticmethod
+    def _apply_provenance(row, acc):
+        """Write the accumulated provenance onto a finished column-analysis row."""
+        row["Service Used"] = "; ".join(sorted(acc["services"]))
+        row["Model Used"] = "; ".join(sorted(acc["models"]))
+        row["Fallback?"] = "yes" if acc["fallback"] else ""
+
+    def _store_cols(self):
+        """Columns written to the storage/export file: the analysis columns
+        plus the trailing provenance columns."""
+        return self._col_table_cols + self._col_prov_cols
+
     def _col_worker(self, jobs, col_defs, prompt_head, service, model, per_col):
         try:
             from data_extraction.ai_utils.llm_utils import llm_call
@@ -1873,6 +1927,7 @@ class AIReviewMixin:
                                     f"retry {attempt}/{_JSON_RETRIES}")
                 self._ai_call_count += 1
                 resp = llm_call(prompt, None, service, model)
+                self._track_provenance(prov)
                 self._ai_log_bg(f"←{tag} Response ({len(str(resp or ''))} chars): "
                                 f"{self._ai_preview(resp)}")
                 parsed = self._parse_llm_json(resp)
@@ -1885,6 +1940,10 @@ class AIReviewMixin:
                     return {chain_col: _clean_chain_text(resp)}, resp
             return None, resp
 
+        # Per-row provenance accumulator, captured by _call_parsed above and
+        # reset at the top of every row (see _track_provenance/_apply_provenance).
+        prov = self._new_provenance()
+
         for i, (title, text) in enumerate(jobs, 1):
             if not self._col_wait_if_paused():
                 self._col_q.put(("stopped", i - 1))
@@ -1893,6 +1952,7 @@ class AIReviewMixin:
             self._ai_log_bg(f"▶ [{i}/{len(jobs)}] Analyzing '{title}' "
                             f"({len(text or '')} chars): {self._ai_preview(text)}")
             row = {"Section": title}
+            prov = self._new_provenance()
             if per_col:
                 stopped = False
                 for name, what in col_defs:
@@ -1910,6 +1970,7 @@ class AIReviewMixin:
                         try:
                             self._ai_call_count += 1
                             resp = llm_call(prompt, None, service, model)
+                            self._track_provenance(prov)
                         except Exception as exc:  # noqa: BLE001
                             row[name] = f"[ERROR] {exc}"
                             self._ai_log_bg(f"← [column '{name}'] LLM call "
@@ -1974,6 +2035,7 @@ class AIReviewMixin:
                                         f"{_JSON_RETRIES} retries — kept as [unparsed]")
                 for c in columns:
                     row[c] = _norm(parsed.get(c, ""))
+            self._apply_provenance(row, prov)
             self._col_q.put(("row", row))
         self._col_q.put(None)
 
@@ -2165,7 +2227,7 @@ class AIReviewMixin:
         path = self._col_store_path
         if not path:
             return
-        cols = self._col_table_cols
+        cols = self._store_cols()
         ext = os.path.splitext(path)[1].lower()
         try:
             if ext == ".json":
@@ -2848,7 +2910,8 @@ class AIReviewMixin:
         srow.pack(fill="x", pady=(4, 0))
         ttk.Label(srow, text="Service:").pack(side="left")
         self.eval_embed_service = ttk.Combobox(
-            srow, state="readonly", width=14, values=["BlaBla", "DLR Ollama"])
+            srow, state="readonly", width=14,
+            values=["BlaBla", "Chat AI", "DLR Ollama"])
         self.eval_embed_service.set("BlaBla")
         self.eval_embed_service.pack(side="left", padx=4)
         self.eval_embed_service.bind(
@@ -3377,7 +3440,7 @@ class AIReviewMixin:
         if not path:
             return
         try:
-            sheet = self._col_write_store(path, self._col_table_cols, self._col_results)
+            sheet = self._col_write_store(path, self._store_cols(), self._col_results)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Export failed", str(exc))
             return

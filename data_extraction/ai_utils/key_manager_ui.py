@@ -22,6 +22,7 @@ from .LLM_Config import (API_keys_config, KEY_ENV_NAMES, delete_api_key,
 # Friendlier row labels than the raw config names.
 _SERVICE_LABELS = {
     'BlaBla Door': "Blablador (BlaBla Door)",
+    'Chat AI': "Chat AI (academiccloud)",
     'DLR Ollama': "DLR Ollama",
 }
 

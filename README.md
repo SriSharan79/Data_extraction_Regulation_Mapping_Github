@@ -212,7 +212,9 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     hosts an **inline model picker** (↻ loads the live list in the
     background) plus an *Active: service · model* chip showing exactly
     what the next run uses. **Blablador is the first and default
-    service**, and a background **availability probe** at startup only
+    service, then Chat AI (chat-ai.academiccloud.de), then DLR Ollama**
+    — the same preference order drives the automatic fallback when a
+    chat call fails — and a background **availability probe** at startup only
     offers a service when its **API key is stored and its live model
     list answers** (with nothing usable, the chip warns and points to
     *API keys…*); the probed model lists pre-fill the pickers. The same
@@ -274,7 +276,14 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     so one workbook accumulates the whole history (CSV/JSON hold the latest
     batch). Saving is **row by row**: the file (and the run's sheet) is
     created with the first LLM reply and re-saved after every further
-    section, so nothing is lost if a long batch is interrupted. After each
+    section, so nothing is lost if a long batch is interrupted. Every saved
+    row also carries three trailing **provenance columns** — *Service Used*,
+    *Model Used*, *Fallback?* — filled from `get_last_call_info()` so the
+    file records which service/model actually answered each section and
+    flags any cross-service fallback (the free-form export gets the same
+    `service_used` / `model_used` / `fallback` columns). They are written to
+    the file only, never mixed into the analysis columns the entity and
+    evaluation passes read. After each
     saved row a companion `Uniq Run N …` sheet is refreshed via
     `scripts/excel_file_utils.save_unique_elements_to_new_sheet`: every
     column definition has a ✓ checkbox (heading click toggles all; new
@@ -344,7 +353,15 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
   LLM calls run on a background thread. Manage keys with
   the **API keys…** button on the tab (add / edit / clear, persisted to
   `API_keys_config.json` under `ALR_MAIN_FOLDER`); the
-  `Ollama_DLR_API_Key` / `BlaBla_API_Key` env vars still take precedence.
+  `Ollama_DLR_API_Key` / `BlaBla_API_Key` / `ChatAI_API_Key` env vars still
+  take precedence. Chat AI (chat-ai.academiccloud.de) is available for both
+  chat completions and embeddings (`e5-mistral-7b-instruct` by default).
+  Every remote request retries transient failures (429/5xx, timeouts) with
+  backoff on the same service — honouring `Retry-After` — before the
+  cross-service fallback kicks in, and `llm_call(allow_fallback=False)`
+  pins a batch to one service so results never mix models mid-run.
+  `get_last_call_info()` reports which service/model actually answered the
+  most recent call (and whether it was a fallback) for provenance records.
 
 ### PDF → Markdown
 `data_extraction/markdown/converter.py`

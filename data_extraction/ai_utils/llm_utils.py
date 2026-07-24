@@ -1,6 +1,6 @@
 from .system_prompts import General_Sys_Prompt
 from .general_utils import caluculate_time_taken, print_with_separator
-from .LLM_Config import BLABLADOR_BASE_URL, PREFERRED_BLABLADOR_MODELS, check_api_key, get_stored_api_key,local_model_dir,model_repo_id, OLLAMA_BASE_URL, DEFAULT_BLABLADOR_MODEL, DEFAULT_OLLAMA_MODEL
+from .LLM_Config import BLABLADOR_BASE_URL, PREFERRED_BLABLADOR_MODELS, check_api_key, get_stored_api_key,local_model_dir,model_repo_id, OLLAMA_BASE_URL, DEFAULT_BLABLADOR_MODEL, DEFAULT_OLLAMA_MODEL, CHATAI_BASE_URL, PREFERRED_CHATAI_MODELS, DEFAULT_CHATAI_MODEL, DEFAULT_CHATAI_EMBEDDING_MODEL
 from .file_manager import ALR_main_folder
 
 from collections import deque
@@ -35,27 +35,100 @@ API_CALL_LIMITS = {
     "window": 60.0,       # sliding window in seconds
     "timeout": 60.0,      # per-request HTTP timeout for chat completions
 }
-REQUEST_TIMES = deque(maxlen=API_CALL_LIMITS["max_requests"])
+REQUEST_TIMES = deque()
 _REQUEST_LOCK = threading.Lock()
 
 
 def _api_throttle(kind="API"):
-    """Block until this request fits the shared budget, then record it.
-    Thread-safe: concurrent workers queue up on the lock, so the
-    10-per-window limit holds across threads too."""
-    with _REQUEST_LOCK:
-        max_requests = int(API_CALL_LIMITS["max_requests"])
-        window = float(API_CALL_LIMITS["window"])
-        if len(REQUEST_TIMES) >= max_requests:
-            elapsed = time.time() - REQUEST_TIMES[0]
-            if elapsed < window:
-                sleep_time = window - elapsed
-                print(Fore.YELLOW + f"⚠️ {kind} rate limit: sleeping "
-                      f"{sleep_time:.2f}s (max {max_requests} API calls per "
-                      f"{int(window)}s, shared by chat + embeddings)"
-                      + Style.RESET_ALL)
-                time.sleep(sleep_time)
-        REQUEST_TIMES.append(time.time())
+    """Block until this request fits the shared budget, then claim a slot.
+    True sliding window (expired timestamps are evicted, never silently
+    dropped by a maxlen) and thread-safe: concurrent workers queue up on the
+    lock, and the sleep happens OUTSIDE it so waiters don't serialize."""
+    while True:
+        with _REQUEST_LOCK:
+            max_requests = int(API_CALL_LIMITS["max_requests"])
+            window = float(API_CALL_LIMITS["window"])
+            now = time.time()
+            while REQUEST_TIMES and now - REQUEST_TIMES[0] >= window:
+                REQUEST_TIMES.popleft()
+            if len(REQUEST_TIMES) < max_requests:
+                REQUEST_TIMES.append(now)
+                return
+            wait = window - (now - REQUEST_TIMES[0])
+        print(Fore.YELLOW + f"⚠️ {kind} rate limit: sleeping "
+              f"{wait:.2f}s (max {max_requests} API calls per "
+              f"{int(window)}s, shared by chat + embeddings)"
+              + Style.RESET_ALL)
+        time.sleep(max(wait, 0.1))
+
+
+# ---------------------------------------------------------------------------
+# HTTP with native timeouts + bounded retry: a transient failure (429/5xx,
+# connection error, timeout) no longer kills the call outright — it is
+# retried with backoff, honouring Retry-After. Non-retryable HTTP errors
+# (401, 404, ...) raise immediately.
+# ---------------------------------------------------------------------------
+RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+CONNECT_TIMEOUT_SECONDS = 10
+
+
+def _post_with_retries(url, headers, payload, timeout, service, max_retries=3):
+    """
+    POST with a native requests timeout and retry-with-backoff on transient
+    failures. Every attempt claims a slot in the shared rate-limit budget.
+    After max_retries attempts the last error raises to the caller.
+    """
+    delay = 2.0
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        _api_throttle(service)
+        try:
+            resp = requests.post(url, headers=headers, json=payload,
+                                 timeout=(CONNECT_TIMEOUT_SECONDS, timeout))
+            if resp.status_code in RETRYABLE_STATUS:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        pass
+                last_exc = requests.HTTPError(
+                    f"{service}: HTTP {resp.status_code}", response=resp)
+            else:
+                resp.raise_for_status()
+                return resp
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+        if attempt < max_retries:
+            print(Fore.YELLOW
+                  + f"⚠️ {service} request failed ({last_exc}); "
+                  + f"retrying in {delay:.0f}s (attempt {attempt}/{max_retries})..."
+                  + Style.RESET_ALL)
+            time.sleep(delay)
+            delay *= 2
+    raise last_exc
+
+
+# ---------------------------------------------------------------------------
+# Record of what actually served the most recent llm_call - callers can
+# persist this next to their outputs (e.g. a model_used column).
+# ---------------------------------------------------------------------------
+LAST_CALL_INFO = {}
+
+
+def _record_call_info(**kw):
+    global LAST_CALL_INFO
+    LAST_CALL_INFO = {"timestamp": datetime.now().isoformat(), **kw}
+
+
+def get_last_call_info() -> dict:
+    """
+    Return details of the most recent llm_call(): requested_service,
+    service_used, model_used, fallback_used, error. When fallback_used is
+    True the answer came from a different service than requested - record
+    this wherever the response is stored.
+    """
+    return dict(LAST_CALL_INFO)
 
 
 # Embedding-specific knobs: only the HTTP timeout and an optional fixed
@@ -72,7 +145,6 @@ def configure_embedding_limits(timeout=None, max_requests=None, window=None,
     """Tune throttling at runtime; only the given values change.
     ``max_requests``/``window`` adjust the SHARED API budget (chat +
     embeddings together). Returns the effective settings."""
-    global REQUEST_TIMES
     if timeout is not None:
         EMBEDDING_LIMITS["timeout"] = float(timeout)
     if pre_request_delay is not None:
@@ -81,19 +153,18 @@ def configure_embedding_limits(timeout=None, max_requests=None, window=None,
         if window is not None:
             API_CALL_LIMITS["window"] = float(window)
         if max_requests is not None:
-            mr = max(1, int(max_requests))
-            API_CALL_LIMITS["max_requests"] = mr
-            REQUEST_TIMES = deque(REQUEST_TIMES, maxlen=mr)
+            API_CALL_LIMITS["max_requests"] = max(1, int(max_requests))
     return {**EMBEDDING_LIMITS, "max_requests": API_CALL_LIMITS["max_requests"],
             "window": API_CALL_LIMITS["window"]}
 
 
 def _embedding_throttle():
-    """Optional pre-request delay, then the shared API rate limit."""
+    """Optional fixed pre-request delay. The shared API rate limit itself is
+    claimed per attempt inside _post_with_retries (so retries are throttled
+    too, and a slot is never double-claimed)."""
     delay = EMBEDDING_LIMITS["pre_request_delay"]
     if delay > 0:
         time.sleep(delay)
-    _api_throttle("Embedding")
 
 
 def _parse_embedding_response(result, expected):
@@ -145,12 +216,13 @@ def _embed_in_halves(texts, embed_fn, label="embedding"):
 # via select_model_interactive() from the CLI or a dropdown in the desktop UI.
 SELECTED_MODELS = {
     "BlaBla": DEFAULT_BLABLADOR_MODEL,
+    "Chat AI": DEFAULT_CHATAI_MODEL,
     "DLR Ollama": DEFAULT_OLLAMA_MODEL,
 }
 
 
 def get_selected_model(service: str) -> str:
-    """Return the currently selected model for a service ('BlaBla' or 'DLR Ollama')."""
+    """Return the currently selected model for a service ('BlaBla', 'Chat AI' or 'DLR Ollama')."""
     return SELECTED_MODELS.get(service)
 
 
@@ -182,6 +254,26 @@ def list_blablador_models(blablador_key: str = None) -> list:
         return []
 
 
+def list_chatai_models(chatai_key: str = None) -> list:
+    """Fetch the list of currently available Chat AI model ids (live call)."""
+    # Non-prompting: this is called from the UI, so never block on console input.
+    key = chatai_key or get_stored_api_key('Chat AI')
+    if not key:
+        print(Fore.YELLOW + "⚠️ No Chat AI API key - cannot list models." + Style.RESET_ALL)
+        return []
+    try:
+        resp = requests.get(
+            f"{CHATAI_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return [m['id'] for m in resp.json().get('data', [])]
+    except Exception as e:
+        print(Fore.RED + f"❌ Failed to list Chat AI models: {e}" + Style.RESET_ALL)
+        return []
+
+
 def list_ollama_models(ollama_key: str = None) -> list:
     """Fetch the list of currently available DLR Ollama model ids (live call)."""
     # Non-prompting: this is called from the UI, so never block on console input.
@@ -207,9 +299,11 @@ def list_ollama_models(ollama_key: str = None) -> list:
 
 
 def list_available_models(service: str) -> list:
-    """Return live available model ids for 'BlaBla' or 'DLR Ollama'."""
+    """Return live available model ids for 'BlaBla', 'Chat AI' or 'DLR Ollama'."""
     if service == "BlaBla":
         return list_blablador_models()
+    if service == "Chat AI":
+        return list_chatai_models()
     if service == "DLR Ollama":
         return list_ollama_models()
     raise ValueError(f"Unknown service '{service}'.")
@@ -218,10 +312,11 @@ def list_available_models(service: str) -> list:
 def probe_available_services() -> list:
     """The services that are usable RIGHT NOW: an API key is stored **and**
     the live model list answers. Returns ``[(label, [model ids])]`` with
-    **BlaBla first** (the preferred service). Makes network calls — run it
-    off the UI thread."""
+    **BlaBla first** (the preferred service), then Chat AI, then DLR Ollama.
+    Makes network calls — run it off the UI thread."""
     out = []
     for label, key_name in (("BlaBla", "BlaBla Door"),
+                            ("Chat AI", "Chat AI"),
                             ("DLR Ollama", "DLR Ollama")):
         try:
             if not get_stored_api_key(key_name):
@@ -274,38 +369,53 @@ DEFAULT_EMBEDDING_MODEL = "qwen3-8b-embeddings"
 
 SELECTED_EMBEDDING_MODELS = {
     "BlaBla": None,
+    "Chat AI": None,
     "DLR Ollama": None,
+}
+
+# Per-service preferred embedding model. Chat AI's embedding models are the
+# e5 family whose ids don't contain 'embed', so the generic default would
+# never match there.
+PREFERRED_EMBEDDING_MODELS = {
+    "BlaBla": DEFAULT_EMBEDDING_MODEL,
+    "Chat AI": DEFAULT_CHATAI_EMBEDDING_MODEL,
+    "DLR Ollama": DEFAULT_EMBEDDING_MODEL,
 }
 
 
 def _filter_embedding_models(models: list) -> list:
-    """Return only the models whose id/name contains 'embed' (case-insensitive)."""
-    return [m for m in (models or []) if m and "embed" in m.lower()]
+    """Return only the models that look like embedding models: id/name contains
+    'embed' (case-insensitive) or is an e5-family model (Chat AI's embedding
+    ids, e.g. 'e5-mistral-7b-instruct', don't contain 'embed')."""
+    return [m for m in (models or [])
+            if m and ("embed" in m.lower() or m.lower().startswith("e5"))]
 
 
 def list_embedding_models(service: str) -> list:
     """
-    Fetch the live model list for a service ('BlaBla' or 'DLR Ollama') via the
-    existing /models call, and return only the ones that look like embedding
-    models (id/name contains 'embed').
+    Fetch the live model list for a service ('BlaBla', 'Chat AI' or
+    'DLR Ollama') via the existing /models call, and return only the ones that
+    look like embedding models (id/name contains 'embed', or e5-*).
     """
     all_models = list_available_models(service)
     embedding_models = _filter_embedding_models(all_models)
     return embedding_models
 
 
-def get_default_embedding_model(service: str, preferred: str = DEFAULT_EMBEDDING_MODEL) -> str:
+def get_default_embedding_model(service: str, preferred: str = None) -> str:
     """
     Resolve which embedding model to use for `service`.
 
     Preference order:
       1. Embedding model already selected earlier this session.
-      2. `preferred` ('qwen3-8b-embeddings' by default), if it is present in
-         the live embedding-model list.
+      2. `preferred` (the per-service default from PREFERRED_EMBEDDING_MODELS
+         when not given), if it is present in the live embedding-model list.
       3. First embedding model found in the live list.
       4. `preferred` as a last-resort fallback if the live list is empty
          (e.g. the /models call failed).
     """
+    if preferred is None:
+        preferred = PREFERRED_EMBEDDING_MODELS.get(service, DEFAULT_EMBEDDING_MODEL)
     if SELECTED_EMBEDDING_MODELS.get(service):
         return SELECTED_EMBEDDING_MODELS[service]
 
@@ -353,7 +463,7 @@ def get_embedding(
 
     Args:
         text: a single string, or a list of strings (batch embedding).
-        service: 'BlaBla' or 'DLR Ollama'.
+        service: 'BlaBla', 'Chat AI' or 'DLR Ollama'.
         model: explicit model id to use; otherwise the resolved default
                embedding model for the service is used (qwen3-8b-embeddings
                if available).
@@ -377,8 +487,8 @@ def get_embedding(
 
     start_time = time.time()
 
-    if service not in ("BlaBla", "DLR Ollama"):
-        raise ValueError(f"Unknown service '{service}'. Expected 'BlaBla' or 'DLR Ollama'.")
+    if service not in ("BlaBla", "Chat AI", "DLR Ollama"):
+        raise ValueError(f"Unknown service '{service}'. Expected 'BlaBla', 'Chat AI' or 'DLR Ollama'.")
 
     inputs = text if isinstance(text, list) else [text]
     resolved_model = model or get_default_embedding_model(service)
@@ -390,6 +500,9 @@ def get_embedding(
         # does. If no key is stored the request goes out unauthenticated and the
         # server returns a clear 401 rather than the app hanging.
         key = api_key or get_stored_api_key('BlaBla Door')
+    elif service == "Chat AI":
+        base_url = CHATAI_BASE_URL
+        key = api_key or get_stored_api_key('Chat AI')
     else:
         base_url = OLLAMA_BASE_URL
         key = api_key or get_stored_api_key('DLR Ollama')
@@ -407,10 +520,9 @@ def get_embedding(
 
     def _request(batch):
         _embedding_throttle()
-        resp = requests.post(url, headers=headers,
-                             json={"model": resolved_model, "input": list(batch)},
-                             timeout=timeout)
-        resp.raise_for_status()
+        resp = _post_with_retries(
+            url, headers, {"model": resolved_model, "input": list(batch)},
+            timeout, f"{service} embeddings")
         payload = resp.json()
         if len(batch) == len(inputs):
             raw_holder["raw"] = payload
@@ -712,8 +824,6 @@ def Ollama_ask_llm(
     max_tokens: int = 2000,
     model: str = None,
 ) -> str:
-    # Shared 10-per-window API budget (chat + embeddings together).
-    _api_throttle("Chat")
 
     start_time = time.time()
 
@@ -721,8 +831,6 @@ def Ollama_ask_llm(
 
     # Resolve the model: explicit arg > session selection > configured default.
     model = model or get_selected_model("DLR Ollama") or DEFAULT_OLLAMA_MODEL
-
-    start_time = time.time()
 
     messages = []
     messages.append({'role': 'system', 'content': sys_prompt})
@@ -740,11 +848,8 @@ def Ollama_ask_llm(
         headers["Authorization"] = f"Bearer {Ollama_DLR_API_Key}"
 
     url = f'{OLLAMA_BASE_URL}/chat/completions'
-    resp = requests.post(url, headers=headers, json=payload,
-                         timeout=API_CALL_LIMITS["timeout"])
-
-    # Raise an informative error if something went wrong
-    resp.raise_for_status()
+    resp = _post_with_retries(url, headers, payload,
+                              API_CALL_LIMITS["timeout"], "DLR Ollama")
 
     result = resp.json()
     content=None 
@@ -875,9 +980,6 @@ def blabla_ask_llm(
 ) -> str:
     """Query Blablador LLM with the selected (or default) model."""
 
-    # Shared 10-per-window API budget (chat + embeddings together).
-    _api_throttle("Chat")
-
     start_time = time.time()
     # print_with_separator("DebugLog",'/')
 
@@ -905,9 +1007,8 @@ def blabla_ask_llm(
 
     url = f"{BLABLADOR_BASE_URL}/chat/completions"
 
-    resp = requests.post(url, headers=headers, json=payload,
-                         timeout=API_CALL_LIMITS["timeout"])
-    resp.raise_for_status()
+    resp = _post_with_retries(url, headers, payload,
+                              API_CALL_LIMITS["timeout"], "Blablador")
 
     result = resp.json()
     content=None 
@@ -935,6 +1036,65 @@ def blabla_ask_llm(
     end_time = time.time()    
     try:
         log_llm_interaction(model,"BlaBla",messages,content.strip(),caluculate_time_taken(start_time,end_time))
+    except Exception as e:
+        print('failed to log LLM Interaction')
+
+    return content.strip() if content else ""
+
+
+#Chat AI Models Usage
+
+def chatai_ask_llm(
+    prompt: str,
+    sys_prompt: str,
+    temperature: float = 0.3,
+    max_tokens: int = 8192,
+    chatai_key: str = None,
+    model: str = None,
+) -> str:
+    """Query Chat AI (academiccloud) with the selected (or default) model."""
+
+    start_time = time.time()
+
+    # Resolve the model: explicit arg > session selection > configured default.
+    model = model or get_selected_model("Chat AI") or DEFAULT_CHATAI_MODEL
+
+    messages = [
+        {'role': 'system', 'content': sys_prompt},
+        {'role': 'user', 'content': prompt}
+    ]
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    headers = {"Content-Type": "application/json"}
+    # Non-prompting key lookup: never block on console input from the UI.
+    key = chatai_key or get_stored_api_key('Chat AI')
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    url = f"{CHATAI_BASE_URL}/chat/completions"
+
+    resp = _post_with_retries(url, headers, payload,
+                              API_CALL_LIMITS["timeout"], "Chat AI")
+
+    result = resp.json()
+    content=None
+    try:
+        content = result["choices"][0]["message"]["content"]
+        if content is None:
+            raise ValueError("Empty content received from Chat AI")
+    except (KeyError, IndexError, ValueError) as exc:
+        print(f"❌ Chat AI failed. Full response: {result}")
+        raise ValueError(f"Unexpected response format from Chat AI: {exc}") from exc
+
+    end_time = time.time()
+    try:
+        log_llm_interaction(model,"Chat_AI",messages,content.strip(),caluculate_time_taken(start_time,end_time))
     except Exception as e:
         print('failed to log LLM Interaction')
 
@@ -1091,7 +1251,25 @@ def timeout_function(func, args=(), timeout=120, fallback=None):
         return result
 
 # Main LLM call method
-def llm_call(prompt: str, system_prompt: str, service: str, model: str = None):
+def llm_call(prompt: str, system_prompt: str, service: str, model: str = None,
+             allow_fallback: bool = True):
+    """
+    Chat call with bounded per-service retries and a *recorded* fallback.
+
+      'B' -> Blablador; 'C' -> Chat AI; 'O' -> DLR Ollama;
+      'L' -> local HuggingFace model.
+
+    Transient failures retry on the SAME service inside _post_with_retries.
+    Only after the requested service exhausts its retries do the others get
+    one chance each, in the preference order BlaBla -> Chat AI -> DLR Ollama
+    - and only if ``allow_fallback`` is True. Pass ``allow_fallback=False``
+    for batches whose results must not mix models mid-run.
+
+    Whatever happens is recorded in get_last_call_info() (requested_service,
+    service_used, model_used, fallback_used, error) so callers can persist
+    which model actually produced each output. Returns the response text, or
+    None when every allowed service failed.
+    """
     # Use provided prompt if valid; otherwise fallback
     if system_prompt:
         sys_prompt = system_prompt
@@ -1111,37 +1289,65 @@ def llm_call(prompt: str, system_prompt: str, service: str, model: str = None):
     if model:
         if s == 'b':
             set_selected_model("BlaBla", model)
+        elif s == 'c':
+            set_selected_model("Chat AI", model)
         elif s == 'o':
             set_selected_model("DLR Ollama", model)
 
-    # The HTTP requests carry their own timeout (API_CALL_LIMITS["timeout"]),
-    # so a hung call raises here instead of leaking a worker thread. On any
-    # failure the OTHER service is tried once, loudly, so the switch is
-    # visible in the logs; None only when both failed.
-    if s == 'b':
-        order = ((blabla_ask_llm, "Blablador"), (Ollama_ask_llm, "DLR Ollama"))
-    elif s == 'o':
-        order = ((Ollama_ask_llm, "DLR Ollama"), (blabla_ask_llm, "Blablador"))
-    elif s == 'l':
+    if s == 'l':
         # Local model call
-        return Local_Model_call(prompt, sys_prompt)
-    else:
-        error_msg = "Error: Invalid service. Use 'B', 'O', or 'L'."
+        response = Local_Model_call(prompt, sys_prompt)
+        _record_call_info(kind="chat", requested_service="local", service_used="local",
+                          model_used=model_repo_id, fallback_used=False, error=None)
+        return response
+
+    if s not in ('b', 'c', 'o'):
+        error_msg = "Error: Invalid service. Use 'B', 'C', 'O', or 'L'."
         print(error_msg)
         return error_msg  # Return the error so the app doesn't crash downstream
 
-    (primary, primary_label), (backup, backup_label) = order
-    try:
-        return primary(prompt, sys_prompt)
-    except Exception as exc:  # noqa: BLE001 - includes requests timeouts
-        print(Fore.YELLOW + f"⚠️ {primary_label} call failed ({exc}) — "
-              f"falling back to {backup_label}." + Style.RESET_ALL)
+    # The HTTP requests carry their own timeout and same-service retries, so
+    # a hung call raises here instead of leaking a worker thread. On any
+    # persistent failure the next service in the preference order (BlaBla →
+    # Chat AI → DLR Ollama, requested service first) is tried, loudly, so the
+    # switch is visible in the logs; None only when every allowed service
+    # failed.
+    services = {'b': ("BlaBla", blabla_ask_llm),
+                'c': ("Chat AI", chatai_ask_llm),
+                'o': ("DLR Ollama", Ollama_ask_llm)}
+    primary_name = services[s][0]
+    attempt_order = [services[s]]
+    if allow_fallback:
+        attempt_order.extend(services[code] for code in ('b', 'c', 'o')
+                             if code != s)
+
+    errors = []
+    for name, ask in attempt_order:
         try:
-            return backup(prompt, sys_prompt)
-        except Exception as exc2:  # noqa: BLE001
-            print(Fore.RED + f"❌ {backup_label} fallback failed too "
-                  f"({exc2})." + Style.RESET_ALL)
-            return None
+            response = ask(prompt, sys_prompt)
+            fallback_used = name != primary_name
+            if fallback_used:
+                print(Fore.YELLOW
+                      + f"⚠️ Chat fallback used: '{primary_name}' failed "
+                      + f"({errors[-1]}); this answer came from '{name}' "
+                      + f"(model={get_selected_model(name)})."
+                      + Style.RESET_ALL)
+            _record_call_info(kind="chat", requested_service=primary_name,
+                              service_used=name, model_used=get_selected_model(name),
+                              fallback_used=fallback_used,
+                              error="; ".join(errors) or None)
+            return response
+        except Exception as exc:  # noqa: BLE001 - includes requests timeouts
+            errors.append(f"{name}: {exc}")
+            print(Fore.RED + f"❌ {name} chat call failed after retries: {exc}"
+                  + Style.RESET_ALL)
+
+    _record_call_info(kind="chat", requested_service=primary_name, service_used=None,
+                      model_used=None, fallback_used=False, error="; ".join(errors))
+    print(Fore.RED
+          + f"❌ llm_call failed on every allowed service ({'; '.join(errors)}); returning None."
+          + Style.RESET_ALL)
+    return None
 
 # print(llm_call('hi','','o'))
 if __name__ == "__main__":
