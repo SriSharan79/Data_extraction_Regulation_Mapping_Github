@@ -20,6 +20,7 @@ class DataExtractionStudio(_BaseStudio):
     WINDOW_TITLE = "Data Extraction Studio"
     HEADER = "Data Extraction Studio — pick a tab to begin."
     TAB_SPECS = [
+        ("Extract & Review", "_build_extract_review_tab"),
         ("PDF Extraction & Review", "_build_extraction_tab"),
         ("Section Review", "_build_section_review_tab"),
         ("AI Review", "_build_chunk_ai_tab"),

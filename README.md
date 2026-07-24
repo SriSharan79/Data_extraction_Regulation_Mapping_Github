@@ -62,6 +62,22 @@ they are only needed when an extraction actually runs.
 
 ## What each tab does
 
+### Extract & Review (unified)
+`data_extraction/studio/extract_review_tab.py`
+
+One workspace-driven surface that folds extraction and review into a single
+flow for both document types — the first tab in both studios. A **source
+selector** (PDF · Docling chunks / EASA · XML), a shared **workspace bar** (the
+storage folder backed by the SQLite store), and a **document rail** listing what
+the workspace already holds (from the database). Press **＋ Extract new…** to run
+the source's extractor with the workspace pre-filled; pick a document in the
+rail to review it, with mode buttons switching between the review surfaces the
+source offers (PDF: *Section review* / *AI review*; EASA: *Browse + AI review*).
+
+It is an orchestrator, not a rewrite: it *hosts* the existing tools (below)
+unchanged, so every feature they have is still here. The original per-tool tabs
+remain available alongside it.
+
 ### PDF Extraction & Review
 `data_extraction/chunking/` — `logic.py`, `table_image_extractor.py`,
 `chunk_review_ui.py`

@@ -727,3 +727,7 @@ class _BaseStudio:
     def _build_data_analysis_tab(self, frame):
         from data_extraction.studio.data_analysis_tab import DataAnalysisTab
         DataAnalysisTab(frame)
+
+    def _build_extract_review_tab(self, frame):
+        from data_extraction.studio.extract_review_tab import ExtractReviewTab
+        ExtractReviewTab(frame, review_launcher=self._review_launcher)
