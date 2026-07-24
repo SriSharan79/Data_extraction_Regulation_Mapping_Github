@@ -557,14 +557,15 @@ class AIReviewMixin:
         self._ui_state_save()
 
     def _llm_models_refresh(self):
-        """Load the service's live model list in the background and fill the
-        inline picker (the UI stays responsive; errors go to the status bar)."""
+        """Re-fetch the service's model list LIVE (the ↻ button) and fill the
+        inline picker. Passive population uses the stored list; this button is
+        the explicit refresh, so it forces a live fetch."""
         label = self._llm_service_label()
-        self.status_var.set(f"Loading {label} models…")
+        self.status_var.set(f"Refreshing {label} models…")
 
         def work():
             try:
-                models = list_available_models(label) or []
+                models = list_available_models(label, force_refresh=True) or []
             except Exception as exc:  # noqa: BLE001
                 models, err = [], str(exc)
             else:
@@ -3152,7 +3153,8 @@ class AIReviewMixin:
 
         def work():
             try:
-                models = list_embedding_models(service)
+                # explicit user request for the list -> refresh live
+                models = list_embedding_models(service, force_refresh=True)
                 default = get_default_embedding_model(service) if models else ""
             except Exception as exc:  # noqa: BLE001
                 self.root.after(0, lambda e=exc: self.status_var.set(

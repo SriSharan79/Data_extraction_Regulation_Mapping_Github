@@ -225,15 +225,18 @@ node see the text, EASA attributes, hyperlinks, and extracted assets:
     button, and an **Open results** button that opens the latest result
     file (analysis workbook, free-form autosave, evaluation output,
     uniques/entities sheet) with the system's default app. The LLM row
-    hosts an **inline model picker** (↻ loads the live list in the
-    background) plus an *Active: service · model* chip showing exactly
-    what the next run uses. **Blablador is the first and default
+    hosts an **inline model picker** plus an *Active: service · model* chip
+    showing exactly what the next run uses. **Blablador is the first and default
     service, then Chat AI (chat-ai.academiccloud.de), then DLR Ollama**
     — the same preference order drives the automatic fallback when a
     chat call fails — and a background **availability probe** at startup only
-    offers a service when its **API key is stored and its live model
-    list answers** (with nothing usable, the chip warns and points to
-    *API keys…*); the probed model lists pre-fill the pickers. The same
+    offers a service when its **API key is stored and a model list is
+    known** (with nothing usable, the chip warns and points to *API keys…*).
+    Model lists are **cached**: they are fetched once and stored per service
+    (`model_lists_cache.json` under `ALR_MAIN_FOLDER`), then reused on every
+    startup and probe without another network call — the **↻ button** is the
+    explicit *refresh* that re-fetches a service's list live and updates the
+    cache (a failed refresh keeps the stored list). The same
     gated **service + model picker sits on the PDF Extraction tab** for
     the triage's LLM heading check (used only when the document has no
     usable Table of Contents). Every Evaluation-tab metric checkbox has a

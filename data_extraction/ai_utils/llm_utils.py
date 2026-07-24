@@ -298,8 +298,46 @@ def list_ollama_models(ollama_key: str = None) -> list:
         return []
 
 
-def list_available_models(service: str) -> list:
-    """Return live available model ids for 'BlaBla', 'Chat AI' or 'DLR Ollama'."""
+# ---------------------------------------------------------------------------
+# Persisted model-list cache
+# ---------------------------------------------------------------------------
+# Fetching a service's /models list is a network round-trip; doing it on every
+# probe/refresh is wasteful and fails offline. Instead we fetch ONCE, store the
+# list per service on disk, and reuse it until the user explicitly refreshes
+# (force_refresh=True). A refresh that comes back empty/errors keeps the
+# previously stored list, so a momentary outage never blanks the pickers.
+MODEL_LIST_CACHE_FILE = os.path.join(str(ALR_main_folder), "model_lists_cache.json")
+_MODEL_LIST_CACHE = None   # {service: {"models": [...], "fetched_at": iso}}
+
+
+def _load_model_list_cache() -> dict:
+    global _MODEL_LIST_CACHE
+    if _MODEL_LIST_CACHE is None:
+        try:
+            with open(MODEL_LIST_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _MODEL_LIST_CACHE = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            _MODEL_LIST_CACHE = {}
+    return _MODEL_LIST_CACHE
+
+
+def _save_model_list_cache() -> None:
+    try:
+        os.makedirs(os.path.dirname(MODEL_LIST_CACHE_FILE), exist_ok=True)
+        with open(MODEL_LIST_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_MODEL_LIST_CACHE or {}, f, indent=2)
+    except OSError as e:
+        print(Fore.YELLOW + f"⚠️ Could not save model-list cache: {e}" + Style.RESET_ALL)
+
+
+def get_cached_models(service: str) -> list:
+    """The stored model list for a service (no network), or ``[]`` if none."""
+    return list(_load_model_list_cache().get(service, {}).get("models") or [])
+
+
+def _fetch_models_live(service: str) -> list:
+    """Do the actual /models network call for a service."""
     if service == "BlaBla":
         return list_blablador_models()
     if service == "Chat AI":
@@ -309,11 +347,37 @@ def list_available_models(service: str) -> list:
     raise ValueError(f"Unknown service '{service}'.")
 
 
-def probe_available_services() -> list:
-    """The services that are usable RIGHT NOW: an API key is stored **and**
-    the live model list answers. Returns ``[(label, [model ids])]`` with
-    **BlaBla first** (the preferred service), then Chat AI, then DLR Ollama.
-    Makes network calls — run it off the UI thread."""
+def list_available_models(service: str, force_refresh: bool = False) -> list:
+    """Return the model ids for 'BlaBla', 'Chat AI' or 'DLR Ollama'.
+
+    Uses the **stored** list by default (no network). Pass
+    ``force_refresh=True`` (the UI's refresh button) to re-fetch live and
+    update the cache; a refresh that returns nothing keeps the stored list.
+    On a cache miss (never fetched) it fetches once and stores the result."""
+    if service not in ("BlaBla", "Chat AI", "DLR Ollama"):
+        raise ValueError(f"Unknown service '{service}'.")
+    cache = _load_model_list_cache()
+    cached = list(cache.get(service, {}).get("models") or [])
+    if cached and not force_refresh:
+        return cached
+    try:
+        models = _fetch_models_live(service)
+    except Exception:  # noqa: BLE001 - offline/unreachable
+        models = []
+    if models:
+        cache[service] = {"models": models, "fetched_at": datetime.now().isoformat()}
+        _save_model_list_cache()
+        return models
+    # Fetch failed or came back empty: keep whatever was stored before.
+    return cached
+
+
+def probe_available_services(force_refresh: bool = False) -> list:
+    """The services that are usable: an API key is stored **and** a model list
+    is known (from the cache, or fetched once on a miss). Returns
+    ``[(label, [model ids])]`` **BlaBla first**, then Chat AI, then DLR Ollama.
+    Pass ``force_refresh=True`` to re-fetch every service's list live. Runs the
+    network off the UI thread only on a miss/refresh."""
     out = []
     for label, key_name in (("BlaBla", "BlaBla Door"),
                             ("Chat AI", "Chat AI"),
@@ -321,7 +385,7 @@ def probe_available_services() -> list:
         try:
             if not get_stored_api_key(key_name):
                 continue
-            models = list_available_models(label)
+            models = list_available_models(label, force_refresh=force_refresh)
         except Exception:  # noqa: BLE001 - an unreachable service is just absent
             models = []
         if models:
@@ -336,22 +400,27 @@ def select_model_interactive(service: str) -> str:
     and returned. Pressing Enter keeps the current selection.
     """
     current = get_selected_model(service)
-    models = list_available_models(service)
+    models = list_available_models(service)   # cached
 
     if not models:
-        print(Fore.YELLOW + f"⚠️ No models returned for {service}; keeping current: {current}" + Style.RESET_ALL)
-        return current
-
-    print(Fore.CYAN + f"\nAvailable {service} models:" + Style.RESET_ALL)
-    for i, m in enumerate(models, 1):
-        marker = "  (current)" if m == current else ""
-        print(f"  {i}. {m}{marker}")
+        print(Fore.YELLOW + f"⚠️ No stored models for {service} (type 'r' to fetch). "
+              f"Keeping current: {current}" + Style.RESET_ALL)
 
     while True:
-        choice = input(f"Select a {service} model [1-{len(models)}], or Enter to keep '{current}': ").strip()
+        if models:
+            print(Fore.CYAN + f"\nAvailable {service} models:" + Style.RESET_ALL)
+            for i, m in enumerate(models, 1):
+                marker = "  (current)" if m == current else ""
+                print(f"  {i}. {m}{marker}")
+        choice = input(f"Select a {service} model [1-{len(models)}], 'r' to "
+                       f"refresh the list, or Enter to keep '{current}': ").strip()
         if choice == "":
             print(Fore.GREEN + f"Keeping current {service} model: {current}" + Style.RESET_ALL)
             return current
+        if choice.lower() == "r":
+            print(Fore.CYAN + f"Refreshing {service} models…" + Style.RESET_ALL)
+            models = list_available_models(service, force_refresh=True)
+            continue
         if choice.isdigit() and 1 <= int(choice) <= len(models):
             chosen = models[int(choice) - 1]
             set_selected_model(service, chosen)
@@ -391,13 +460,14 @@ def _filter_embedding_models(models: list) -> list:
             if m and ("embed" in m.lower() or m.lower().startswith("e5"))]
 
 
-def list_embedding_models(service: str) -> list:
+def list_embedding_models(service: str, force_refresh: bool = False) -> list:
     """
-    Fetch the live model list for a service ('BlaBla', 'Chat AI' or
-    'DLR Ollama') via the existing /models call, and return only the ones that
-    look like embedding models (id/name contains 'embed', or e5-*).
+    Return the embedding-model ids for a service ('BlaBla', 'Chat AI' or
+    'DLR Ollama'): the cached full model list (or fetched once on a miss),
+    filtered to the embedding models (id/name contains 'embed', or e5-*).
+    Pass ``force_refresh=True`` to re-fetch the list live first.
     """
-    all_models = list_available_models(service)
+    all_models = list_available_models(service, force_refresh=force_refresh)
     embedding_models = _filter_embedding_models(all_models)
     return embedding_models
 

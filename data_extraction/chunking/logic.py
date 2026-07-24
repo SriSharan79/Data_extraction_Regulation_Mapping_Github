@@ -88,8 +88,10 @@ class ExtractionLauncherUI:
         self.llm_model = ttk.Combobox(llm_row, state="readonly", width=42,
                                       values=[])
         self.llm_model.pack(side="left", padx=4)
+        # ↻ forces a live re-fetch of the model lists; startup uses the
+        # stored lists (see _probe_llm_services).
         ttk.Button(llm_row, text="↻", width=3,
-                   command=self._probe_llm_services).pack(side="left")
+                   command=lambda: self._probe_llm_services(force=True)).pack(side="left")
         self.llm_hint = ttk.Label(llm_row, foreground="#666666",
                                   text="checking services…")
         self.llm_hint.pack(side="left", padx=(8, 0))
@@ -148,11 +150,13 @@ class ExtractionLauncherUI:
             pass
 
     # --- LLM service/model picker (for the triage heading check) ----------- #
-    def _probe_llm_services(self):
-        """Check in the background which services have a stored API key AND
-        an answering model list; only those become pickable (BlaBla first)."""
+    def _probe_llm_services(self, force=False):
+        """Check in the background which services have a stored API key AND a
+        known model list; only those become pickable (BlaBla first). Uses the
+        stored model lists; ``force=True`` (the ↻ button) re-fetches them live."""
         try:
-            self.llm_hint.config(text="checking services…")
+            self.llm_hint.config(text="refreshing services…" if force
+                                 else "checking services…")
         except tk.TclError:
             pass
 
@@ -160,7 +164,7 @@ class ExtractionLauncherUI:
             try:
                 from data_extraction.ai_utils import llm_utils as _lu
                 probe = getattr(_lu, "probe_available_services", None)
-                avail = probe() if probe else []
+                avail = probe(force_refresh=force) if probe else []
             except Exception:  # noqa: BLE001 - offline just means none usable
                 avail = []
             try:

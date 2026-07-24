@@ -125,7 +125,8 @@ class DataAnalysisTab:
         self.llm_service.bind("<<ComboboxSelected>>", self._llm_service_picked)
         self.llm_model = ttk.Combobox(row, state="readonly", width=30, values=[])
         self.llm_model.pack(side="left", padx=4)
-        ttk.Button(row, text="↻", width=3, command=self._probe_llm).pack(side="left")
+        ttk.Button(row, text="↻", width=3,
+                   command=lambda: self._probe_llm(force=True)).pack(side="left")
         self.llm_hint = ttk.Label(row, foreground="#666666", text="checking services…")
         self.llm_hint.pack(side="left", padx=(8, 0))
 
@@ -254,16 +255,19 @@ class DataAnalysisTab:
                               e.get("chain") or ""))
 
     # ----------------------------------------------------------- LLM picker -- #
-    def _probe_llm(self):
+    def _probe_llm(self, force=False):
+        """Populate the LLM picker from the stored model lists; ``force=True``
+        (the ↻ button) re-fetches them live first."""
         try:
-            self.llm_hint.config(text="checking services…")
+            self.llm_hint.config(text="refreshing services…" if force
+                                 else "checking services…")
         except tk.TclError:
             pass
 
         def work():
             try:
                 from data_extraction.ai_utils import llm_utils as _lu
-                avail = _lu.probe_available_services()
+                avail = _lu.probe_available_services(force_refresh=force)
             except Exception:  # noqa: BLE001
                 avail = []
             try:
